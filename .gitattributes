@@ -1,0 +1,3 @@
+*.tar.gz annex.largefiles=(largerthan=10MB)
+* annex.backend=MD5E
+**/.git* annex.largefiles=nothing

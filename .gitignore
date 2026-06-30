@@ -1,5 +1,6 @@
-# Ignore data files 
-*.tar.gz 
+# Ignore data files
+*.tar.gz
+source_data/mario.scenes/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

@@ -1,0 +1,20 @@
+{
+  "subject": "05",
+  "n_attempts": 11420,
+  "changepoints": [
+    3346
+  ],
+  "phases": [
+    {
+      "phase": "discovery",
+      "start": 0,
+      "end": 3346
+    },
+    {
+      "phase": "practice",
+      "start": 3346,
+      "end": 11420
+    }
+  ],
+  "method": "phase_annotation"
+}

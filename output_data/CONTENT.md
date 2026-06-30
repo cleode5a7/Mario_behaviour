@@ -1,11 +1,19 @@
-# 📁 Output Data Contents
+# Output Data
 
-Once the pipeline is run, this folder will contain the following:
+After running the full pipeline (`invoke run`), this folder contains:
 
-- `simulation_output.csv` — simulated data table with random values.
-- `scatter.png` — a plot of the simulated data.
-- `authors.csv` — a list of authors from papers found in a spreadsheet retrieved from figshare.
+## `changepoints/`
 
-📝 Note: csv and png files in this folder are **ignored by Git** (see `.gitignore`), so outputs won't be tracked by default.
+One JSON file per subject produced by `invoke run-changepoints`:
 
+- `<subject_id>_changepoints.json` — detected learning-phase changepoints in that subject's full chronological attempt sequence (all scenes combined).
+  Fields: `{"subject": str, "n_attempts": int, "changepoints": [<attempt indices>]}`
 
+## `clusters/`
+
+One JSON file per scene produced by `invoke run-clustering`:
+
+- `<scene_id>_clusters.json` — cluster label per behavioural trace for that scene.
+  Fields: `{"scene": str, "labels": [<per-trace cluster label>]}`
+
+> Note: output files are ignored by Git. Run `invoke run` to regenerate them.

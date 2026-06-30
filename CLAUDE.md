@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-This is the `airoh-mini` template — a starting point for structuring a reproducible data analysis. It is built on the [`invoke`](https://www.pyinvoke.org/) task runner. The `airoh` pip package provides reusable invoke tasks; this repo customizes them via `tasks.py` and `invoke.yaml`.
+**Mario Behaviour Analysis** — a reproducible pipeline for studying how players learn to complete scenes in a Mario video game task. The analysis detects learning-phase changepoints from per-scene completion-rate data (Bernoulli) and clusters behavioural traces within scenes using Fréchet distance fed into HDBSCAN or k-means.
+
+Built on the [`invoke`](https://www.pyinvoke.org/) task runner. The `airoh` pip package provides reusable invoke tasks; this repo customizes them via `tasks.py` and `invoke.yaml`.
 
 ## Persona
 
@@ -13,14 +15,7 @@ Respond as Uncle Airoh: patient, warm, and wise. Assume the user may be new to c
 ## Setup
 
 ```bash
-# uv (recommended):
 uv sync
-
-# pip:
-pip install -r requirements.txt
-
-# conda:
-conda env create -n airoh_env -f environment.yml && conda activate airoh_env
 ```
 
 ## Common Commands
@@ -67,11 +62,15 @@ invoke --list             # Show all available tasks
 
 **Task parameters:** `run-{name}` tasks should expose chunk or subset parameters (e.g. a subject ID, a chunk index) so that individual pieces can be rerun in isolation. They should also support a `smoke` flag for a fast minimal run useful for testing the pipeline end-to-end without running the full analysis.
 
-**Template cleanup:** When starting a new project from this template, remove the demo code before adding project-specific work:
-- Delete `run_simulation` from `tasks.py` and remove it from the `pre=` chains on `run_notebooks` and `run`
-- Delete `analysis/simulation.py` (and the `analysis/` folder if it stays empty)
-- Clear or replace `source_data/CONTENT.md` and `output_data/CONTENT.md` with project-specific descriptions
-- Update `invoke.yaml` (`files:`, paths) for the new project's data sources
+**Project-specific conventions:**
+- **Changepoints chunk by subject**: `run-changepoints` accepts `--subjects` (comma-separated subject IDs, e.g. `01,02`) and `--smoke` (first subject only). It loads each subject's full chronological attempt sequence across all scenes.
+- **Clustering chunks by scene**: `run-clustering` accepts `--scenes` (comma-separated scene IDs, e.g. `w1l1s0,w2l3s4`) and `--smoke` (first scene only).
+- Source data lives in `source_data/mario.scenes/` (a datalad dataset, git-ignored). `invoke fetch` clones it, checks out `dev_refactor`, runs `datalad get`, and decompresses archives via `code/archives/decompress.py`.
+- Changepoint inputs: all `*_summary.json` files under `sub-{subject}/`, sorted by (Session, Run, StartFrame). Key field: `Outcome` (`"completed"` or `"death"`) → Bernoulli series.
+- Clustering inputs: all `*_variables.json` files for a given scene. Trajectory built from `player_x_posHi × 256 + player_x_posLo` and `player_y_pos`.
+- `analysis/changepoints.py` — Bayesian changepoint detection on full per-subject Bernoulli series (algorithm TBD; see TODOs in file).
+- `analysis/clustering.py` — pairwise Fréchet distance matrix → HDBSCAN or k-means clustering of per-scene behavioural traces (see TODOs in file).
+- `run-changepoints` and `run-clustering` are **independent** — they can be run in any order or in isolation.
 
 **Adding a new analysis step:** add a function to `analysis/`, add a `run-{name}` task and a matching `clean-{name}` task in `tasks.py`, wire both into the top-level `run` and `clean` tasks via `pre=` chains, and create or extend a notebook in `notebooks/` for visualization.
 

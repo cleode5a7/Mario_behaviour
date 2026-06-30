@@ -1,3 +1,4 @@
+import os
 import shutil
 from pathlib import Path
 from invoke import task
@@ -59,7 +60,7 @@ def run_changepoints(c, subjects=None, smoke=False):
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5):
+def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, n_jobs=None):
     """Cluster behavioural traces within each scene using Fréchet distance.
 
     Args:
@@ -88,7 +89,8 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
         if out.exists():
             print(f"Skipping {scene} (output exists)")
             continue
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size))
+        _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), n_jobs=_n_jobs)
 
 
 @task

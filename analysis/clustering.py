@@ -5,6 +5,7 @@ import re
 import numpy as np
 import similaritymeasures
 import hdbscan
+from joblib import Parallel, delayed
 
 from analysis.changepoints import _SCENE_PATTERN
 
@@ -46,14 +47,21 @@ def load_traces(scene_id: str, source_dir: Path) -> tuple[list[np.ndarray], list
     return traces, metadata
 
 
-def frechet_distance_matrix(traces: list[np.ndarray]) -> np.ndarray:
-    """Compute symmetric pairwise Fréchet distance matrix."""
+def frechet_distance_matrix(traces: list[np.ndarray], n_jobs: int = 1) -> np.ndarray:
+    """Compute symmetric pairwise Fréchet distance matrix.
+
+    Args:
+        n_jobs: number of parallel workers (passed to joblib; -1 = all CPUs)
+    """
     n = len(traces)
+    pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    distances = Parallel(n_jobs=n_jobs)(
+        delayed(similaritymeasures.frechet_dist)(traces[i], traces[j])
+        for i, j in pairs
+    )
     dist = np.zeros((n, n))
-    for i in range(n):
-        for j in range(i + 1, n):
-            d = similaritymeasures.frechet_dist(traces[i], traces[j])
-            dist[i, j] = dist[j, i] = d
+    for (i, j), d in zip(pairs, distances):
+        dist[i, j] = dist[j, i] = d
     return dist
 
 
@@ -96,6 +104,7 @@ def run_clustering(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    n_jobs: int = 1,
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
 
@@ -114,8 +123,8 @@ def run_clustering(
         print(f"No trace data found for scene {scene_id}, skipping.")
         return
 
-    print(f"Scene {scene_id}: computing Fréchet distances for {len(traces)} traces...")
-    dist_matrix = frechet_distance_matrix(traces)
+    print(f"Scene {scene_id}: computing Fréchet distances for {len(traces)} traces (n_jobs={n_jobs})...")
+    dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
 
     if method == "hdbscan":
         labels = hdbscan.HDBSCAN(

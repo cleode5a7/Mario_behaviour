@@ -2,9 +2,9 @@
 #SBATCH --job-name=mario-clustering
 #SBATCH --account=def-YOURPI          # ← replace with your allocation account
 #SBATCH --array=0-307                 # one job per scene (308 scenes total)
-#SBATCH --time=04:00:00               # 4 h; worst scene (761 traces) takes ~3 h
+#SBATCH --time=01:00:00               # 1 h; worst scene (~3 h single-core) ÷ 8 CPUs
 #SBATCH --mem=4G
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=8
 #SBATCH --output=logs/clustering_%A_%a.out
 #SBATCH --error=logs/clustering_%A_%a.err
 

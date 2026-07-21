@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Overview
 
-**Mario Behaviour Analysis** — a reproducible pipeline for studying how players learn to complete scenes in a Mario video game task. The analysis detects learning-phase changepoints from per-scene completion-rate data (Bernoulli) and clusters behavioural traces within scenes using Fréchet distance fed into HDBSCAN or k-means.
+**Mario Behaviour Analysis** — a reproducible pipeline for studying how players learn to complete scenes in a Mario video game task. The analysis detects learning-phase changepoints from per-scene completion-rate data (Bernoulli) and clusters behavioural traces — both within individual scenes and pooled across scenes sharing a design-pattern category — using Fréchet distance fed into HDBSCAN or k-means.
 
 Built on the [`invoke`](https://www.pyinvoke.org/) task runner. The `airoh` pip package provides reusable invoke tasks; this repo customizes them via `tasks.py` and `invoke.yaml`.
 
@@ -65,12 +65,14 @@ invoke --list             # Show all available tasks
 **Project-specific conventions:**
 - **Changepoints chunk by subject**: `run-changepoints` accepts `--subjects` (comma-separated subject IDs, e.g. `01,02`) and `--smoke` (first subject only). It loads each subject's full chronological attempt sequence across all scenes.
 - **Clustering chunks by scene**: `run-clustering` accepts `--scenes` (comma-separated scene IDs, e.g. `w1l1s0,w2l3s4`) and `--smoke` (first scene only).
+- **Clustering-by-category chunks by category**: `run-clustering-by-category` accepts `--categories` (comma-separated pattern tags, e.g. `"2-Horde,Flagpole"`) and `--smoke` (first category only). It pools traces from every scene sharing a tag, re-based to a common origin (each trace shifted to start at (0,0)) before computing Fréchet distance — otherwise distance would be dominated by each scene's absolute level position rather than trace shape. Cost scales with the *square* of the pooled trace count, which varies enormously by category (e.g. "Enemy" pools ~19,000 traces across 90 scenes vs. ~150 for the smallest category) — see `slurm_clustering_by_category.sh` for a SLURM array template and size resources per-category accordingly.
 - Source data lives in `source_data/mario.scenes/` (a datalad dataset, git-ignored). `invoke fetch` clones it, checks out `dev_refactor`, runs `datalad get`, and decompresses archives via `code/archives/decompress.py`.
+- `source_data/scenes_mastersheet.csv` (checked into Git, from Zenodo record 15586709) tags each scene with one or more design-pattern categories (28 binary columns, not mutually exclusive) — see `source_data/CONTENT.md`.
 - Changepoint inputs: all `*_summary.json` files under `sub-{subject}/`, sorted by (Session, Run, StartFrame). Key field: `Outcome` (`"completed"` or `"death"`) → Bernoulli series.
-- Clustering inputs: all `*_variables.json` files for a given scene. Trajectory built from `player_x_posHi × 256 + player_x_posLo` and `player_y_pos`.
+- Clustering inputs: all `*_variables.json` files for a given scene (or, for clustering-by-category, for every scene tagged with that category). Trajectory built from `player_x_posHi × 256 + player_x_posLo` and `player_y_pos`.
 - `analysis/changepoints.py` — Bayesian changepoint detection on full per-subject Bernoulli series (algorithm TBD; see TODOs in file).
-- `analysis/clustering.py` — pairwise Fréchet distance matrix → HDBSCAN or k-means clustering of per-scene behavioural traces (see TODOs in file).
-- `run-changepoints` and `run-clustering` are **independent** — they can be run in any order or in isolation.
+- `analysis/clustering.py` — pairwise Fréchet distance matrix → HDBSCAN or k-means clustering, shared by `run_clustering` (per scene) and `run_clustering_by_category` (per scene category) via `cluster_traces()`. See TODOs in file.
+- `run-changepoints`, `run-clustering`, and `run-clustering-by-category` are **independent** — they can be run in any order or in isolation.
 
 **Adding a new analysis step:** add a function to `analysis/`, add a `run-{name}` task and a matching `clean-{name}` task in `tasks.py`, wire both into the top-level `run` and `clean` tasks via `pre=` chains, and create or extend a notebook in `notebooks/` for visualization.
 

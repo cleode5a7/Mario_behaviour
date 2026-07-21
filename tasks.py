@@ -94,11 +94,56 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
 
 
 @task
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, n_jobs=None):
+    """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
+
+    Traces are pooled across every scene tagged with the category (from
+    scenes_mastersheet.csv) and re-based to a common origin before clustering,
+    since raw traces from different scenes sit at different absolute positions.
+
+    Args:
+        method:           hdbscan (default) or kmedoids
+        n_clusters:       number of clusters for kmedoids
+        min_cluster_size: minimum cluster size for hdbscan
+    """
+    from analysis.clustering import list_categories, category_slug, run_clustering_by_category as _run_clustering_by_category
+
+    source_dir = Path(c.config.get("source_data_dir"))
+    output_dir = Path(c.config.get("output_data_dir")) / "clusters_by_category"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_categories = list_categories(source_dir)
+    if not all_categories:
+        print("No scene categories found — check source_data/scenes_mastersheet.csv.")
+        return
+    if smoke:
+        all_categories = all_categories[:1]
+    if categories:
+        all_categories = categories.split(",")
+
+    for category in all_categories:
+        out = output_dir / f"{category_slug(category)}_clusters.json"
+        if out.exists():
+            print(f"Skipping {category} (output exists)")
+            continue
+        _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), n_jobs=_n_jobs)
+
+
+@task
 def list_scenes_task(c):
     """Print all scene IDs, one per line. Used to build SLURM array inputs."""
     from analysis.changepoints import list_scenes
     for scene in list_scenes(Path(c.config.get("source_data_dir"))):
         print(scene)
+
+
+@task
+def list_categories_task(c):
+    """Print all scene-category (pattern tag) names, one per line. Used to build SLURM array inputs."""
+    from analysis.clustering import list_categories
+    for category in list_categories(Path(c.config.get("source_data_dir"))):
+        print(category)
 
 
 @task
@@ -113,7 +158,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_clustering, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_clustering, run_clustering_by_category, run_notebooks])
 def run(c):
     """Full pipeline."""
     print("Pipeline complete.")
@@ -123,8 +168,9 @@ def run(c):
 def run_smoke(c):
     """Smoke test: minimal end-to-end pass."""
     fetch(c)
-    run_changepoints(c, smoke=True)   # first subject, first 500 attempts
-    run_clustering(c, smoke=True)     # first scene only
+    run_changepoints(c, smoke=True)             # first subject, first 500 attempts
+    run_clustering(c, smoke=True)                # first scene only
+    run_clustering_by_category(c, smoke=True)    # first category only
     run_notebooks(c)
 
 
@@ -150,7 +196,18 @@ def clean_clustering(c):
         print("No clustering output to clean.")
 
 
-@task(pre=[clean_changepoints, clean_clustering])
+@task
+def clean_clustering_by_category(c):
+    """Remove per-category clustering outputs."""
+    output_dir = Path(c.config.get("output_data_dir")) / "clusters_by_category"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No per-category clustering output to clean.")
+
+
+@task(pre=[clean_changepoints, clean_clustering, clean_clustering_by_category])
 def clean(c):
     """Remove all computed outputs."""
     pass

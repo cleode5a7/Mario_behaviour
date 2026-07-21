@@ -3,11 +3,50 @@ import json
 import re
 
 import numpy as np
+import pandas as pd
 import similaritymeasures
 import hdbscan
 from joblib import Parallel, delayed
 
 from analysis.changepoints import _SCENE_PATTERN
+
+# Binary scene-design-pattern columns in scenes_mastersheet.csv (Zenodo 15586709).
+SCENE_PATTERN_COLS = [
+    "Enemy", "2-Horde", "3-Horde", "4-Horde", "Roof", "Gap",
+    "Multiple gaps", "Variable gaps", "Gap enemy", "Pillar gap", "Valley",
+    "Pipe valley", "Empty valley", "Enemy valley", "Roof valley", "2-Path",
+    "3-Path", "Risk/Reward", "Stair up", "Stair down", "Empty stair valley",
+    "Enemy stair valley", "Gap stair valley", "Reward", "Moving platform",
+    "Flagpole", "Beginning", "Bonus zone",
+]
+
+
+def load_scene_patterns(source_dir: Path) -> pd.DataFrame:
+    """Long-form (scene_id, pattern) table from scenes_mastersheet.csv.
+
+    A scene can carry multiple pattern tags at once (not mutually exclusive),
+    so each scene contributes one row per tag it has set. Use this to group
+    per-scene results by scene category (e.g. "Gap stair valley") instead of
+    by individual scene.
+    """
+    df = pd.read_csv(source_dir / "scenes_mastersheet.csv").dropna(subset=["World", "Level", "Scene"])
+    df["scene_id"] = df.apply(
+        lambda r: f"w{int(r['World'])}l{int(r['Level'])}s{int(r['Scene'])}", axis=1
+    )
+    long = df[["scene_id"] + SCENE_PATTERN_COLS].melt(
+        id_vars="scene_id", var_name="pattern", value_name="present"
+    )
+    return long[long["present"] == 1].drop(columns="present").reset_index(drop=True)
+
+
+def list_categories(source_dir: Path) -> list[str]:
+    """All scene-category (pattern tag) names, sorted."""
+    return sorted(load_scene_patterns(source_dir)["pattern"].unique().tolist())
+
+
+def category_slug(category: str) -> str:
+    """Filesystem-safe slug for a category name, e.g. 'Gap stair valley' -> 'gap_stair_valley'."""
+    return category.lower().replace(" ", "_").replace("/", "-")
 
 
 def load_traces(scene_id: str, source_dir: Path) -> tuple[list[np.ndarray], list[dict]]:
@@ -97,6 +136,33 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
     return labels
 
 
+def cluster_traces(
+    traces: list[np.ndarray],
+    method: str = "hdbscan",
+    n_clusters: int = 5,
+    min_cluster_size: int = 5,
+    n_jobs: int = 1,
+) -> list[int]:
+    """Pairwise Fréchet distance + clustering. Shared by per-scene and per-category runs.
+
+    Args:
+        method:           "hdbscan" (default, no k needed) or "kmedoids"
+        n_clusters:       number of clusters for kmedoids
+        min_cluster_size: minimum cluster size for hdbscan
+    """
+    dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
+
+    if method == "hdbscan":
+        return hdbscan.HDBSCAN(
+            metric="precomputed",
+            min_cluster_size=min_cluster_size,
+        ).fit_predict(dist_matrix).tolist()
+    elif method == "kmedoids":
+        return kmedoids(dist_matrix, n_clusters=n_clusters).tolist()
+    else:
+        raise ValueError(f"Unknown method '{method}'. Use 'hdbscan' or 'kmedoids'.")
+
+
 def run_clustering(
     scene_id: str,
     source_dir: Path,
@@ -107,11 +173,6 @@ def run_clustering(
     n_jobs: int = 1,
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
-
-    Args:
-        method:           "hdbscan" (default, no k needed) or "kmedoids"
-        n_clusters:       number of clusters for kmedoids
-        min_cluster_size: minimum cluster size for hdbscan
 
     Input:   all *_variables.json matching scene_id in mario.scenes/
     Output:  output_dir/<scene_id>_clusters.json
@@ -124,17 +185,8 @@ def run_clustering(
         return
 
     print(f"Scene {scene_id}: computing Fréchet distances for {len(traces)} traces (n_jobs={n_jobs})...")
-    dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
-
-    if method == "hdbscan":
-        labels = hdbscan.HDBSCAN(
-            metric="precomputed",
-            min_cluster_size=min_cluster_size,
-        ).fit_predict(dist_matrix).tolist()
-    elif method == "kmedoids":
-        labels = kmedoids(dist_matrix, n_clusters=n_clusters).tolist()
-    else:
-        raise ValueError(f"Unknown method '{method}'. Use 'hdbscan' or 'kmedoids'.")
+    labels = cluster_traces(traces, method=method, n_clusters=n_clusters,
+                             min_cluster_size=min_cluster_size, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Scene {scene_id}: {n_found} clusters found ({labels.count(-1)} noise points)")
@@ -142,6 +194,62 @@ def run_clustering(
     out = output_dir / f"{scene_id}_clusters.json"
     out.write_text(json.dumps({
         "scene": scene_id,
+        "method": method,
+        "labels": labels,
+        "metadata": metadata,
+    }, indent=2))
+
+
+def run_clustering_by_category(
+    category: str,
+    source_dir: Path,
+    output_dir: Path,
+    method: str = "hdbscan",
+    n_clusters: int = 5,
+    min_cluster_size: int = 5,
+    n_jobs: int = 1,
+) -> None:
+    """Cluster behavioural traces pooled across every scene tagged with a category.
+
+    Traces come from different scenes at different absolute level positions, so
+    each trace is re-based to start at (0, 0) before computing Fréchet distance —
+    otherwise distance would be dominated by scene offset rather than trace shape.
+
+    Input:   scenes_mastersheet.csv (category -> scene_ids) + matching
+             *_variables.json under mario.scenes/
+    Output:  output_dir/<category-slug>_clusters.json
+             {"category": str, "method": str, "labels": [int, ...], "metadata": [...]}
+             metadata entries carry "SceneID" so traces stay attributable to their scene.
+    """
+    patterns = load_scene_patterns(source_dir)
+    scene_ids = sorted(patterns.loc[patterns["pattern"] == category, "scene_id"].unique())
+
+    if not scene_ids:
+        print(f"No scenes tagged '{category}', skipping.")
+        return
+
+    traces: list[np.ndarray] = []
+    metadata: list[dict] = []
+    for scene_id in scene_ids:
+        scene_traces, scene_metadata = load_traces(scene_id, source_dir)
+        traces.extend(trace - trace[0] for trace in scene_traces)
+        metadata.extend(scene_metadata)
+
+    if not traces:
+        print(f"No trace data found for category '{category}' ({len(scene_ids)} scenes), skipping.")
+        return
+
+    print(f"Category '{category}': computing Fréchet distances for {len(traces)} traces "
+          f"across {len(scene_ids)} scenes (n_jobs={n_jobs})...")
+    labels = cluster_traces(traces, method=method, n_clusters=n_clusters,
+                             min_cluster_size=min_cluster_size, n_jobs=n_jobs)
+
+    n_found = len(set(l for l in labels if l != -1))
+    print(f"Category '{category}': {n_found} clusters found ({labels.count(-1)} noise points)")
+
+    out = output_dir / f"{category_slug(category)}_clusters.json"
+    out.write_text(json.dumps({
+        "category": category,
         "method": method,
         "labels": labels,
         "metadata": metadata,

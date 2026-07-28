@@ -27,4 +27,15 @@ e.g. `2-Horde`, `Gap stair valley`) produced by `invoke run-clustering-by-catego
   Fields: `{"category": str, "method": str, "labels": [<per-trace cluster label>], "metadata": [...]}`
   (each `metadata` entry carries `SceneID` so pooled traces stay attributable to their scene).
 
+## Trace figures
+
+`notebooks/figure_clustering.ipynb` also writes trajectory figures into `clusters/`
+(`figure_clustering_<scene_id>.png`, `figure_clustering_category_<slug>.png`, etc.).
+Traces use a screen-corrected vertical coordinate and are colored by cluster (default)
+or by outcome. `figure_clustering_<scene_id>_panels.png` shows the same scene split into
+one subplot per cluster (shared axes) so individual cluster shapes are easy to compare. Each scene figure overlays a scene background image when one exists at
+`source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png`; those images are
+not part of the dataset (must be generated separately), so by default the figures render
+on a plain y-flipped axis.
+
 > Note: output files are ignored by Git. Run `invoke run` to regenerate them.

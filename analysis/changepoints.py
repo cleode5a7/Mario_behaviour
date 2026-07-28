@@ -50,7 +50,10 @@ def load_all_attempts(subject: str, source_dir: Path) -> list[dict]:
     for f in (scenes_dir / f"sub-{subject}").glob("**/gamelogs/*_summary.json"):
         records.append(json.loads(f.read_text()))
 
-    records.sort(key=lambda d: (d["Session"], d["Run"], d["StartFrame"]))
+    # ClipCode tiebreaker keeps ordering deterministic when several clips share
+    # (Session, Run, StartFrame) — otherwise ties fall back to non-reproducible
+    # filesystem glob order.
+    records.sort(key=lambda d: (d["Session"], d["Run"], d["StartFrame"], d.get("ClipCode", "")))
     return records
 
 

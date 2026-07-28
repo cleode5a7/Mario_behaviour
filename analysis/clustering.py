@@ -49,13 +49,34 @@ def category_slug(category: str) -> str:
     return category.lower().replace(" ", "_").replace("/", "-")
 
 
-def load_traces(scene_id: str, source_dir: Path) -> tuple[list[np.ndarray], list[dict]]:
+def load_traces(scene_id: str, source_dir: Path, y_mode: str = "raw") -> tuple[list[np.ndarray], list[dict]]:
     """Load (x, y) player trajectories for all clips of one scene.
 
+    Args:
+        y_mode: how to derive the vertical coordinate.
+            "raw"    — raw ``player_y_pos`` (default). This is what clustering
+                       distances/labels are computed on; keep it unchanged so
+                       existing results stay reproducible.
+            "screen" — screen-corrected y for plotting only:
+                       ``player_y_pos + 24 - (1 - player_y_screen) * 256`` with
+                       frames masked where ``player_state == 0``. Stacks the
+                       vertical NES screens into one continuous coordinate (no
+                       mid-trace teleport) and hides fully-inactive frames.
+                       Note a pit death is a *real* multi-screen downward fall
+                       (``player_y_screen`` runs up as the player drops off the
+                       bottom); the plotting layer clips the view to the playfield
+                       so those honest-but-huge plunges don't dominate the axis.
+
     Returns:
-        traces:   list of (T, 2) float arrays, one per clip
+        traces:   list of (T, 2) float arrays, one per clip. In "screen" mode the
+                  y column is a masked array (matplotlib skips masked frames).
         metadata: list of dicts with Subject/Session/Run/Outcome per clip
+
+    Trace discovery/order is identical across y_modes, so cluster labels (stored
+    in this order) map 1:1 regardless of the y coordinate chosen for plotting.
     """
+    if y_mode not in ("raw", "screen"):
+        raise ValueError(f"Unknown y_mode '{y_mode}'. Use 'raw' or 'screen'.")
     scenes_dir = source_dir / "mario.scenes"
     records: list[tuple[dict, Path]] = []
 
@@ -67,10 +88,19 @@ def load_traces(scene_id: str, source_dir: Path) -> tuple[list[np.ndarray], list
         meta = json.loads(summary_path.read_text()) if summary_path.exists() else {}
         records.append((meta, f))
 
+    # Sort by a UNIQUE, content-based key. (Subject, Session, Run) alone is not
+    # unique — a scene can have many clips per run (e.g. 11–15) — so those ties
+    # would otherwise fall back to filesystem glob order, which is not
+    # reproducible. ClipCode is unique within (Subject, Session, Run), making the
+    # order deterministic across machines and runs (labels are stored/rejoined by
+    # this order, so it must be stable). StartFrame is included for readability;
+    # it is not unique on its own.
     records.sort(key=lambda r: (
         r[0].get("Subject", ""),
         r[0].get("Session", ""),
         r[0].get("Run", ""),
+        r[0].get("StartFrame", 0),
+        r[0].get("ClipCode", ""),
     ))
 
     traces: list[np.ndarray] = []
@@ -79,8 +109,16 @@ def load_traces(scene_id: str, source_dir: Path) -> tuple[list[np.ndarray], list
     for meta, f in records:
         data = json.loads(f.read_text())
         x = np.array(data["player_x_posHi"], dtype=float) * 256 + np.array(data["player_x_posLo"], dtype=float)
-        y = np.array(data["player_y_pos"], dtype=float)
-        traces.append(np.column_stack([x, y]))
+        if y_mode == "screen":
+            y_pos = np.array(data["player_y_pos"], dtype=float)
+            y_screen = np.array(data["player_y_screen"], dtype=float)
+            state = np.array(data["player_state"], dtype=float)
+            y = y_pos + 24 - (1 - y_screen) * 256
+            y = np.ma.masked_where(state == 0, y)
+            traces.append(np.ma.column_stack([x, y]))
+        else:
+            y = np.array(data["player_y_pos"], dtype=float)
+            traces.append(np.column_stack([x, y]))
         metadata.append(meta)
 
     return traces, metadata
@@ -113,6 +151,7 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
     Returns array of cluster labels (length n).
     """
     n = len(dist_matrix)
+    n_clusters = min(n_clusters, n)  # can't have more medoids than points
     rng = np.random.default_rng(seed)
     medoid_idx = rng.choice(n, n_clusters, replace=False)
 
@@ -124,6 +163,10 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
         for k in range(n_clusters):
             members = np.where(labels == k)[0]
             if len(members) == 0:
+                # Re-seed an emptied cluster to the point farthest from all current
+                # medoids, so clusters don't silently collapse onto each other.
+                nearest = dist_matrix[:, medoid_idx].min(axis=1)
+                new_medoids[k] = int(nearest.argmax())
                 continue
             # medoid = member with smallest total distance to all others in cluster
             within = dist_matrix[np.ix_(members, members)].sum(axis=1)

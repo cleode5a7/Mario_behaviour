@@ -33,8 +33,14 @@ def fetch(c):
 
 
 @task
-def run_changepoints(c, subjects=None, smoke=False):
-    """Detect learning-phase changepoints from each subject's full attempt sequence."""
+def run_changepoints(c, subjects=None, smoke=False, beta=1.0, n_bkps=None):
+    """Detect learning-phase changepoints from each subject's full attempt sequence.
+
+    Args:
+        beta:   ruptures penalty scale for the completion-signal diagnostic
+        n_bkps: fixed changepoint count for the Dynp algorithm
+                (default: the subject's number of Phase transitions)
+    """
     from analysis.changepoints import list_subjects, run_changepoint
 
     source_dir = Path(c.config.get("source_data_dir"))
@@ -51,22 +57,70 @@ def run_changepoints(c, subjects=None, smoke=False):
         all_subjects = subjects.split(",")
 
     max_attempts = 500 if smoke else None
+    _n_bkps = int(n_bkps) if n_bkps is not None else None
     for subject in all_subjects:
         out = output_dir / f"{subject}_changepoints.json"
         if out.exists():
             print(f"Skipping subject {subject} (output exists)")
             continue
-        run_changepoint(subject, source_dir, output_dir, max_attempts=max_attempts)
+        run_changepoint(subject, source_dir, output_dir, max_attempts=max_attempts,
+                        beta=float(beta), n_bkps=_n_bkps)
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, n_jobs=None):
-    """Cluster behavioural traces within each scene using Fréchet distance.
+def run_changepoints_by_category(c, subjects=None, smoke=False, beta=1.0, n_bkps=1):
+    """Detect changepoints per scene-category in each subject's attempt sequence.
+
+    Restricts each subject's chronological attempts to scenes sharing a
+    design-pattern tag, then runs the ruptures detector on BOTH the Duration
+    (time-to-complete) and completion signals. Chunked by subject: each subject
+    loads once, then splits cheaply across the categories they played.
 
     Args:
-        method:           hdbscan (default) or kmedoids
-        n_clusters:       number of clusters for kmedoids
-        min_cluster_size: minimum cluster size for hdbscan
+        beta:   ruptures penalty scale
+        n_bkps: fixed changepoint count for the Dynp algorithm
+    """
+    from analysis.changepoints import list_subjects, run_changepoint_by_category
+
+    source_dir = Path(c.config.get("source_data_dir"))
+    output_dir = Path(c.config.get("output_data_dir")) / "changepoints_by_category"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    all_subjects = list_subjects(source_dir)
+    if not all_subjects:
+        print("No subjects found in source_data/mario.scenes — run invoke fetch first.")
+        return
+    if smoke:
+        all_subjects = all_subjects[:1]
+    if subjects:
+        all_subjects = subjects.split(",")
+
+    max_attempts = 500 if smoke else None
+    for subject in all_subjects:
+        out = output_dir / f"{subject}_changepoints_by_category.json"
+        if out.exists():
+            print(f"Skipping subject {subject} (output exists)")
+            continue
+        run_changepoint_by_category(subject, source_dir, output_dir,
+                                    max_attempts=max_attempts,
+                                    beta=float(beta), n_bkps=int(n_bkps))
+
+
+@task
+def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
+    """Cluster behavioural traces within each scene using Fréchet distance.
+
+    The Fréchet distance matrix is cached under output_data/frechet/; re-running
+    with a different epsilon/k/method reuses it (skipping the expensive O(n^2)
+    recompute). Delete only the <scene>_clusters.json to re-cluster cheaply.
+
+    Args:
+        method:                     hdbscan (default) or kmedoids
+        n_clusters:                 number of clusters for kmedoids
+        min_cluster_size:           minimum cluster size for hdbscan
+        cluster_selection_epsilon:  hdbscan merge threshold (Fréchet units);
+                                    raise it to get fewer, merged clusters
+        recompute_frechet:          force recompute of the cached distance matrix
     """
     from analysis.changepoints import list_scenes
     from analysis.clustering import run_clustering as _run_clustering
@@ -90,21 +144,28 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
             print(f"Skipping {scene} (output exists)")
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), n_jobs=_n_jobs)
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
 
 
 @task
-def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, n_jobs=None):
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
     """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
 
     Traces are pooled across every scene tagged with the category (from
     scenes_mastersheet.csv) and re-based to a common origin before clustering,
     since raw traces from different scenes sit at different absolute positions.
 
+    The Fréchet distance matrix is cached under output_data/frechet/; re-running
+    with a different epsilon/k/method reuses it (skipping the expensive O(n^2)
+    recompute). Delete only the <category>_clusters.json to re-cluster cheaply.
+
     Args:
-        method:           hdbscan (default) or kmedoids
-        n_clusters:       number of clusters for kmedoids
-        min_cluster_size: minimum cluster size for hdbscan
+        method:                     hdbscan (default) or kmedoids
+        n_clusters:                 number of clusters for kmedoids
+        min_cluster_size:           minimum cluster size for hdbscan
+        cluster_selection_epsilon:  hdbscan merge threshold (Fréchet units);
+                                    raise it to get fewer, merged clusters
+        recompute_frechet:          force recompute of the cached distance matrix
     """
     from analysis.clustering import list_categories, category_slug, run_clustering_by_category as _run_clustering_by_category
 
@@ -127,7 +188,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
             print(f"Skipping {category} (output exists)")
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), n_jobs=_n_jobs)
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
 
 
 @task
@@ -158,7 +219,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_clustering, run_clustering_by_category, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_notebooks])
 def run(c):
     """Full pipeline."""
     print("Pipeline complete.")
@@ -169,6 +230,7 @@ def run_smoke(c):
     """Smoke test: minimal end-to-end pass."""
     fetch(c)
     run_changepoints(c, smoke=True)             # first subject, first 500 attempts
+    run_changepoints_by_category(c, smoke=True)  # first subject, per category
     run_clustering(c, smoke=True)                # first scene only
     run_clustering_by_category(c, smoke=True)    # first category only
     run_notebooks(c)
@@ -183,6 +245,17 @@ def clean_changepoints(c):
         print(f"Removed {output_dir}")
     else:
         print("No changepoints output to clean.")
+
+
+@task
+def clean_changepoints_by_category(c):
+    """Remove per-category changepoint outputs."""
+    output_dir = Path(c.config.get("output_data_dir")) / "changepoints_by_category"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No changepoints-by-category output to clean.")
 
 
 @task
@@ -207,7 +280,23 @@ def clean_clustering_by_category(c):
         print("No per-category clustering output to clean.")
 
 
-@task(pre=[clean_changepoints, clean_clustering, clean_clustering_by_category])
+@task
+def clean_frechet(c):
+    """Remove cached Fréchet distance matrices.
+
+    Kept separate from clean-clustering so clearing cluster labels (to re-cluster
+    with a new epsilon/k) preserves the expensive distance matrices. Only a full
+    `invoke clean` or an explicit `invoke clean-frechet` discards them.
+    """
+    output_dir = Path(c.config.get("output_data_dir")) / "frechet"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No cached Fréchet matrices to clean.")
+
+
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass

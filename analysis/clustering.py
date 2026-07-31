@@ -142,6 +142,38 @@ def frechet_distance_matrix(traces: list[np.ndarray], n_jobs: int = 1) -> np.nda
     return dist
 
 
+def frechet_matrix_cached(
+    traces: list[np.ndarray],
+    cache_path: Path,
+    n_jobs: int = 1,
+    recompute: bool = False,
+) -> np.ndarray:
+    """Load a cached Fréchet distance matrix, or compute-and-cache it.
+
+    The matrix depends only on the traces (and their deterministic load order),
+    never on the clustering method/epsilon/k — so it is the expensive part worth
+    caching. Re-clustering with a different epsilon can then reuse this and skip
+    the O(n^2) Fréchet recomputation entirely.
+
+    The cache is validated by trace count: if the on-disk matrix does not match
+    the current number of traces (e.g. new source data landed), it is recomputed.
+    Pass ``recompute=True`` to force a fresh computation regardless.
+    """
+    if cache_path.exists() and not recompute:
+        dist = np.load(cache_path)
+        if dist.shape == (len(traces), len(traces)):
+            print(f"Loaded cached Fréchet matrix from {cache_path} ({len(traces)} traces).")
+            return dist
+        print(f"Cached matrix at {cache_path} is stale "
+              f"({dist.shape[0]} != {len(traces)} traces), recomputing.")
+
+    dist = frechet_distance_matrix(traces, n_jobs=n_jobs)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    np.save(cache_path, dist)
+    print(f"Saved Fréchet matrix to {cache_path}.")
+    return dist
+
+
 def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed: int = 42) -> np.ndarray:
     """K-medoids clustering on a precomputed distance matrix.
 
@@ -180,25 +212,41 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
 
 
 def cluster_traces(
-    traces: list[np.ndarray],
+    traces: list[np.ndarray] | None = None,
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
+    dist_matrix: np.ndarray | None = None,
 ) -> list[int]:
     """Pairwise Fréchet distance + clustering. Shared by per-scene and per-category runs.
 
     Args:
-        method:           "hdbscan" (default, no k needed) or "kmedoids"
-        n_clusters:       number of clusters for kmedoids
-        min_cluster_size: minimum cluster size for hdbscan
+        method:                     "hdbscan" (default, no k needed) or "kmedoids"
+        n_clusters:                 number of clusters for kmedoids
+        min_cluster_size:           minimum cluster size for hdbscan
+        cluster_selection_epsilon:  hdbscan merge threshold, in Fréchet-distance
+                                    units. Clusters whose separation is below this
+                                    are fused, so raise it to get fewer clusters
+                                    (0.0 = HDBSCAN's default, no forced merging).
+        dist_matrix:                a precomputed Fréchet distance matrix. If given,
+                                    ``traces`` is not needed and no distances are
+                                    computed — this is the cheap path for re-running
+                                    clustering (new epsilon/k/method) on cached
+                                    distances. If omitted, distances are computed
+                                    from ``traces``.
     """
-    dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
+    if dist_matrix is None:
+        if traces is None:
+            raise ValueError("cluster_traces needs either traces or a precomputed dist_matrix.")
+        dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
 
     if method == "hdbscan":
         return hdbscan.HDBSCAN(
             metric="precomputed",
             min_cluster_size=min_cluster_size,
+            cluster_selection_epsilon=float(cluster_selection_epsilon),
         ).fit_predict(dist_matrix).tolist()
     elif method == "kmedoids":
         return kmedoids(dist_matrix, n_clusters=n_clusters).tolist()
@@ -213,13 +261,20 @@ def run_clustering(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
+    frechet_cache_dir: Path | None = None,
+    recompute_frechet: bool = False,
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
 
     Input:   all *_variables.json matching scene_id in mario.scenes/
     Output:  output_dir/<scene_id>_clusters.json
              {"scene": str, "method": str, "labels": [int, ...], "metadata": [...]}
+
+    The Fréchet distance matrix is cached (under ``frechet_cache_dir``, default
+    ``output_dir/../frechet``); re-running with a different epsilon/k/method reuses
+    it and skips the O(n^2) recomputation. Pass ``recompute_frechet=True`` to force.
     """
     traces, metadata = load_traces(scene_id, source_dir)
 
@@ -227,9 +282,13 @@ def run_clustering(
         print(f"No trace data found for scene {scene_id}, skipping.")
         return
 
-    print(f"Scene {scene_id}: computing Fréchet distances for {len(traces)} traces (n_jobs={n_jobs})...")
-    labels = cluster_traces(traces, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size, n_jobs=n_jobs)
+    cache_dir = frechet_cache_dir if frechet_cache_dir is not None else output_dir.parent / "frechet"
+    dist_matrix = frechet_matrix_cached(traces, cache_dir / f"{scene_id}.npy",
+                                        n_jobs=n_jobs, recompute=recompute_frechet)
+    print(f"Scene {scene_id}: clustering {len(traces)} traces (method={method})...")
+    labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
+                             min_cluster_size=min_cluster_size,
+                             cluster_selection_epsilon=cluster_selection_epsilon)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Scene {scene_id}: {n_found} clusters found ({labels.count(-1)} noise points)")
@@ -250,7 +309,10 @@ def run_clustering_by_category(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
+    frechet_cache_dir: Path | None = None,
+    recompute_frechet: bool = False,
 ) -> None:
     """Cluster behavioural traces pooled across every scene tagged with a category.
 
@@ -263,6 +325,10 @@ def run_clustering_by_category(
     Output:  output_dir/<category-slug>_clusters.json
              {"category": str, "method": str, "labels": [int, ...], "metadata": [...]}
              metadata entries carry "SceneID" so traces stay attributable to their scene.
+
+    The Fréchet distance matrix is cached (under ``frechet_cache_dir``, default
+    ``output_dir/../frechet``); re-running with a different epsilon/k/method reuses
+    it and skips the O(n^2) recomputation. Pass ``recompute_frechet=True`` to force.
     """
     patterns = load_scene_patterns(source_dir)
     scene_ids = sorted(patterns.loc[patterns["pattern"] == category, "scene_id"].unique())
@@ -282,10 +348,14 @@ def run_clustering_by_category(
         print(f"No trace data found for category '{category}' ({len(scene_ids)} scenes), skipping.")
         return
 
-    print(f"Category '{category}': computing Fréchet distances for {len(traces)} traces "
-          f"across {len(scene_ids)} scenes (n_jobs={n_jobs})...")
-    labels = cluster_traces(traces, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size, n_jobs=n_jobs)
+    cache_dir = frechet_cache_dir if frechet_cache_dir is not None else output_dir.parent / "frechet"
+    dist_matrix = frechet_matrix_cached(traces, cache_dir / f"{category_slug(category)}.npy",
+                                        n_jobs=n_jobs, recompute=recompute_frechet)
+    print(f"Category '{category}': clustering {len(traces)} traces "
+          f"across {len(scene_ids)} scenes (method={method})...")
+    labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
+                             min_cluster_size=min_cluster_size,
+                             cluster_selection_epsilon=cluster_selection_epsilon)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Category '{category}': {n_found} clusters found ({labels.count(-1)} noise points)")

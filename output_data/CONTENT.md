@@ -7,7 +7,17 @@ After running the full pipeline (`invoke run`), this folder contains:
 One JSON file per subject produced by `invoke run-changepoints`:
 
 - `<subject_id>_changepoints.json` — detected learning-phase changepoints in that subject's full chronological attempt sequence (all scenes combined).
-  Fields: `{"subject": str, "n_attempts": int, "changepoints": [<attempt indices>]}`
+  Fields: `{"subject": str, "n_attempts": int, "changepoints": [<attempt indices>], "phases": [...], "method": "phase_annotation"}`.
+  Also carries a `"ruptures"` block — a non-Bayesian diagnostic that runs the `ruptures` PELT/Binseg/Dynp algorithms (CostL2) on the completion signal, on both the raw per-attempt series and a 50-attempt block-averaged series, for comparison against the Phase annotations:
+  `{"model": "l2", "block_size": int, "beta": float, "n_bkps": int, "results": {"raw": {"pelt": [...], "binseg": [...], "dynp": [...]}, "blocks": {...}}}` (breakpoints in attempt-index space).
+
+## `changepoints_by_category/`
+
+One JSON file per subject produced by `invoke run-changepoints-by-category`:
+
+- `<subject_id>_changepoints_by_category.json` — changepoints in each subject's attempt series **restricted to scenes sharing a design-pattern category** (from `source_data/scenes_mastersheet.csv`). For every category the subject played, the `ruptures` detector runs on **both** the `Duration` (time-to-complete) signal — continuous, expected to shrink with mastery — and the Bernoulli completion signal, each on raw + block-averaged series.
+  Fields: `{"subject": str, "method": "ruptures_by_category", "model": "l2", "block_size": int, "beta": float, "n_bkps": int, "categories": {"<category>": {"n_attempts": int, "duration": {"raw": {...}, "blocks": {...}}, "completion": {"raw": {...}, "blocks": {...}}}, ...}}`.
+  `notebooks/figure_changepoints_by_category.ipynb` writes one small-multiples figure per subject here (`figure_changepoints_by_category_<subject>.png`): duration vs. completion curves for the busiest categories, with per-algorithm changepoint lines.
 
 ## `clusters/`
 

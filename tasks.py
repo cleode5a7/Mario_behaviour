@@ -33,13 +33,18 @@ def fetch(c):
 
 
 @task
-def run_changepoints(c, subjects=None, smoke=False, beta=1.0, n_bkps=None):
+def run_changepoints(c, subjects=None, smoke=False, beta=1.0, n_bkps=None, rep_block_size=10):
     """Detect learning-phase changepoints from each subject's full attempt sequence.
 
+    Detection runs on two units: per scene clip (near-ceiling at ~92%, largely
+    flat) and per level repetition (~53-81% cleared, the signal with the dynamic
+    range that actually tracks learning).
+
     Args:
-        beta:   ruptures penalty scale for the completion-signal diagnostic
-        n_bkps: fixed changepoint count for the Dynp algorithm
-                (default: the subject's number of Phase transitions)
+        beta:           ruptures penalty scale for the completion-signal diagnostic
+        n_bkps:         fixed changepoint count for the Dynp algorithm
+                        (default: the subject's number of Phase transitions)
+        rep_block_size: repetitions per block for the level-repetition signal
     """
     from analysis.changepoints import list_subjects, run_changepoint
 
@@ -64,7 +69,8 @@ def run_changepoints(c, subjects=None, smoke=False, beta=1.0, n_bkps=None):
             print(f"Skipping subject {subject} (output exists)")
             continue
         run_changepoint(subject, source_dir, output_dir, max_attempts=max_attempts,
-                        beta=float(beta), n_bkps=_n_bkps)
+                        beta=float(beta), n_bkps=_n_bkps,
+                        rep_block_size=int(rep_block_size))
 
 
 @task
@@ -107,7 +113,7 @@ def run_changepoints_by_category(c, subjects=None, smoke=False, beta=1.0, n_bkps
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
+def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
     """Cluster behavioural traces within each scene using Fréchet distance.
 
     The Fréchet distance matrix is cached under output_data/frechet/; re-running
@@ -118,6 +124,10 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
         method:                     hdbscan (default) or kmedoids
         n_clusters:                 number of clusters for kmedoids
         min_cluster_size:           minimum cluster size for hdbscan
+        min_samples:                hdbscan noise aggressiveness (defaults to
+                                    min_cluster_size); set lower to keep fewer,
+                                    larger clusters without discarding so many
+                                    traces to noise
         cluster_selection_epsilon:  hdbscan merge threshold (Fréchet units);
                                     raise it to get fewer, merged clusters
         recompute_frechet:          force recompute of the cached distance matrix
@@ -144,11 +154,12 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
             print(f"Skipping {scene} (output exists)")
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
+        _min_samples = int(min_samples) if min_samples is not None else None
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
 
 
 @task
-def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
     """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
 
     Traces are pooled across every scene tagged with the category (from
@@ -163,6 +174,10 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
         method:                     hdbscan (default) or kmedoids
         n_clusters:                 number of clusters for kmedoids
         min_cluster_size:           minimum cluster size for hdbscan
+        min_samples:                hdbscan noise aggressiveness (defaults to
+                                    min_cluster_size); set lower to keep fewer,
+                                    larger clusters without discarding so many
+                                    traces to noise
         cluster_selection_epsilon:  hdbscan merge threshold (Fréchet units);
                                     raise it to get fewer, merged clusters
         recompute_frechet:          force recompute of the cached distance matrix
@@ -188,7 +203,8 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
             print(f"Skipping {category} (output exists)")
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
-        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
+        _min_samples = int(min_samples) if min_samples is not None else None
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
 
 
 @task

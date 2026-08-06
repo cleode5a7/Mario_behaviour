@@ -216,6 +216,7 @@ def cluster_traces(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    min_samples: int | None = None,
     cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
     dist_matrix: np.ndarray | None = None,
@@ -226,6 +227,12 @@ def cluster_traces(
         method:                     "hdbscan" (default, no k needed) or "kmedoids"
         n_clusters:                 number of clusters for kmedoids
         min_cluster_size:           minimum cluster size for hdbscan
+        min_samples:                hdbscan conservativeness / noise aggressiveness.
+                                    Lower = fewer points called noise. Defaults to
+                                    ``min_cluster_size`` (HDBSCAN's own default) when
+                                    None; set it below min_cluster_size to raise the
+                                    cluster-size floor without also discarding so many
+                                    traces to noise.
         cluster_selection_epsilon:  hdbscan merge threshold, in Fréchet-distance
                                     units. Clusters whose separation is below this
                                     are fused, so raise it to get fewer clusters
@@ -246,6 +253,7 @@ def cluster_traces(
         return hdbscan.HDBSCAN(
             metric="precomputed",
             min_cluster_size=min_cluster_size,
+            min_samples=min_samples,
             cluster_selection_epsilon=float(cluster_selection_epsilon),
         ).fit_predict(dist_matrix).tolist()
     elif method == "kmedoids":
@@ -261,6 +269,7 @@ def run_clustering(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    min_samples: int | None = None,
     cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
     frechet_cache_dir: Path | None = None,
@@ -287,7 +296,7 @@ def run_clustering(
                                         n_jobs=n_jobs, recompute=recompute_frechet)
     print(f"Scene {scene_id}: clustering {len(traces)} traces (method={method})...")
     labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size,
+                             min_cluster_size=min_cluster_size, min_samples=min_samples,
                              cluster_selection_epsilon=cluster_selection_epsilon)
 
     n_found = len(set(l for l in labels if l != -1))
@@ -309,6 +318,7 @@ def run_clustering_by_category(
     method: str = "hdbscan",
     n_clusters: int = 5,
     min_cluster_size: int = 5,
+    min_samples: int | None = None,
     cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
     frechet_cache_dir: Path | None = None,
@@ -354,7 +364,7 @@ def run_clustering_by_category(
     print(f"Category '{category}': clustering {len(traces)} traces "
           f"across {len(scene_ids)} scenes (method={method})...")
     labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size,
+                             min_cluster_size=min_cluster_size, min_samples=min_samples,
                              cluster_selection_epsilon=cluster_selection_epsilon)
 
     n_found = len(set(l for l in labels if l != -1))

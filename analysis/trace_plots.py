@@ -43,6 +43,22 @@ N_DIRECT_CLUSTERS = 8      # clusters beyond this rank (by size) fold into "othe
 OUTCOME_COLORS = {"completed": "#2ca02c", "death": "#d62728"}
 OUTCOME_OTHER = "#898781"
 
+# Per-subject palette for coloring traces by player (plotting only). Kept distinct
+# from CLUSTER_COLORS so a subject-colored panel can't be mistaken for a
+# cluster-colored one.
+SUBJECT_COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3",
+                  "#937860", "#da8bc3", "#8c8c8c", "#ccb974", "#64b5cd"]
+
+
+def subject_color_map(metadata) -> dict:
+    """Stable ``Subject -> color`` dict, assigned by sorted subject id.
+
+    A given subject gets the same color in every panel of a figure. Colors cycle
+    if there are more subjects than palette entries.
+    """
+    subjects = sorted({m.get("Subject", "?") for m in metadata})
+    return {s: SUBJECT_COLORS[i % len(SUBJECT_COLORS)] for i, s in enumerate(subjects)}
+
 
 def default_background_dir(source_dir: Path) -> Path:
     """Where scene background PNGs are expected once generated."""
@@ -262,6 +278,7 @@ def plot_scene_cluster_panels(
     source_dir,
     output_dir,
     *,
+    color_by="cluster",
     background_dir=None,
     include_noise=True,
     max_cols=4,
@@ -275,6 +292,9 @@ def plot_scene_cluster_panels(
     screen-corrected y coordinate work exactly as in ``plot_scene_clusters``.
 
     Args:
+        color_by:      "cluster" (default) draws each cluster's panel in a single
+                       cluster color; "subject" colors every trace by its player,
+                       so each panel shows the cluster's per-subject composition.
         include_noise: add a final panel for HDBSCAN noise (label -1) if present.
         max_cols:      maximum columns in the panel grid.
         panel_size:    (width, height) inches per panel.
@@ -282,10 +302,15 @@ def plot_scene_cluster_panels(
     source_dir = Path(source_dir)
     output_dir = Path(output_dir)
 
-    traces, _, labels, method = load_labeled_traces(scene_id, source_dir, output_dir)
+    if color_by not in ("cluster", "subject"):
+        raise ValueError(f"Unknown color_by '{color_by}'. Use 'cluster' or 'subject'.")
+
+    traces, metadata, labels, method = load_labeled_traces(scene_id, source_dir, output_dir)
     if not traces:
         print(f"No trace data found for scene {scene_id}, skipping plot.")
         return None
+
+    subj_colors = subject_color_map(metadata) if color_by == "subject" else {}
 
     # rank clusters by size (same ordering/colors as the combined plot)
     sizes = {l: int((labels == l).sum()) for l in set(labels.tolist()) if l != -1}
@@ -324,12 +349,13 @@ def plot_scene_cluster_panels(
             marker = CLUSTER_MARKERS[slot % len(CLUSTER_MARKERS)]
             name, n = f"cluster {label}", sizes[label]
 
-        for trace, lab in zip(traces, labels):
+        for trace, lab, meta in zip(traces, labels, metadata):
             if lab != label:
                 continue
             x = trace[:, 0] - x_offset
-            ax.plot(x, trace[:, 1], color=color, alpha=0.6, linewidth=1.2)
-            ax.plot(x[0], trace[0, 1], color=color, marker=marker, markersize=4, alpha=0.8)
+            tcolor = subj_colors[meta.get("Subject", "?")] if color_by == "subject" else color
+            ax.plot(x, trace[:, 1], color=tcolor, alpha=0.6, linewidth=1.2)
+            ax.plot(x[0], trace[0, 1], color=tcolor, marker=marker, markersize=4, alpha=0.8)
 
         if bg is not None:
             ax.set_xlim(0, bg.shape[1])
@@ -343,11 +369,20 @@ def plot_scene_cluster_panels(
     for i in range(len(panels), rows * cols):
         axes[i // cols][i % cols].axis("off")
 
-    fig.suptitle(f"{scene_id} — per-cluster traces ({len(ranked)} clusters, {method})",
+    color_txt = " colored by subject" if color_by == "subject" else ""
+    fig.suptitle(f"{scene_id} — per-cluster traces{color_txt} ({len(ranked)} clusters, {method})",
                  fontsize=13, fontweight="bold")
+
+    if color_by == "subject":
+        handles = [plt.Line2D([0], [0], color=c, lw=2, label=f"sub-{s}")
+                   for s, c in subj_colors.items()]
+        fig.legend(handles=handles, loc="lower center", ncol=min(len(handles), 8),
+                   fontsize=9, frameon=False, bbox_to_anchor=(0.5, -0.01))
+
     fig.tight_layout()
 
-    out_path = output_dir / "clusters" / f"figure_clustering_{scene_id}_panels.png"
+    suffix = "_by_subject" if color_by == "subject" else ""
+    out_path = output_dir / "clusters" / f"figure_clustering_{scene_id}_panels{suffix}.png"
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     print(f"Saved -> {out_path}")
     plt.show()

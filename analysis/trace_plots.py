@@ -20,6 +20,7 @@ until they exist, plots fall back to the plain-axis rendering automatically.
 """
 
 from pathlib import Path
+from collections import Counter
 import json
 
 import numpy as np
@@ -45,9 +46,10 @@ OUTCOME_OTHER = "#898781"
 
 # Per-subject palette for coloring traces by player (plotting only). Kept distinct
 # from CLUSTER_COLORS so a subject-colored panel can't be mistaken for a
-# cluster-colored one.
-SUBJECT_COLORS = ["#4c72b0", "#dd8452", "#55a868", "#c44e52", "#8172b3",
-                  "#937860", "#da8bc3", "#8c8c8c", "#ccb974", "#64b5cd"]
+# cluster-colored one. High-contrast qualitative hues (ColorBrewer Set1 order) so
+# the handful of players stay easy to tell apart even when traces overlap.
+SUBJECT_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
+                  "#a65628", "#f781bf", "#00ced1", "#999999", "#dede00"]
 
 
 def subject_color_map(metadata) -> dict:
@@ -356,6 +358,19 @@ def plot_scene_cluster_panels(
             tcolor = subj_colors[meta.get("Subject", "?")] if color_by == "subject" else color
             ax.plot(x, trace[:, 1], color=tcolor, alpha=0.6, linewidth=1.2)
             ax.plot(x[0], trace[0, 1], color=tcolor, marker=marker, markersize=4, alpha=0.8)
+
+        if color_by == "subject":
+            # Per-subject composition of this cluster, as a share of its traces.
+            panel_subs = [m.get("Subject", "?") for m, lab in zip(metadata, labels) if lab == label]
+            comp = Counter(panel_subs)
+            ty = 0.98
+            for s in sorted(comp):
+                pct = 100 * comp[s] / len(panel_subs)
+                ax.text(0.02, ty, f"sub-{s}: {pct:.0f}% (n={comp[s]})",
+                        transform=ax.transAxes, color=subj_colors[s], fontsize=7,
+                        fontweight="bold", va="top", ha="left",
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.7))
+                ty -= 0.085
 
         if bg is not None:
             ax.set_xlim(0, bg.shape[1])

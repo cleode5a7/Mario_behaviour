@@ -208,6 +208,94 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
 
 
 @task
+def run_web_export(c, scenes=None, smoke=False, step=3, force=False):
+    """Export clustered traces to a static payload for the browser dashboard.
+
+    The cluster JSONs hold labels + metadata but no geometry, so the dashboard
+    needs the x/y polylines baked out of mario.scenes once. Writes one file per
+    scene under output_data/web/data/scenes/, plus an index and a copy of the
+    scene background PNGs, so the served tree never reaches back into the 23 GB
+    source dataset.
+
+    Args:
+        step:  keep every step-th frame (first and last always kept). Traces are
+               60 fps against a 224 px background, so 3 is visually lossless;
+               lower it for more fidelity at the cost of payload size.
+        force: re-export scenes whose payload already exists
+    """
+    from analysis.webexport import list_clustered_scenes, export_scene, sync_backgrounds, write_index
+    from analysis.trace_plots import default_background_dir, scene_entry_map
+
+    source_dir = Path(c.config.get("source_data_dir"))
+    output_dir = Path(c.config.get("output_data_dir"))
+    web_dir = output_dir / "web" / "data"
+    web_dir.mkdir(parents=True, exist_ok=True)
+
+    all_scenes = list_clustered_scenes(output_dir)
+    if not all_scenes:
+        print("No clustering output found in output_data/clusters — run invoke run-clustering first.")
+        return
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    entry_map = scene_entry_map(source_dir)
+    background_dir = default_background_dir(source_dir)
+
+    for scene in all_scenes:
+        out = web_dir / "scenes" / f"{scene}.json"
+        if out.exists() and not force:
+            print(f"Skipping {scene} (payload exists)")
+            continue
+        export_scene(scene, source_dir, output_dir, web_dir, step=int(step),
+                     entry_map=entry_map, background_dir=background_dir)
+
+    # Both are cheap and keep the payload internally consistent, so redo on every run.
+    copied = sync_backgrounds(web_dir, source_dir)
+    if copied:
+        print(f"Copied {copied} scene background(s)")
+    write_index(web_dir, source_dir)
+
+
+@task
+def dashboard(c, port=8000, open_browser=True):
+    """Serve the interactive clustering dashboard at http://localhost:<port>.
+
+    Copies the app source from web/ into output_data/web/ (fresh each run, so
+    editing web/app.js and re-running always picks the change up) and serves
+    that directory. Requires `invoke run-web-export` to have run first.
+    """
+    import subprocess
+    import sys
+    import webbrowser
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    web_root = output_dir / "web"
+    if not (web_root / "data" / "index.json").exists():
+        print("No dashboard data found. Run:  invoke run-web-export")
+        return
+
+    app_dir = Path("web")
+    if not app_dir.exists():
+        print(f"Dashboard app source not found at {app_dir}/.")
+        return
+    for asset in sorted(app_dir.iterdir()):
+        if asset.is_file():
+            shutil.copy2(asset, web_root / asset.name)
+
+    url = f"http://localhost:{port}/"
+    print(f"Serving dashboard at {url}  (Ctrl-C to stop)")
+    if open_browser:
+        webbrowser.open(url)
+    try:
+        subprocess.run([sys.executable, "-m", "http.server", str(port),
+                        "--directory", str(web_root)])
+    except KeyboardInterrupt:
+        print("\nDashboard stopped.")
+
+
+@task
 def list_scenes_task(c):
     """Print all scene IDs, one per line. Used to build SLURM array inputs."""
     from analysis.changepoints import list_scenes
@@ -235,7 +323,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_web_export, run_notebooks])
 def run(c):
     """Full pipeline."""
     print("Pipeline complete.")
@@ -249,6 +337,7 @@ def run_smoke(c):
     run_changepoints_by_category(c, smoke=True)  # first subject, per category
     run_clustering(c, smoke=True)                # first scene only
     run_clustering_by_category(c, smoke=True)    # first category only
+    run_web_export(c, smoke=True)                # dashboard payload, first scene
     run_notebooks(c)
 
 
@@ -297,6 +386,17 @@ def clean_clustering_by_category(c):
 
 
 @task
+def clean_web_export(c):
+    """Remove the exported dashboard payload and copied app assets."""
+    output_dir = Path(c.config.get("output_data_dir")) / "web"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No dashboard export to clean.")
+
+
+@task
 def clean_frechet(c):
     """Remove cached Fréchet distance matrices.
 
@@ -312,7 +412,7 @@ def clean_frechet(c):
         print("No cached Fréchet matrices to clean.")
 
 
-@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_frechet])
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass

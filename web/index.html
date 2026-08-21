@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mario clustering dashboard</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <aside id="sidebar">
+    <header>
+      <h1>Trace clustering</h1>
+      <p id="corpus-note">loading…</p>
+    </header>
+
+    <section class="panel" id="scene-panel">
+      <h2>Scene</h2>
+      <select id="tag-filter" aria-label="Filter scenes by design-pattern tag">
+        <option value="">All design patterns</option>
+      </select>
+      <input type="search" id="scene-search" placeholder="Search scene (e.g. w1l1)" aria-label="Search scenes">
+      <div id="scene-list" role="listbox" aria-label="Scenes"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Subject</h2>
+      <div class="check-list" id="subject-list"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Filters</h2>
+      <div class="field">
+        <label for="phase-seg">Phase</label>
+        <div class="seg" id="phase-seg" role="group" aria-label="Phase">
+          <button data-value="all" aria-pressed="true">All</button>
+          <button data-value="discovery" aria-pressed="false">Discovery</button>
+          <button data-value="practice" aria-pressed="false">Practice</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="outcome-seg">Outcome</label>
+        <div class="seg" id="outcome-seg" role="group" aria-label="Outcome">
+          <button data-value="all" aria-pressed="true">All</button>
+          <button data-value="completed" aria-pressed="false">Completed</button>
+          <button data-value="death" aria-pressed="false">Death</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>Display</h2>
+      <div class="field">
+        <label for="view-seg">View</label>
+        <div class="seg" id="view-seg" role="group" aria-label="View">
+          <button data-value="overlay" aria-pressed="true">Overlay</button>
+          <button data-value="panels" aria-pressed="false">Per-cluster panels</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="color-seg">Color by</label>
+        <div class="seg" id="color-seg" role="group" aria-label="Color by">
+          <button data-value="cluster" aria-pressed="true">Cluster</button>
+          <button data-value="outcome" aria-pressed="false">Outcome</button>
+          <button data-value="subject" aria-pressed="false">Subject</button>
+        </div>
+      </div>
+      <div class="check-list">
+        <label class="check"><input type="checkbox" id="toggle-noise" checked> Show noise (label −1)</label>
+        <label class="check"><input type="checkbox" id="toggle-bg" checked> Show scene background</label>
+      </div>
+    </section>
+  </aside>
+
+  <main id="main">
+    <div id="topbar">
+      <div>
+        <h2 id="chart-title">Select a scene</h2>
+        <p id="chart-sub">Cluster labels come from HDBSCAN over every trace in the scene; filters only change what is drawn.</p>
+      </div>
+      <div id="topbar-actions">
+        <button class="ghost" id="reset-view" hidden>Reset view</button>
+        <button class="ghost" id="clear-filters" hidden>Clear filters</button>
+      </div>
+    </div>
+
+    <div id="stage">
+      <div id="empty">Pick a scene from the left to plot its clustered trajectories.</div>
+
+      <div id="overlay-wrap" hidden>
+        <div id="canvas-box"><canvas id="canvas"></canvas></div>
+        <div id="legend"></div>
+        <p class="note" id="overlay-note" hidden></p>
+      </div>
+
+      <div id="panels" hidden></div>
+    </div>
+  </main>
+</div>
+
+<div id="tooltip" role="tooltip" data-show="false"></div>
+
+<script src="app.js"></script>
+</body>
+</html>

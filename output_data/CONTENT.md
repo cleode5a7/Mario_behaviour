@@ -26,6 +26,10 @@ One JSON file per scene produced by `invoke run-clustering`:
 - `<scene_id>_clusters.json` — cluster label per behavioural trace for that scene.
   Fields: `{"scene": str, "labels": [<per-trace cluster label>]}`
 
+  **No trace geometry is stored here** — the x/y polylines are rebuilt from
+  `source_data/mario.scenes/` on demand by `load_traces()`. See `web/` below for the
+  exported copy the dashboard reads.
+
 ## `clusters_by_category/`
 
 One JSON file per scene category (design-pattern tag from `source_data/scenes_mastersheet.csv`,
@@ -47,5 +51,37 @@ one subplot per cluster (shared axes) so individual cluster shapes are easy to c
 `source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png`; those images are
 not part of the dataset (must be generated separately), so by default the figures render
 on a plain y-flipped axis.
+
+## `web/`
+
+The static payload and app behind `invoke dashboard` — an interactive version of the
+figures above, with scene / subject / phase / outcome filters. Written by
+`invoke run-web-export`; roughly 50 MB in total.
+
+- `data/index.json` — one row per exported scene (`id`, `world`, `level`, `scene`, `n`
+  traces, `k` clusters, `noise` fraction, `subjects`, `phases`, `method`, pattern `tags`),
+  plus the corpus-wide subject/phase/tag lists. Drives the scene picker without loading
+  any scene payload.
+- `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
+  x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
+  `playfield_ylim`), `step`, and a `traces` array. Each trace carries its cluster label
+  `c`, the filterable metadata (`s` subject, `ses`, `run`, `clip`, `sf`, `ph` phase,
+  `out` outcome, `dur`), tooltip counters (`xt`, `ht`, `ek`, `ll`), and the polyline as
+  parallel `x`/`y` integer arrays. A `null` in `y` is a masked (dead) frame and must
+  break the line rather than be interpolated across.
+- `data/backgrounds/<scene_id>.png` — copies of the scene backgrounds, so the served
+  tree never reaches back into the 23 GB `mario.scenes` dataset at runtime.
+- `index.html`, `app.js`, `style.css` — copied from `web/` by `invoke dashboard`.
+
+Two caveats worth carrying:
+
+- **Coordinates are downsampled.** `step` (default 3) means only every 3rd frame was
+  kept, plus the first and last, and coordinates are rounded to integers. Fine for
+  drawing at 224 px tall; **do not** use this payload for quantitative analysis — go
+  back to `load_traces()` for that.
+- **Cluster labels are the pooled ones.** HDBSCAN ran once over every trace in the
+  scene. The dashboard's filters only change which traces are drawn; they never
+  re-cluster, and cluster colors stay fixed to the whole-scene rank-by-size order so a
+  filter cannot repaint the traces that survive it.
 
 > Note: output files are ignored by Git. Run `invoke run` to regenerate them.

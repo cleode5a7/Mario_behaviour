@@ -66,6 +66,7 @@ uv run invoke run-web-export --scenes w1l1s0      # export one scene for the das
 
 ### Interactive dashboard
 
+uv run invoke run-web-export --backfill           # add derived fields to existing payloads (seconds)
 The PNGs in `output_data/clusters/` are fixed views. For an interactive one:
 
 ```bash
@@ -75,8 +76,21 @@ uv run invoke dashboard          # serves http://localhost:8000
 
 It renders the same figure as `analysis/trace_plots.py` — scene background, cluster
 palette and marker shapes, per-cluster panels, per-subject composition — and adds what a
-PNG cannot do: pick any scene, filter to a subject, a phase (discovery / practice) or an
-outcome, hover a trajectory for its clip details, and click to isolate it.
+PNG cannot do: pick any scene, filter to a subject, a phase (discovery / practice), a
+stage or an outcome, hover a trajectory for its clip details, and click to isolate it.
+
+**Colour by** offers cluster, outcome, subject, **attempt #** or **stage**. The attempt
+ramp is viridis over the order in which a subject played that scene, normalised per
+subject — each player's own first attempt is dark and their own last is bright, so the
+colour reads as time rather than as how much they played.
+
+**Stage** cuts each phase into thirds (early / middle / late) and crosses with the Phase
+filter, so Discovery + Late gives late discovery, Practice + Early gives early practice,
+and so on for all six cells. The split is at the 1/3 and 2/3 `ClipCode` quantiles within
+each subject and phase, matching `add_stage_column` in the `mario_learning.behavior`
+repo. Because a scene lives inside a single level, the level mix is identical across the
+three bins — this is a genuine repetition axis, not the difficulty-confounded
+chronological binning that whole-session discovery thirds suffer from.
 
 Filters only change which traces are **drawn**. Clustering is never re-run, and cluster
 colors are pinned to the whole-scene ordering, so narrowing to one subject cannot
@@ -112,6 +126,6 @@ category) — see `slurm_clustering.sh` (per scene) and `slurm_clustering_by_cat
 - **Analysis in code, visualization in notebooks.** Heavy computation lives in `analysis/` and is run by `invoke` tasks. Notebooks only read results and produce figures. Trace-figure rendering lives in `analysis/trace_plots.py` (imported by `notebooks/figure_clustering.ipynb`): it plots each scene's trajectories with a screen-corrected vertical coordinate and can color traces by cluster (default) or by outcome (green = completed, red = death), set via `COLOR_BY` in the notebook. A `plot_scene_cluster_panels()` view splits a scene into one subplot per cluster (shared axes) in a single figure for reading individual cluster shapes.
 - **Idempotent steps.** Each task checks whether its outputs already exist and skips if they do. Call `invoke clean` then `invoke run` to force a full rerun.
 - **Chunked for reruns.** `run-changepoints` and `run-changepoints-by-category` process one subject at a time (`--subjects`); `run-clustering` chunks by scene (`--scenes`), `run-clustering-by-category` by category (`--categories`), and `run-web-export` by scene (`--scenes`). Any piece can be restricted or retried in isolation.
-- **Export once, serve statically.** The dashboard reads only `output_data/web/` — trace geometry and background images are baked there by `run-web-export`, so nothing at view time touches the 23 GB `mario.scenes` dataset. Re-export after re-clustering; `--force` overwrites existing payloads.
+- **Export once, serve statically.** The dashboard reads only `output_data/web/` — trace geometry and background images are baked there by `run-web-export`, so nothing at view time touches the 23 GB `mario.scenes` dataset. Re-export after re-clustering; `--force` overwrites existing payloads, and `--backfill` adds fields derivable from what the payload already holds without reading the source dataset at all.
 - **Background-ready trace plots.** Scene trajectory figures overlay a scene background image when one is present at `source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png` (set `BACKGROUND_DIR` in the notebook, or `None` to disable). These images are **not** part of the dataset and must be regenerated separately (see `mario.scenes/code/deprecated/make_images/make_scene_img.py`, which needs `stable_retro` + the source `mario` `.bk2` dataset). Until they exist, plots fall back automatically to a plain y-flipped axis.
 - **AI-native.** Initialized and extended with Claude Code — `CLAUDE.md` gives future sessions full context on the pipeline.

@@ -55,7 +55,7 @@ on a plain y-flipped axis.
 ## `web/`
 
 The static payload and app behind `invoke dashboard` — an interactive version of the
-figures above, with scene / subject / phase / outcome filters. Written by
+figures above, with scene / subject / phase / stage / outcome filters. Written by
 `invoke run-web-export`; roughly 50 MB in total.
 
 - `data/index.json` — one row per exported scene (`id`, `world`, `level`, `scene`, `n`
@@ -66,9 +66,17 @@ figures above, with scene / subject / phase / outcome filters. Written by
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
   `playfield_ylim`), `step`, and a `traces` array. Each trace carries its cluster label
   `c`, the filterable metadata (`s` subject, `ses`, `run`, `clip`, `sf`, `ph` phase,
-  `out` outcome, `dur`), tooltip counters (`xt`, `ht`, `ek`, `ll`), and the polyline as
-  parallel `x`/`y` integer arrays. A `null` in `y` is a masked (dead) frame and must
-  break the line rather than be interpolated across.
+  `out` outcome, `dur`), two derived time fields (`a`, `st` — below), tooltip counters
+  (`xt`, `ht`, `ek`, `ll`), and the polyline as parallel `x`/`y` integer arrays. A
+  `null` in `y` is a masked (dead) frame and must break the line rather than be
+  interpolated across.
+- `a` — **attempt index**: the nth entry this subject made into this scene, 1-based and
+  chronological across the whole experiment. Each clip is one attempt, re-entries after
+  a death included. Not the `rep-NNN` from `SourceBk2`, which restarts every session.
+- `st` — **phase tertile**: `"e"`, `"m"` or `"l"`, cutting each `(subject, phase)` group
+  at the 1/3 and 2/3 `ClipCode` quantiles. The full stage name is `st + "_" + ph`, so
+  only the letter is stored. Both fields come from `analysis/stages.py` and can be added
+  to an existing payload with `invoke run-web-export --backfill`.
 - `data/backgrounds/<scene_id>.png` — copies of the scene backgrounds, so the served
   tree never reaches back into the 23 GB `mario.scenes` dataset at runtime.
 - `index.html`, `app.js`, `style.css` — copied from `web/` by `invoke dashboard`.

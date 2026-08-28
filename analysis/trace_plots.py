@@ -51,6 +51,27 @@ OUTCOME_OTHER = "#898781"
 SUBJECT_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
                   "#a65628", "#f781bf", "#00ced1", "#999999", "#dede00"]
 
+# Time-ordered encodings use viridis — sequential, perceptually uniform, and the
+# house sequential map in the sibling mario_learning.behavior repo (its stage
+# colors are the same plt.get_cmap("viridis")(i / 5) samples).
+#
+# These are baked to hex rather than sampled from matplotlib at draw time because
+# web/app.js must use the *identical* values — the dashboard and these figures are
+# meant to be one figure in two media, and the browser has no colormap library.
+# If you change either list, change it in web/app.js too.
+
+# Stage colors: viridis at i/5, in STAGES order (early/middle/late x disc/practice).
+STAGE_COLORS = ["#440154", "#414487", "#2a788e", "#22a884", "#7ad151", "#fde725"]
+
+# 32-stop viridis ramp for attempt-ordered coloring (nearest-stop lookup). 32 steps
+# is well past what is distinguishable in overlapping thin trajectories.
+VIRIDIS_STOPS = [
+    "#440154", "#470d60", "#48186a", "#482374", "#472e7c", "#453882", "#424186", "#3e4a89",
+    "#3a548c", "#365d8d", "#32658e", "#2e6d8e", "#2b758e", "#287d8e", "#25848e", "#228c8d",
+    "#1f948c", "#1e9c89", "#20a386", "#25ab82", "#2eb37c", "#3aba76", "#48c16e", "#58c765",
+    "#6ccd5a", "#7fd34e", "#93d741", "#a8db34", "#c0df25", "#d5e21a", "#eae51a", "#fde725",
+]
+
 
 def subject_color_map(metadata) -> dict:
     """Stable ``Subject -> color`` dict, assigned by sorted subject id.

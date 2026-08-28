@@ -29,10 +29,27 @@ const OUTCOME_OTHER = "#898781";
 const SUBJECT_COLORS = ["#e41a1c", "#377eb8", "#4daf4a", "#984ea3", "#ff7f00",
                         "#a65628", "#f781bf", "#00ced1", "#999999", "#dede00"];
 
+/* Time-ordered encodings use viridis. Both lists are baked hex copied verbatim
+ * from analysis/trace_plots.py — change them there and here together. */
+const STAGE_COLORS = ["#440154", "#414487", "#2a788e", "#22a884", "#7ad151", "#fde725"];
+const VIRIDIS_STOPS = [
+  "#440154", "#470d60", "#48186a", "#482374", "#472e7c", "#453882", "#424186", "#3e4a89",
+  "#3a548c", "#365d8d", "#32658e", "#2e6d8e", "#2b758e", "#287d8e", "#25848e", "#228c8d",
+  "#1f948c", "#1e9c89", "#20a386", "#25ab82", "#2eb37c", "#3aba76", "#48c16e", "#58c765",
+  "#6ccd5a", "#7fd34e", "#93d741", "#a8db34", "#c0df25", "#d5e21a", "#eae51a", "#fde725",
+];
+
+/* Legend order for the six stages, mirroring STAGES in analysis/stages.py. The
+ * payload stores only the tertile letter; the stage is that plus the phase. */
+const STAGES = ["early_discovery", "middle_discovery", "late_discovery",
+                "early_practice", "middle_practice", "late_practice"];
+const TERTILE_NAMES = { e: "early", m: "middle", l: "late" };
+const stageName = (t) => (t.st && t.ph ? `${TERTILE_NAMES[t.st]}_${t.ph}` : "");
+
 /* Matplotlib linewidths are points at dpi=150; these are the CSS-pixel
  * equivalents that read the same on screen. */
-const LW = { direct: 1.6, faint: 1.0, outcome: 1.0, subject: 1.2 };
-const ALPHA = { direct: 0.85, faint: 0.35, outcome: 0.5, subject: 0.6 };
+const LW = { direct: 1.6, faint: 1.0, outcome: 1.0, subject: 1.2, attempt: 1.2, stage: 1.2 };
+const ALPHA = { direct: 0.85, faint: 0.35, outcome: 0.5, subject: 0.6, attempt: 0.6, stage: 0.6 };
 const MARKER_PX = { overlay: 7, panel: 6 };
 
 /* ---------- state ---------- */
@@ -42,7 +59,9 @@ const state = {
   scene: null,          // the loaded scene payload
   bg: null,             // HTMLImageElement or null
   subjectColors: new Map(),
-  filters: { subjects: new Set(), phase: "all", outcome: "all" },
+  attemptMax: new Map(),   // subject -> highest attempt index in this scene
+  hasDerived: true,        // payload carries the attempt/stage fields
+  filters: { subjects: new Set(), phase: "all", outcome: "all", stage: "all" },
   colorBy: "cluster",
   view: "overlay",
   showNoise: true,
@@ -130,6 +149,7 @@ function visibleTraces() {
   return state.scene.traces.filter((t) =>
     f.subjects.has(t.s) &&
     (f.phase === "all" || t.ph === f.phase) &&
+    (f.stage === "all" || t.st === f.stage) &&
     (f.outcome === "all" || t.out === f.outcome) &&
     (state.showNoise || t.c !== -1) &&
     !state.hiddenClusters.has(t.c));
@@ -171,6 +191,44 @@ function visibleRanked(rank, counts) {
   return rank.ranked.filter((l) => (counts.get(l) || 0) > 0);
 }
 
+/* Viridis position for a trace, normalised WITHIN ITS SUBJECT: every player's
+ * own first attempt is dark and their own last is bright. Players make very
+ * different numbers of attempts at the same scene (44/34/27/33/29 on w1l1s0), and
+ * a scene-wide denominator would make colour encode how much someone played as
+ * well as when — so a light trace would mean "late" for one player and "played a
+ * lot" for another. Per-subject keeps it reading purely as time. */
+function attemptFrac(t) {
+  const max = state.attemptMax.get(t.s) || 1;
+  return max > 1 ? (t.a - 1) / (max - 1) : 1;
+}
+
+function attemptColor(t) {
+  return VIRIDIS_STOPS[Math.round(attemptFrac(t) * (VIRIDIS_STOPS.length - 1))];
+}
+
+/* Painting order for sequential colour modes.
+ *
+ * Traces in a scene overlap almost completely — everyone runs the same corridor —
+ * so at these alphas the top few strokes are the only ones visible, and painting
+ * order decides what the plot says. Payload order is (Subject, Session, Run, ...),
+ * i.e. blocked by subject, which for a time ramp is actively wrong: sub-06's first
+ * attempt lands on top of sub-01's last, and the visible colour ends up encoding
+ * subject order instead of time. Sort ascending so the latest attempts sit on top
+ * and early ones show only where they actually diverged.
+ *
+ * Categorical modes (cluster / outcome / subject) keep payload order — nothing is
+ * gained by reordering them, and leaving them alone keeps the overlay identical to
+ * the PNG that analysis/trace_plots.py draws. */
+function drawOrder(traces) {
+  if (state.colorBy === "attempt") {
+    return [...traces].sort((a, b) => attemptFrac(a) - attemptFrac(b));
+  }
+  if (state.colorBy === "stage") {   // STAGES is already in chronological order
+    return [...traces].sort((a, b) => STAGES.indexOf(stageName(a)) - STAGES.indexOf(stageName(b)));
+  }
+  return traces;
+}
+
 function styleFor(t, rank, counts) {
   if (state.colorBy === "outcome") {
     return {
@@ -196,6 +254,16 @@ function styleFor(t, rank, counts) {
     color = state.subjectColors.get(t.s) || OTHER_COLOR;
     alpha = ALPHA.subject; lw = LW.subject;
     name = `sub-${t.s}`;
+  } else if (state.colorBy === "attempt") {
+    color = attemptColor(t);
+    marker = null;
+    alpha = ALPHA.attempt; lw = LW.attempt;
+    name = `attempt ${t.a}`;
+  } else if (state.colorBy === "stage") {
+    const i = STAGES.indexOf(stageName(t));
+    color = i === -1 ? OTHER_COLOR : STAGE_COLORS[i];
+    alpha = ALPHA.stage; lw = LW.stage;
+    name = stageName(t) || "unknown stage";
   }
   return { color, marker, name, alpha, lw };
 }
@@ -307,7 +375,7 @@ function renderOverlay() {
   const counts = visibleCounts(traces);          // labels: live, filtered subset
   const focus = state.pinned || state.hover;
 
-  for (const t of traces) {
+  for (const t of drawOrder(traces)) {
     if (focus && t === focus) continue;          // drawn last, on top
     const st = styleFor(t, rank, counts);
     const dim = focus ? 0.12 : 1;                // ghost the rest while focused
@@ -398,6 +466,35 @@ function renderLegend(traces, rank, counts) {
     return;
   }
 
+  if (state.colorBy === "stage") {
+    const counts = new Map();
+    for (const t of traces) {
+      const name = stageName(t) || "unknown stage";
+      counts.set(name, (counts.get(name) || 0) + 1);
+    }
+    // Fixed STAGES order, and every stage stays listed even at n=0 — a filter
+    // that empties a third should say so rather than drop it from the legend.
+    for (const name of STAGES) {
+      legend.appendChild(legendItem(STAGE_COLORS[STAGES.indexOf(name)], null,
+                                    `${name.replace("_", " ")} (n=${counts.get(name) || 0})`, null));
+    }
+    if (counts.has("unknown stage")) {
+      legend.appendChild(legendItem(OTHER_COLOR, null,
+                                    `unknown stage (n=${counts.get("unknown stage")})`, null));
+    }
+    return;
+  }
+
+  if (state.colorBy === "attempt") {
+    // A row per attempt would be dozens of entries, so the ramp itself is the
+    // legend. The scale is per-subject, which the caption has to say outright or
+    // two same-coloured traces from different players look like the same attempt.
+    const shown = traces.filter((t) => t.a != null);
+    const hi = shown.length ? Math.max(...shown.map((t) => t.a)) : 0;
+    legend.appendChild(legendRamp(`attempt 1 → last, per subject (max ${hi})`));
+    return;
+  }
+
   // cluster mode: stable rank order, clickable to toggle. Every cluster in the
   // scene stays listed even at n=0, so a filter that empties one shows that
   // plainly instead of silently dropping it from the legend.
@@ -450,7 +547,65 @@ function legendItem(color, marker, text, toggleLabel) {
   return btn;
 }
 
+/* Gradient swatch for the continuous attempt ramp — same shape as legendItem so
+ * it sits in the legend row without special-casing the layout. */
+function legendRamp(text) {
+  const btn = document.createElement("button");
+  btn.className = "legend-item";
+  btn.type = "button";
+  btn.setAttribute("aria-pressed", "true");
+  btn.style.cursor = "default";
+
+  const dpr = window.devicePixelRatio || 1;
+  const mark = document.createElement("canvas");
+  mark.className = "legend-mark legend-mark--ramp";
+  mark.width = 44 * dpr; mark.height = 12 * dpr;
+  mark.style.width = "44px"; mark.style.height = "12px";
+  const mctx = mark.getContext("2d");
+  mctx.scale(dpr, dpr);
+  const grad = mctx.createLinearGradient(0, 0, 44, 0);
+  VIRIDIS_STOPS.forEach((c, i) => grad.addColorStop(i / (VIRIDIS_STOPS.length - 1), c));
+  mctx.fillStyle = grad;
+  mctx.fillRect(0, 2, 44, 8);
+  btn.appendChild(mark);
+
+  const span = document.createElement("span");
+  span.textContent = text;
+  btn.appendChild(span);
+  return btn;
+}
+
 /* ---------- panels view ---------- */
+
+/* Which composition pills a panel should carry, or null for modes where the
+ * breakdown is not meaningful (cluster: it is the panel itself; attempt: a
+ * continuous quantity, not categories). */
+function compositionSpec(members) {
+  if (!members.length) return null;
+  if (state.colorBy === "subject") {
+    const comp = new Map();
+    for (const t of members) comp.set(t.s, (comp.get(t.s) || 0) + 1);
+    return {
+      entries: [...comp.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1)),
+      label: (s) => `sub-${s}`,
+      color: (s) => state.subjectColors.get(s) || OTHER_COLOR,
+    };
+  }
+  if (state.colorBy === "stage") {
+    const comp = new Map();
+    for (const t of members) {
+      const name = stageName(t) || "unknown";
+      comp.set(name, (comp.get(name) || 0) + 1);
+    }
+    return {
+      entries: STAGES.filter((n) => comp.has(n)).map((n) => [n, comp.get(n)])
+        .concat(comp.has("unknown") ? [["unknown", comp.get("unknown")]] : []),
+      label: (n) => n.replace("_", " "),
+      color: (n) => (STAGES.indexOf(n) === -1 ? OTHER_COLOR : STAGE_COLORS[STAGES.indexOf(n)]),
+    };
+  }
+  return null;
+}
 
 function renderPanels() {
   const host = $("panels");
@@ -492,18 +647,18 @@ function renderPanels() {
     const canvas = document.createElement("canvas");
     box.appendChild(canvas);
 
-    // Per-cluster subject composition, mirroring the pills in
-    // plot_scene_cluster_panels(); percentages are of the panel's visible traces.
-    if (state.colorBy === "subject" && members.length) {
-      const comp = new Map();
-      for (const t of members) comp.set(t.s, (comp.get(t.s) || 0) + 1);
+    // Per-cluster composition pills, mirroring plot_scene_cluster_panels();
+    // percentages are of the panel's visible traces. Shown for the two
+    // categorical modes where "what is this cluster made of" is the question.
+    const comp = compositionSpec(members);
+    if (comp) {
       const wrap = document.createElement("div");
       wrap.className = "composition";
-      for (const s of [...comp.keys()].sort()) {
-        const pct = Math.round((100 * comp.get(s)) / members.length);
+      for (const [key, n] of comp.entries) {
+        const pct = Math.round((100 * n) / members.length);
         const span = document.createElement("span");
-        span.textContent = `sub-${s}: ${pct}% (n=${comp.get(s)})`;
-        span.style.color = state.subjectColors.get(s) || OTHER_COLOR;
+        span.textContent = `${comp.label(key)}: ${pct}% (n=${n})`;
+        span.style.color = comp.color(key);
         wrap.appendChild(span);
       }
       box.appendChild(wrap);
@@ -531,12 +686,10 @@ function renderPanels() {
     const marker = label === -1 ? "x"
                  : slot === undefined ? "." : CLUSTER_MARKERS[slot];
 
-    for (const t of members) {
-      const color = state.colorBy === "subject"
-        ? (state.subjectColors.get(t.s) || OTHER_COLOR)
-        : state.colorBy === "outcome"
-          ? (OUTCOME_COLORS[t.out] || OUTCOME_OTHER)
-          : panelColor;
+    for (const t of drawOrder(members)) {
+      const color = state.colorBy === "cluster"
+        ? panelColor
+        : styleFor(t, rank, counts).color;
       drawTrace(ctx, t, proj, color, ALPHA.subject, LW.subject);
       const p = firstPoint(t);
       if (p) drawMarker(ctx, marker, proj.x(p[0]), proj.y(p[1]),
@@ -580,6 +733,8 @@ function showTooltip(t, clientX, clientY) {
     ["subject", `sub-${t.s}`],
     ["session/run", `${t.ses} / ${t.run}`],
     ["phase", t.ph],
+    ["stage", stageName(t) ? stageName(t).replace("_", " ") : "—"],
+    ["attempt", t.a == null ? "—" : `${t.a} of ${state.attemptMax.get(t.s) || t.a}`],
     ["outcome", t.out],
     ["duration", t.dur == null ? "—" : `${t.dur} s`],
     ["cluster", t.c === -1 ? "noise" : t.c],
@@ -720,6 +875,18 @@ async function selectScene(id) {
   const kept = [...state.filters.subjects].filter((s) => subjects.includes(s));
   state.filters.subjects = new Set(kept.length ? kept : subjects);
 
+  // Denominator for the attempt ramp, per subject (see attemptColor).
+  state.attemptMax = new Map();
+  for (const t of payload.traces) {
+    if (t.a != null) state.attemptMax.set(t.s, Math.max(state.attemptMax.get(t.s) || 0, t.a));
+  }
+
+  // A payload exported before the attempt/stage fields existed would silently
+  // draw everything one colour and filter to nothing, so say so and lock the
+  // controls instead.
+  state.hasDerived = payload.traces.every((t) => t.a != null && t.st !== undefined);
+  applyDerivedAvailability();
+
   state.bg = null;
   if (payload.bg) {
     const img = await loadImage(`data/backgrounds/${payload.bg}`).catch(() => null);
@@ -732,6 +899,28 @@ async function selectScene(id) {
   renderSceneList();
   renderSubjectList();
   render();
+}
+
+/* Enable/disable the controls that need the derived fields. */
+function applyDerivedAvailability() {
+  const why = "Needs the attempt/stage fields — run: invoke run-web-export --backfill";
+  const targets = [...$("stage-seg").querySelectorAll("button")].concat(
+    [...$("color-seg").querySelectorAll("button")]
+      .filter((b) => b.dataset.value === "attempt" || b.dataset.value === "stage"));
+  for (const b of targets) {
+    b.disabled = !state.hasDerived;
+    b.title = state.hasDerived ? "" : why;
+  }
+  if (!state.hasDerived) {
+    state.filters.stage = "all";
+    if (state.colorBy === "attempt" || state.colorBy === "stage") state.colorBy = "cluster";
+    for (const id of ["stage-seg", "color-seg"]) {
+      for (const b of $(id).querySelectorAll("button")) {
+        b.setAttribute("aria-pressed",
+          String(b.dataset.value === (id === "stage-seg" ? "all" : state.colorBy)));
+      }
+    }
+  }
 }
 
 function loadImage(src) {
@@ -837,10 +1026,11 @@ function clearFilters() {
     state.filters.subjects = new Set(state.scene.traces.map((t) => t.s));
   }
   state.filters.phase = "all";
+  state.filters.stage = "all";
   state.filters.outcome = "all";
   state.hiddenClusters.clear();
   state.pinned = null; state.hover = null;
-  for (const id of ["phase-seg", "outcome-seg"]) {
+  for (const id of ["phase-seg", "stage-seg", "outcome-seg"]) {
     for (const b of $(id).querySelectorAll("button")) {
       b.setAttribute("aria-pressed", String(b.dataset.value === "all"));
     }
@@ -876,6 +1066,7 @@ async function init() {
   $("scene-search").addEventListener("input", renderSceneList);
   tagSel.addEventListener("change", renderSceneList);
   bindSeg("phase-seg", "phase");
+  bindSeg("stage-seg", "stage");
   bindSeg("outcome-seg", "outcome");
   bindSeg("view-seg", "view");
   bindSeg("color-seg", "colorBy");

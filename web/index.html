@@ -40,6 +40,16 @@
         </div>
       </div>
       <div class="field">
+        <label for="stage-seg">Stage</label>
+        <div class="seg" id="stage-seg" role="group" aria-label="Stage">
+          <button data-value="all" aria-pressed="true">All</button>
+          <button data-value="e" aria-pressed="false">Early</button>
+          <button data-value="m" aria-pressed="false">Mid</button>
+          <button data-value="l" aria-pressed="false">Late</button>
+        </div>
+        <p class="hint">thirds within each phase &mdash; cross with Phase for e.g. late discovery</p>
+      </div>
+      <div class="field">
         <label for="outcome-seg">Outcome</label>
         <div class="seg" id="outcome-seg" role="group" aria-label="Outcome">
           <button data-value="all" aria-pressed="true">All</button>
@@ -60,10 +70,12 @@
       </div>
       <div class="field">
         <label for="color-seg">Color by</label>
-        <div class="seg" id="color-seg" role="group" aria-label="Color by">
+        <div class="seg seg--wrap" id="color-seg" role="group" aria-label="Color by">
           <button data-value="cluster" aria-pressed="true">Cluster</button>
           <button data-value="outcome" aria-pressed="false">Outcome</button>
           <button data-value="subject" aria-pressed="false">Subject</button>
+          <button data-value="attempt" aria-pressed="false">Attempt&nbsp;#</button>
+          <button data-value="stage" aria-pressed="false">Stage</button>
         </div>
       </div>
       <div class="check-list">

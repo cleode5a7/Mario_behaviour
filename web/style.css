@@ -191,7 +191,19 @@ select { margin-bottom: 6px; }
   cursor: pointer;
 }
 .seg button:last-child { border-right: none; }
+
+/* Segments with more entries than fit one row (e.g. the five colour modes).
+   Every button keeps its right border so wrapped rows stay gridded; .seg's own
+   overflow:hidden trims the ones that land on the right edge. */
+.seg--wrap { flex-wrap: wrap; }
+.seg--wrap button {
+  flex: 1 0 30%;
+  border-bottom: 1px solid var(--line);
+}
+.seg--wrap button:last-child { border-right: 1px solid var(--line); }
 .seg button:hover { background: var(--surface-3); }
+.seg button:disabled { opacity: 0.35; cursor: not-allowed; }
+.seg button:disabled:hover { background: none; }
 .seg button[aria-pressed="true"] {
   background: var(--accent);
   color: #fff;
@@ -205,6 +217,13 @@ select { margin-bottom: 6px; }
   margin-bottom: 4px;
   font-size: 11px;
   color: var(--ink-2);
+}
+.field .hint {
+  margin: 4px 0 0;
+  font-size: 10px;
+  line-height: 1.35;
+  color: var(--ink-3);
+  opacity: 0.8;
 }
 
 /* ---------- main ---------- */
@@ -290,6 +309,9 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
 .legend-item:hover { background: var(--surface-3); }
 .legend-item[aria-pressed="false"] { opacity: 0.4; text-decoration: line-through; }
 .legend-mark { width: 22px; height: 12px; flex: 0 0 22px; }
+/* The attempt ramp needs a wider swatch to read as a gradient; flex-basis has to
+   move with it, since it beats the inline width inside a flex row. */
+.legend-mark--ramp { width: 44px; flex: 0 0 44px; }
 
 /* ---------- panels view ---------- */
 

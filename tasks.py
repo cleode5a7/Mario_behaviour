@@ -208,7 +208,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
 
 
 @task
-def run_web_export(c, scenes=None, smoke=False, step=3, force=False):
+def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=False):
     """Export clustered traces to a static payload for the browser dashboard.
 
     The cluster JSONs hold labels + metadata but no geometry, so the dashboard
@@ -222,14 +222,28 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False):
                60 fps against a 224 px background, so 3 is visually lossless;
                lower it for more fidelity at the cost of payload size.
         force: re-export scenes whose payload already exists
+        backfill: only add the derived attempt/stage fields to payloads that
+               already exist, then rewrite the index. Reads nothing but the
+               exported JSON, so it takes seconds where --force would re-read
+               the source dataset. Use it after a change that adds a field
+               derivable from what the payload already carries.
     """
-    from analysis.webexport import list_clustered_scenes, export_scene, sync_backgrounds, write_index
+    from analysis.webexport import (backfill_derived, export_scene, list_clustered_scenes,
+                                    sync_backgrounds, write_index)
     from analysis.trace_plots import default_background_dir, scene_entry_map
 
     source_dir = Path(c.config.get("source_data_dir"))
     output_dir = Path(c.config.get("output_data_dir"))
     web_dir = output_dir / "web" / "data"
     web_dir.mkdir(parents=True, exist_ok=True)
+
+    if backfill:
+        if not (web_dir / "scenes").exists():
+            print("Nothing to backfill — no payload at output_data/web/data/scenes.")
+            return
+        backfill_derived(web_dir)
+        write_index(web_dir, source_dir)
+        return
 
     all_scenes = list_clustered_scenes(output_dir)
     if not all_scenes:

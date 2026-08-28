@@ -25,6 +25,7 @@ import shutil
 import numpy as np
 
 from analysis.clustering import load_scene_patterns
+from analysis.stages import attempt_index, stage_tertiles
 from analysis.trace_plots import (
     _shared_xlim,
     default_background_dir,
@@ -56,6 +57,27 @@ def list_clustered_scenes(output_dir: Path) -> list[str]:
         return []
     return sorted(p.name[: -len("_clusters.json")]
                   for p in clusters_dir.glob("*_clusters.json"))
+
+
+def add_derived(out_traces: list[dict]) -> None:
+    """Attach the attempt index and stage tertile to payload records, in place.
+
+    Depends only on ``s`` / ``ph`` / ``clip``, which are already on every exported
+    record — that is what lets ``backfill_derived`` add these fields to an
+    existing payload without re-reading the 23 GB source dataset.
+
+    Adds:
+        "a"  1-based nth attempt this subject made at this scene (chronological)
+        "st" phase tertile, "e" / "m" / "l", or "" when Phase is missing. The full
+             stage name is ``st + "_" + ph``; storing only the letter keeps the
+             field one byte, and Phase and Stage stay two independent filters in
+             the dashboard, which is exactly how the UI crosses them.
+    """
+    meta = [{"Subject": t.get("s", "?"), "Phase": t.get("ph", ""),
+             "ClipCode": t.get("clip", "")} for t in out_traces]
+    for t, a, st in zip(out_traces, attempt_index(meta), stage_tertiles(meta)):
+        t["a"] = int(a)
+        t["st"] = st
 
 
 def _downsample(trace: np.ndarray, step: int, x_offset: int = 0) -> tuple[list, list]:
@@ -128,6 +150,8 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
         }
         rec.update({short: meta.get(field) for field, short in EXTRA_FIELDS.items()})
         out_traces.append(rec)
+
+    add_derived(out_traces)
 
     payload = {
         "scene": scene_id,
@@ -241,3 +265,23 @@ def sync_backgrounds(web_dir: Path, source_dir: Path, scene_ids=None) -> int:
             shutil.copy2(src, dest)
             copied += 1
     return copied
+
+
+def backfill_derived(web_dir: Path) -> int:
+    """Add the derived fields to already-exported scene payloads, in place.
+
+    The attempt index and stage tertile are computed from ``s``/``ph``/``clip``,
+    all of which the payload already carries, so this needs neither
+    ``mario.scenes`` nor the cluster files — it rewrites 300-odd JSON files in
+    seconds where a ``--force`` re-export would re-read tens of GB for nothing.
+    Fresh exports get the fields from ``export_scene``; this is the migration
+    path for payloads written before they existed.
+    """
+    scenes_dir = Path(web_dir) / "scenes"
+    paths = sorted(scenes_dir.glob("*.json"))
+    for path in paths:
+        payload = json.loads(path.read_text())
+        add_derived(payload["traces"])
+        path.write_text(json.dumps(payload, separators=(",", ":")))
+    print(f"Backfilled attempt/stage fields in {len(paths)} scene payloads")
+    return len(paths)

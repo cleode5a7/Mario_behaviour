@@ -1,35 +1,83 @@
 import os
+import re
 import shutil
 from pathlib import Path
 from invoke import task
 
 
-@task
-def fetch(c):
-    """Clone mario.scenes datalad dataset and decompress JSON archives."""
-    source_dir = Path(c.config.get("source_data_dir"))
-    scenes_dir = source_dir / "mario.scenes"
+@task(help={
+    "source": "Path to an existing mario.scenes checkout to symlink instead of cloning.",
+})
+def fetch_mario_scenes(c, source=None):
+    """Make the mario.scenes datalad dataset available, and decompress its archives.
 
-    if not (scenes_dir / ".git").exists():
-        datalad_check = c.run("datalad --version", warn=True, hide=True)
-        if not datalad_check.ok:
-            print("datalad is not installed — cannot fetch mario.scenes.")
-            print("Install it with:  pip install datalad  (or  uv add datalad)")
-            print("See: https://www.datalad.org/get_datalad.html")
-            return
-        print("Cloning mario.scenes dataset...")
-        c.run(f"datalad install git@github.com:courtois-neuromod/mario.scenes {scenes_dir}")
-        c.run(f"git -C {scenes_dir} checkout dev_refactor")
-        c.run(f"datalad get -d {scenes_dir} .")
-    else:
-        print(f"mario.scenes already cloned at {scenes_dir}, skipping install.")
+    Two ways in, decided by `airoh.datalad.install_dataset`:
+
+    - **clone** (default) — `datalad clone` the `url` from invoke.yaml, check out
+      the configured branch, `datalad get` the content, then run the dataset's
+      own `code/archives/decompress.py` to extract the per-scene JSON files.
+    - **symlink** — `--source /path/to/checkout` (or the entry's `source:` key)
+      points source_data/mario.scenes at a checkout that already exists, so the
+      23 GB dataset is not duplicated per project.
+
+    A symlinked checkout is **read as-is**: no branch checkout, no `datalad get`,
+    no decompression. Those all write into a dataset this project does not own,
+    and silently switching a colleague's branch is worse than telling them the
+    checkout is not ready. If it lacks JSON files, this says so and stops.
+
+    Idempotent: an existing checkout (linked or cloned) is left alone.
+    """
+    from airoh.datalad import get_data, install_dataset
+
+    entry = c.config.get("datasets")["mario_scenes"]
+    scenes_dir = Path(entry["output_dir"])
+    linking = bool(source or entry.get("source"))
+
+    if not scenes_dir.exists() and not linking and not shutil.which("datalad"):
+        print("datalad is not installed — cannot clone mario.scenes.")
+        print("Install it with:  pip install datalad  (or  uv add datalad)")
+        print("Already have the dataset? Point at it instead:")
+        print("  invoke fetch-mario-scenes --source /path/to/mario.scenes")
+        print("See: https://www.datalad.org/get_datalad.html")
+        return
+
+    fresh_clone = not scenes_dir.exists() and not linking
+    install_dataset(c, "mario_scenes", source=source)
+
+    if fresh_clone:
+        c.run(f"git -C {scenes_dir} checkout {entry['branch']}")
+        get_data(c, "mario_scenes")
 
     json_files = list(scenes_dir.glob("**/*.json"))
-    if not json_files:
+    if json_files:
+        print(f"JSON files already present ({len(json_files)} found), skipping decompress.")
+    elif scenes_dir.is_symlink():
+        print(f"⚠️  {scenes_dir} links to an external checkout with no JSON files.")
+        print("    Leaving it untouched — run code/archives/decompress.py there yourself.")
+    else:
         print("Decompressing archives...")
         c.run(f"cd {scenes_dir} && python code/archives/decompress.py")
-    else:
-        print(f"JSON files already present ({len(json_files)} found), skipping decompress.")
+
+
+@task(help={
+    "mario-scenes-source": "Path to an existing mario.scenes checkout to symlink "
+                           "instead of cloning.",
+})
+def fetch(c, mario_scenes_source=None):
+    """Retrieve all source data assets.
+
+    Each asset has its own fetch-{name} task; this umbrella routes a per-asset
+    --{name}-source flag to the matching one. (scenes_mastersheet.csv has no
+    fetch task — it is checked into Git.)
+
+    Records what each asset actually resolved to in source_data/MANIFEST.json,
+    including the commit of a symlinked external checkout, so the inputs a later
+    run consumed stay identifiable. See CLAUDE.md, "Recording asset versions".
+    """
+    from airoh.provenance import record_sources
+
+    fetch_mario_scenes(c, source=mario_scenes_source)
+    record_sources(c)
 
 
 @task
@@ -113,15 +161,32 @@ def run_changepoints_by_category(c, subjects=None, smoke=False, beta=1.0, n_bkps
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
+def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=20.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging"):
     """Cluster behavioural traces within each scene using Fréchet distance.
+
+    Defaults to `consensus` — bagged HDBSCAN, where the ensemble produces the
+    labels rather than a single fit being trusted. min_cluster_size=5 and
+    epsilon=20 are not arbitrary: they are what `select-cluster-params` chose from
+    a 12-point sweep over 288 scenes (82% of all traces land in a cluster that
+    survives resampling, median k=4). See output_data/stability/selected_params.json
+    for the full grid, and run the sweep again if the source data changes.
 
     The Fréchet distance matrix is cached under output_data/frechet/; re-running
     with a different epsilon/k/method reuses it (skipping the expensive O(n^2)
     recompute). Delete only the <scene>_clusters.json to re-cluster cheaply.
 
     Args:
-        method:                     hdbscan (default) or kmedoids
+        method:                     consensus (default), hdbscan (single fit) or kmedoids
+        bootstraps:                 consensus replicates (200 verified converged)
+        frac:                       subsample fraction, drawn without replacement
+        seed:                       makes the consensus labels reproducible
+        consensus_epsilon:          merge threshold for the consensus fit, in
+                                    co-association distance (NOT Fréchet units);
+                                    0.4 = "co-clustered in >60% of shared replicates"
+        scheme:                     subagging (default; 80% without replacement) or
+                                    bootstrap (Breiman: n with replacement). Bootstrap
+                                    replicates hold ~63% unique points and overestimate
+                                    k by ~29% — see CLAUDE.md before switching.
         n_clusters:                 number of clusters for kmedoids
         min_cluster_size:           minimum cluster size for hdbscan
         min_samples:                hdbscan noise aggressiveness (defaults to
@@ -155,16 +220,24 @@ def run_clustering(c, scenes=None, smoke=False, method="hdbscan", n_clusters=5, 
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme)
 
 
 @task
-def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None):
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging"):
     """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
 
     Traces are pooled across every scene tagged with the category (from
     scenes_mastersheet.csv) and re-based to a common origin before clustering,
     since raw traces from different scenes sit at different absolute positions.
+
+    Unlike the per-scene task this still defaults to a single `hdbscan` fit, not
+    `consensus`. A category pools up to ~19,000 traces, where the distance matrix
+    alone is ~2.9 GB and each of the 200 subsample copies ~1.9 GB — bagging needs a
+    memory strategy (float32, a lower B, and the Jaccard-only path with no
+    co-association matrix) that is not built yet. `--method consensus` works and is
+    correct for the small categories; size the job accordingly before using it on a
+    large one.
 
     The Fréchet distance matrix is cached under output_data/frechet/; re-running
     with a different epsilon/k/method reuses it (skipping the expensive O(n^2)
@@ -204,7 +277,183 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs)
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme)
+
+
+@task
+def run_cluster_audit(c, scenes=None, smoke=False, bootstraps=60, frac=0.8):
+    """Audit stored cluster files: recover their parameters, then score them.
+
+    The stored <scene>_clusters.json records no parameters, and the scenes were not
+    all clustered alike, so this reconstructs the settings that reproduce each
+    partition (by grid search, ARI >= 0.999) and *then* measures how well that
+    partition survives resampling. Recovering first matters: replicate fits made
+    with the wrong settings depress the Jaccard through a parameter mismatch rather
+    than through genuine instability.
+
+    Reads only output_data/ (the stored labels and the cached Fréchet matrices);
+    never opens mario.scenes. Results merge into output_data/stability/audit.json,
+    so --scenes chunks accumulate and a re-run skips what is already recorded.
+    """
+    from analysis.stability import run_cluster_audit as _run_cluster_audit
+
+    output_dir = Path(c.config.get("output_data_dir"))
+
+    clusters_dir = output_dir / "clusters"
+    if not clusters_dir.exists():
+        print("No clustering output to audit — run invoke run-clustering first.")
+        return
+
+    all_scenes = sorted(p.name[: -len("_clusters.json")]
+                        for p in clusters_dir.glob("*_clusters.json"))
+    if not all_scenes:
+        print("No clustering output to audit — run invoke run-clustering first.")
+        return
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    _run_cluster_audit(all_scenes, output_dir,
+                       B=int(bootstraps), frac=float(frac))
+
+
+@task
+def run_cluster_sweep(c, scenes=None, smoke=False, min_cluster_sizes="5,10,20",
+                      epsilons="0,10,20,40", bootstraps=60, frac=0.8):
+    """Score each (min_cluster_size, epsilon) by how well its clusters resample.
+
+    For every grid point: fit HDBSCAN on the full cached Fréchet matrix, refit on
+    B random 80% subsamples, and record what share of the scene's traces sit in a
+    cluster whose mean bootstrap Jaccard clears 0.75. Count parameters are scaled
+    by the subsample fraction inside the resampler; epsilon, being a distance
+    threshold, is not.
+
+    Reads only the cached matrices under output_data/frechet/ — never opens
+    mario.scenes. Writes output_data/stability/<scene>_sweep.json.
+
+    Args:
+        min_cluster_sizes:  comma-separated grid axis (default 5,10,20)
+        epsilons:           comma-separated grid axis, Fréchet units (default 0,10,20,40)
+        bootstraps:         replicates per grid point; 60 is ample to *rank* points
+        frac:               subsample fraction, drawn without replacement
+    """
+    from analysis.stability import run_sweep
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    frechet_dir = output_dir / "frechet"
+    if not frechet_dir.exists():
+        print("No cached Fréchet matrices — run invoke run-clustering first.")
+        return
+
+    all_scenes = sorted(p.stem for p in frechet_dir.glob("*.npy")
+                        if re.fullmatch(r"w\d+l\d+s\d+", p.stem))
+    if not all_scenes:
+        print("No cached Fréchet matrices — run invoke run-clustering first.")
+        return
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    grid = [(int(m), float(e))
+            for m in min_cluster_sizes.split(",")
+            for e in epsilons.split(",")]
+    run_sweep(all_scenes, output_dir, grid=grid,
+              B=int(bootstraps), frac=float(frac))
+
+
+@task
+def select_cluster_params(c, floor=0.80):
+    """Pick one global (min_cluster_size, epsilon) from the per-scene sweeps.
+
+    Aggregates trace-weighted, then takes the largest k whose stable share clears
+    `floor`. Maximising stability alone would pick the degenerate k=2 collapse, so
+    the rule prefers the finest partition that still reproduces. Writes
+    output_data/stability/selected_params.json.
+    """
+    from analysis.stability import select_global_params
+
+    select_global_params(Path(c.config.get("output_data_dir")), floor=float(floor))
+
+
+@task
+def run_scheme_comparison(c, scenes=None, smoke=False, bootstraps=200, frac=0.8,
+                          min_cluster_size=5, cluster_selection_epsilon=20.0,
+                          consensus_epsilon=0.4, n_jobs=None):
+    """Cluster every scene under BOTH resampling schemes and write the comparison.
+
+    subagging (frac*n without replacement, the default) vs Breiman bootstrap
+    (n with replacement), at identical parameters, B and seed — so the only thing
+    that differs is how replicates are drawn. Writes
+    output_data/stability/scheme_comparison.json.
+
+    Reads only the cached Fréchet matrices; never opens mario.scenes. Parallel over
+    scenes, so -1 uses all cores.
+    """
+    from analysis.stability import run_scheme_comparison as _compare
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    frechet_dir = output_dir / "frechet"
+    if not frechet_dir.exists():
+        print("No cached Fréchet matrices — run invoke run-clustering first.")
+        return
+
+    all_scenes = sorted(p.stem for p in frechet_dir.glob("*.npy")
+                        if re.fullmatch(r"w\d+l\d+s\d+", p.stem))
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    _n_jobs = int(n_jobs) if n_jobs is not None else int(
+        os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    _compare(all_scenes, output_dir,
+             params={"min_cluster_size": int(min_cluster_size),
+                     "cluster_selection_epsilon": float(cluster_selection_epsilon)},
+             B=int(bootstraps), frac=float(frac),
+             consensus_epsilon=float(consensus_epsilon), n_jobs=_n_jobs)
+
+
+@task
+def run_coassociation(c, scenes=None, smoke=False, force=False):
+    """Store each scene's co-association matrix (the consensus matrix) as uint8.
+
+    cluster_traces builds this matrix, derives the labels and stability from it, then
+    discards it — so nothing could display it. This regenerates it from the cached
+    Fréchet matrix plus the params each cluster file records (the draws are seeded, so
+    it reproduces exactly), and writes output_data/coassociation/<scene>.npy.
+
+    Feeds the dashboard's Matrix view via run-web-export. Reads only output_data/;
+    never opens mario.scenes. ~13 MB for the whole corpus.
+    """
+    from analysis.stability import run_coassociation as _run
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    clusters_dir = output_dir / "clusters"
+    if not clusters_dir.exists():
+        print("No clustering output — run invoke run-clustering first.")
+        return
+
+    all_scenes = sorted(p.name[: -len("_clusters.json")]
+                        for p in clusters_dir.glob("*_clusters.json"))
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    _run(all_scenes, output_dir, force=force)
+
+
+@task
+def clean_coassociation(c):
+    """Remove stored co-association matrices."""
+    output_dir = Path(c.config.get("output_data_dir")) / "coassociation"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No co-association matrices to clean.")
 
 
 @task
@@ -339,8 +588,34 @@ def run_notebooks(c):
 
 @task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_web_export, run_notebooks])
 def run(c):
-    """Full pipeline."""
+    """Full pipeline.
+
+    Steps run through the `pre=` chain above; the body only records what the
+    run produced into output_data/PROVENANCE.json (project commit, environment,
+    the manifest consumed, and a checksum per output file).
+    """
+    from airoh.provenance import record_run
+
+    record_run(c, tasks="fetch,run-changepoints,run-changepoints-by-category,"
+                        "run-clustering,run-clustering-by-category,run-web-export,"
+                        "run-notebooks")
     print("Pipeline complete.")
+
+
+@task(help={
+    "skip": "Comma-separated check names to skip.",
+    "strict": "Treat warnings as failures.",
+})
+def verify(c, skip=None, strict=False):
+    """Check that the code, config, data and docs still agree.
+
+    Run this before committing. It is deliberately NOT part of `run`:
+    reproducing results should never depend on documentation hygiene. See
+    CLAUDE.md, "Verification", for what each check covers.
+    """
+    from airoh.verify import verify as airoh_verify
+
+    airoh_verify(c, skip=skip, strict=strict)
 
 
 @task
@@ -411,6 +686,17 @@ def clean_web_export(c):
 
 
 @task
+def clean_stability(c):
+    """Remove the cluster audit, sweep and selected-parameter outputs."""
+    output_dir = Path(c.config.get("output_data_dir")) / "stability"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No stability output to clean.")
+
+
+@task
 def clean_frechet(c):
     """Remove cached Fréchet distance matrices.
 
@@ -426,7 +712,7 @@ def clean_frechet(c):
         print("No cached Fréchet matrices to clean.")
 
 
-@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_frechet])
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass
@@ -434,10 +720,19 @@ def clean(c):
 
 @task
 def clean_mario_scenes(c):
-    """Remove the cloned mario.scenes datalad dataset from source_data/."""
-    source_dir = Path(c.config.get("source_data_dir"))
-    scenes_dir = source_dir / "mario.scenes"
-    if scenes_dir.exists():
+    """Remove the mario.scenes dataset from source_data/.
+
+    A symlink is unlinked, never followed: pointing at an external checkout with
+    `fetch-mario-scenes --source` must not put someone else's 23 GB dataset one
+    `clean-source` away from deletion. Use this before re-pointing a stale link
+    — `fetch` never overwrites what already sits at the destination.
+    """
+    scenes_dir = Path(c.config.get("datasets")["mario_scenes"]["output_dir"])
+    if scenes_dir.is_symlink():
+        target = scenes_dir.resolve()
+        scenes_dir.unlink()
+        print(f"Removed the link {scenes_dir} -> {target} (the checkout itself is untouched)")
+    elif scenes_dir.exists():
         shutil.rmtree(scenes_dir)
         print(f"Removed {scenes_dir}")
     else:

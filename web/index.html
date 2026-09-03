@@ -66,6 +66,7 @@
         <div class="seg" id="view-seg" role="group" aria-label="View">
           <button data-value="overlay" aria-pressed="true">Overlay</button>
           <button data-value="panels" aria-pressed="false">Per-cluster panels</button>
+          <button data-value="matrix" aria-pressed="false">Co-association</button>
         </div>
       </div>
       <div class="field">
@@ -76,6 +77,7 @@
           <button data-value="subject" aria-pressed="false">Subject</button>
           <button data-value="attempt" aria-pressed="false">Attempt&nbsp;#</button>
           <button data-value="stage" aria-pressed="false">Stage</button>
+          <button data-value="stability" aria-pressed="false">Stability</button>
         </div>
       </div>
       <div class="check-list">
@@ -107,6 +109,12 @@
       </div>
 
       <div id="panels" hidden></div>
+
+      <div id="matrix-wrap" hidden>
+        <div id="matrix-box"><canvas id="matrix-canvas"></canvas></div>
+        <div id="matrix-legend"></div>
+        <p class="note" id="matrix-note"></p>
+      </div>
     </div>
   </main>
 </div>

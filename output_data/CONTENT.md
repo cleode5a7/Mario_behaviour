@@ -10,6 +10,11 @@ One JSON file per subject produced by `invoke run-changepoints`:
   Fields: `{"subject": str, "n_attempts": int, "changepoints": [<attempt indices>], "phases": [...], "method": "phase_annotation"}`.
   Also carries a `"ruptures"` block — a non-Bayesian diagnostic that runs the `ruptures` PELT/Binseg/Dynp algorithms (CostL2) on the completion signal, on both the raw per-attempt series and a 50-attempt block-averaged series, for comparison against the Phase annotations:
   `{"model": "l2", "block_size": int, "beta": float, "n_bkps": int, "results": {"raw": {"pelt": [...], "binseg": [...], "dynp": [...]}, "blocks": {...}}}` (breakpoints in attempt-index space).
+  And a `"repetitions"` block — the same detectors run one unit up, per **level repetition** (one `.bk2` playthrough) instead of per scene clip. This is the signal that actually tracks learning: a scene clip is cleared ~92% of the time (a ceiling no detector can segment), whereas a level repetition is cleared 53–81% depending on subject. Two nested criteria are reported — `cleared` (reached the end of the level, deaths allowed) and `flawless` (cleared without dying once, 22–54%):
+  `{"n_reps": int, "unit": "level_repetition", "block_size": int, "beta": float, "n_bkps": int, "cleared_rate": float, "flawless_rate": float, "changepoints": [...], "phases": [...], "results": {"cleared": {"raw": {...}, "blocks": {...}}, "flawless": {...}}}`. All indices are in **rep-index space**, including the `changepoints`/`phases` re-derived from the Phase annotations, so detected and annotated boundaries share one axis.
+  The `"repetitions"` block also carries `"phase_thirds"` — an Early/Mid/Late summary within each phase, mirroring the lab's figure. `"chronological"` holds true slabs of time and is the primary reporting view: `cleared`, `flawless`, and `level_adjusted` (each repetition minus that level's session-wide mean, so difficulty is removed while chronology is kept). `"within_level"` splits each level's repetitions into thirds and pools them — difficulty-controlled, but **not a time axis**: its bins are scattered across the whole session (chronological medians 110/113/116 of 230), so it measures improvement with repetition at a level rather than over time. **Reporting only** — all these bins are cut at the phase boundary and must never be fed to a changepoint detector.
+  A sibling `"level_adjusted"` block records the definition, the per-phase means, and the per-level means behind that adjustment. **Only the practice thirds are comparable to each other.** Practice contains all 22 levels in every third, so level mix is constant and the rise is a real effect. Discovery's thirds each hold a *different, disjoint* set of levels (the subject walks the game in world order), so they differ in what was played rather than only when — and adjusting does not fix it: what looks like a within-discovery rise is a floor effect, since the hard late-discovery levels have no room to improve.
+  `notebooks/figure_changepoints.ipynb` writes three figures here: `figure_changepoints.png` (per scene clip), `figure_changepoints_repetitions.png` (per level repetition, `cleared` and `flawless` panels side by side), and `figure_changepoints_phase_thirds.png` (Early/Mid/Late summary, both binnings side by side).
 
 ## `changepoints_by_category/`
 
@@ -24,7 +29,30 @@ One JSON file per subject produced by `invoke run-changepoints-by-category`:
 One JSON file per scene produced by `invoke run-clustering`:
 
 - `<scene_id>_clusters.json` — cluster label per behavioural trace for that scene.
-  Fields: `{"scene": str, "labels": [<per-trace cluster label>]}`
+  Fields: `{"scene": str, "method": str, "params": {...}, "labels": [<per-trace cluster
+  label>], "metadata": [...], "stability": {...}}`
+  `labels`, `metadata` and `stability.per_trace` are positionally aligned, in the order
+  clustering ran.
+
+  `params` records the settings that produced the partition — method, `min_cluster_size`,
+  `min_samples`, `cluster_selection_epsilon`, and for the consensus method `bootstraps`,
+  `frac`, `seed` and `consensus_epsilon` (the merge threshold for the final fit, in
+  co-association distance rather than Fréchet units — see CLAUDE.md). Files written before this field existed carried no parameters at all,
+  and the corpus was not made uniformly (an audit recovered 14 distinct settings across
+  308 scenes), so `analysis.stability.recover_params` exists to reconstruct them by grid
+  search against the stored labels.
+
+  `stability` is the resampling report from the consensus method, `null` for the
+  single-fit ones: `per_cluster` (mean bootstrap Jaccard per cluster), `per_trace`
+  (0-1 consensus confidence per trace), `stable_share`, `k_replicates` (mean/sd of the
+  cluster count across replicates), `noise_frac`, and `min_co_sampled` — the smallest
+  number of replicates any pair was drawn into together, which is the diagnostic for
+  whether `bootstraps` was large enough.
+  A label of `-1` is HDBSCAN noise. Each `metadata` entry is the trace's
+  `*_summary.json` record verbatim (21 fields: `Subject`, `Session`, `Run`, `Level`,
+  `SceneID`, `ClipCode`, `StartFrame`, `EndFrame`, `Duration`, `Outcome`, `Phase`,
+  `SourceBk2`, `GameName`, and the gameplay counters), so subject/phase/outcome are
+  available without re-reading the source dataset.
 
   **No trace geometry is stored here** — the x/y polylines are rebuilt from
   `source_data/mario.scenes/` on demand by `load_traces()`. See `web/` below for the
@@ -38,8 +66,90 @@ e.g. `2-Horde`, `Gap stair valley`) produced by `invoke run-clustering-by-catego
 - `<category-slug>_clusters.json` — cluster label per behavioural trace, pooled across every
   scene tagged with that category. Traces are re-based to a common origin before clustering
   since raw traces from different scenes sit at different absolute level positions.
-  Fields: `{"category": str, "method": str, "labels": [<per-trace cluster label>], "metadata": [...]}`
-  (each `metadata` entry carries `SceneID` so pooled traces stay attributable to their scene).
+  Fields: as `clusters/` above but keyed `"category"` instead of `"scene"` (each
+  `metadata` entry carries `SceneID` so pooled traces stay attributable to their scene).
+
+## `stability/`
+
+Resampling diagnostics written by `invoke run-cluster-audit`, `invoke run-cluster-sweep`
+and `invoke select-cluster-params`. All three read only `output_data/` — the stored labels
+and the cached Fréchet matrices — and never open `source_data/mario.scenes/`.
+
+- `audit.json` — one entry per already-clustered scene: the parameters behind it, plus
+  `n`, `k`, `noise_frac`, `per_cluster` Jaccard and `stable_share` measured *at those
+  parameters*. Scoring with any other settings depresses the Jaccard through a parameter
+  mismatch rather than through real instability, which is why the parameters come first.
+
+  `params_source` says how they were obtained. `"recorded"` means the file carried its own
+  consensus `params` block and its own stability report, both used as-is. `"recovered"`
+  means the file predates `params` and the settings were reconstructed by grid search
+  against its labels (`recovery_ari`, or `null` when nothing in the grid reproduces them) —
+  this path applies only to single-fit partitions, since a consensus partition has no
+  single-fit equivalent to recover.
+
+  **The file accumulates and never overwrites**: a scene already present is skipped, so an
+  `audit.json` written before a re-clustering stays a record of the *previous* corpus. That
+  is the point — it is what makes superseded results reproducible — but it means the file
+  can describe labels that no longer exist on disk. Delete it (or use `clean-stability`) to
+  re-audit what is there now.
+- `<scene_id>_sweep.json` — one row per `(min_cluster_size, epsilon)` grid point:
+  `k`, `noise_frac`, `stable_share`, `per_cluster` Jaccard, and `eps_quantile` (where that
+  epsilon falls in this scene's own pairwise-distance distribution — the check on whether a
+  single global epsilon means the same thing scene to scene). Scenes too small for the
+  grid are written with `"skipped"` set and no rows.
+- `scheme_comparison.json` — every scene clustered under both resampling schemes
+  (subagging and Breiman bootstrap) at identical parameters, `B` and seed, so the only
+  difference is how replicates are drawn. `rows` carries per-scene `k`, `stable_share`,
+  `noise_frac`, replicate-`k` spread and the ARI between the two partitions; `summary`
+  aggregates each scheme. Written by `invoke run-scheme-comparison`.
+- `selected_params.json` — the corpus-wide choice. `rows` aggregates every sweep
+  trace-weighted; `selected` is the winner under the rule "largest median k whose stable
+  share clears `floor`", and `cleared_floor` says whether the floor was reached at all.
+
+**`stable_share` is the headline number throughout**: the share of a scene's traces
+sitting in a cluster whose mean bootstrap Jaccard exceeds 0.75. It is deliberately
+per-trace rather than per-cluster, so a scene with forty unreproducible clusters and one
+solid one is scored by how many traces ended up somewhere trustworthy, and noise counts
+against it for free. It is **not** sufficient alone — collapsing a scene to k=2 scores
+well — which is why the selection rule maximises k subject to a floor on it rather than
+maximising it directly.
+
+## `coassociation/`
+
+The consensus matrices, written by `invoke run-coassociation`:
+
+- `<scene_id>.npy` — symmetric `n x n` **uint16**, in the same row order as that scene's
+  `clusters/<scene_id>_clusters.json` metadata. Divide by 65535 for the probability:
+  `C[i,j]` = how often traces i and j landed in the same cluster, over the replicates in
+  which *both* were drawn. The diagonal is how often a trace was clustered at all rather
+  than called noise.
+
+`cluster_traces` builds this matrix, reads the labels and the stability numbers off it,
+and then drops it, so nothing downstream could display it. This task regenerates it from
+the cached Fréchet matrix plus the `params` each cluster file records — the draws are
+seeded, so it reproduces the matrix that produced the stored labels exactly (re-deriving
+the labels from it gives ARI 1.000).
+
+uint16 rather than uint8 because this is the analysis copy: at uint8 the rounding
+perturbs enough borderline distances to shift the partition (ARI 0.998). ~26 MB for the
+corpus, against ~106 MB for float64. The web export downsamples to uint8, which is a
+display copy and is not exact.
+
+## `frechet/`
+
+Cached pairwise Fréchet distance matrices, one per clustering unit, written by
+`invoke run-clustering` and `invoke run-clustering-by-category`:
+
+- `<scene_id>.npy` / `<category-slug>.npy` — the symmetric `n x n` float distance
+  matrix for that scene's (or category's) traces, in the deterministic load order of
+  `load_traces()`. The cache is validated by trace count: a matrix whose size no longer
+  matches the traces on disk is recomputed.
+
+This is the expensive half of clustering (O(n^2) Fréchet, quadratic in pool size), and
+it depends only on the traces — never on the method, `k` or epsilon. That is why
+`clean-frechet` is a separate task from `clean-clustering`: deleting the labels to
+re-cluster with a different epsilon reuses these, and only a full `invoke clean` or an
+explicit `invoke clean-frechet` throws them away.
 
 ## Trace figures
 
@@ -47,10 +157,26 @@ e.g. `2-Horde`, `Gap stair valley`) produced by `invoke run-clustering-by-catego
 (`figure_clustering_<scene_id>.png`, `figure_clustering_category_<slug>.png`, etc.).
 Traces use a screen-corrected vertical coordinate and are colored by cluster (default)
 or by outcome. `figure_clustering_<scene_id>_panels.png` shows the same scene split into
-one subplot per cluster (shared axes) so individual cluster shapes are easy to compare. Each scene figure overlays a scene background image when one exists at
-`source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png`; those images are
-not part of the dataset (must be generated separately), so by default the figures render
-on a plain y-flipped axis.
+one subplot per cluster (shared axes) so individual cluster shapes are easy to compare.
+`figure_clustering_<scene_id>_by_stability.png` colours every trace by its consensus
+confidence on a magma ramp (dark = its cluster-mates rarely agreed with it), drawn
+low-confidence-last so the unreliable traces are the visible ones.
+`figure_clustering_<scene_id>_panels_by_subject.png` is the same panel grid with every
+trace colored by player instead of by cluster, and each panel captioned with its
+per-subject composition (`sub-01: 45% (n=12)`) — this is how a cluster is checked for
+being one player's idiosyncrasy rather than a shared strategy.
+
+`notebooks/figure_cluster_stability.ipynb` writes `figure_stability_audit.png`,
+`figure_stability_sweep.png`, `figure_stability_clusters.png`,
+`figure_stability_scheme.png` (subagging vs bootstrap) and
+`figure_stability_<scene_id>.png` (co-association matrix plus the spread of `k` across the
+ensemble) into `clusters/` as well.
+
+Each scene figure overlays a scene background image when one exists at
+`source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png`, with x offset by
+the scene's mastersheet `Entry point`; otherwise it falls back to a plain y-flipped data
+axis. These images are **not** part of the dataset and must be generated separately, but
+310 of them are present in this working copy, so the overlay is active by default here.
 
 ## `web/`
 
@@ -58,16 +184,18 @@ The static payload and app behind `invoke dashboard` — an interactive version 
 figures above, with scene / subject / phase / stage / outcome filters. Written by
 `invoke run-web-export`; roughly 50 MB in total.
 
-- `data/index.json` — one row per exported scene (`id`, `world`, `level`, `scene`, `n`
-  traces, `k` clusters, `noise` fraction, `subjects`, `phases`, `method`, pattern `tags`),
+- `output_data/web/data/index.json` — one row per exported scene (`id`, `world`, `level`, `scene`, `n`
+  traces, `k` clusters, `noise` fraction, `sb` mean stability, `subjects`, `phases`,
+  `method`, pattern `tags`),
   plus the corpus-wide subject/phase/tag lists. Drives the scene picker without loading
   any scene payload.
 - `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
   `playfield_ylim`), `step`, and a `traces` array. Each trace carries its cluster label
   `c`, the filterable metadata (`s` subject, `ses`, `run`, `clip`, `sf`, `ph` phase,
-  `out` outcome, `dur`), two derived time fields (`a`, `st` — below), tooltip counters
-  (`xt`, `ht`, `ek`, `ll`), and the polyline as parallel `x`/`y` integer arrays. A
+  `out` outcome, `dur`), its consensus confidence `sb` (below), two derived time fields
+  (`a`, `st` — below), tooltip counters (`xt`, `ht`, `ek`, `ll`), and the polyline as
+  parallel `x`/`y` integer arrays. A
   `null` in `y` is a masked (dead) frame and must break the line rather than be
   interpolated across.
 - `a` — **attempt index**: the nth entry this subject made into this scene, 1-based and
@@ -77,6 +205,15 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   at the 1/3 and 2/3 `ClipCode` quantiles. The full stage name is `st + "_" + ph`, so
   only the letter is stored. Both fields come from `analysis/stages.py` and can be added
   to an existing payload with `invoke run-web-export --backfill`.
+- `sb` — **consensus confidence**, 0-1: how often this trace's cluster-mates agreed with
+  it across the bootstrap replicates. Present only for scenes clustered with the
+  consensus method. Unlike `a` and `st` it is **not** derivable from what the payload
+  already carries, so adding it is a real re-export — `--backfill` cannot supply it.
+- `data/coassoc/<scene_id>.bin` — the scene's co-association matrix as raw `n x n`
+  **uint8**, row-major, in the **payload's** trace order (permuted from the analysis copy
+  by clip key, never by position). One byte per cell; the browser fetches it only when the
+  Co-association view is opened. `coassoc: true` in the scene payload says one exists.
+  Display precision only — for numbers use `output_data/coassociation/`.
 - `data/backgrounds/<scene_id>.png` — copies of the scene backgrounds, so the served
   tree never reaches back into the 23 GB `mario.scenes` dataset at runtime.
 - `index.html`, `app.js`, `style.css` — copied from `web/` by `invoke dashboard`.
@@ -87,9 +224,23 @@ Two caveats worth carrying:
   kept, plus the first and last, and coordinates are rounded to integers. Fine for
   drawing at 224 px tall; **do not** use this payload for quantitative analysis — go
   back to `load_traces()` for that.
-- **Cluster labels are the pooled ones.** HDBSCAN ran once over every trace in the
+- **Cluster labels are the pooled ones.** The ensemble ran once over every trace in the
   scene. The dashboard's filters only change which traces are drawn; they never
   re-cluster, and cluster colors stay fixed to the whole-scene rank-by-size order so a
-  filter cannot repaint the traces that survive it.
+  filter cannot repaint the traces that survive it. The same holds for `sb`: it is the
+  whole-scene consensus confidence and does not recompute under a filter.
 
-> Note: output files are ignored by Git. Run `invoke run` to regenerate them.
+## `PROVENANCE.json`
+
+Written by `invoke run` (see `airoh.provenance`). Records what produced the current
+outputs: the project's own git commit and dirty flag, the environment, a checksum of
+`source_data/MANIFEST.json` plus an inlined copy of each input asset's commit and
+checksum, and the size and checksum of every output file.
+
+Git-tracked, and it **changes on every run** — that churn is the record working, not
+noise to suppress. It attests, it does not retrieve: it can tell you a figure came from
+commit `abc123` of an input dataset with a dirty working tree, which is what "why do my
+numbers differ from the paper's" actually needs, but only datalad can bring that state
+back.
+
+> Note: apart from `changepoints/`, `changepoints_by_category/` and this record, output files are ignored by Git. Run `invoke run` to regenerate them.

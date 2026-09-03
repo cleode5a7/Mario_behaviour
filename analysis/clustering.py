@@ -211,6 +211,47 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
     return labels
 
 
+# Merge threshold for the *consensus* fit, in co-association distance (1 - C),
+# NOT in Fréchet units. 0.4 means "merge clusters whose members co-clustered in
+# more than 60% of the replicates they shared".
+#
+# It cannot be 0. At 0 the consensus fit splits on tiny co-association differences
+# and comes out systematically *finer* than the ensemble it is meant to summarise —
+# w8l3s5 gave k=7 against a replicate mean of k=2.7, and the per-cluster Jaccard
+# then scored that granularity mismatch as instability (8% stable, against 100% for
+# a plain single fit). Swept over 42 scenes, 0.3-0.4 is a flat optimum (86% median
+# stable share, median k=4) and 0.0 the worst row (82%, k=5).
+CONSENSUS_EPSILON = 0.4
+
+
+def _params_record(method, n_clusters, min_cluster_size, min_samples,
+                   cluster_selection_epsilon, bootstraps, frac, seed,
+                   consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging") -> dict:
+    """The settings that produced a partition, stored alongside it.
+
+    Earlier cluster files recorded no parameters at all, and the scenes were not
+    all run alike — three sampled scenes recovered to three different settings, so
+    nobody could say what produced any given file without a grid search against its
+    labels (see ``analysis.stability.recover_params``). Writing this closes that gap
+    going forward.
+    """
+    record = {"method": method}
+    if method == "kmedoids":
+        record["n_clusters"] = int(n_clusters)
+        return record
+    record.update({
+        "min_cluster_size": int(min_cluster_size),
+        "min_samples": None if min_samples is None else int(min_samples),
+        "cluster_selection_epsilon": float(cluster_selection_epsilon),
+    })
+    if method == "consensus":
+        record.update({"bootstraps": int(bootstraps), "frac": float(frac),
+                       "seed": int(seed),
+                       "consensus_epsilon": float(consensus_epsilon),
+                       "scheme": scheme})
+    return record
+
+
 def cluster_traces(
     traces: list[np.ndarray] | None = None,
     method: str = "hdbscan",
@@ -220,11 +261,20 @@ def cluster_traces(
     cluster_selection_epsilon: float = 0.0,
     n_jobs: int = 1,
     dist_matrix: np.ndarray | None = None,
-) -> list[int]:
+    bootstraps: int = 200,
+    frac: float = 0.8,
+    seed: int = 0,
+    consensus_epsilon: float = CONSENSUS_EPSILON,
+    scheme: str = "subagging",
+) -> tuple[list[int], dict | None]:
     """Pairwise Fréchet distance + clustering. Shared by per-scene and per-category runs.
 
+    Returns ``(labels, stability)``. ``stability`` is None for the single-fit
+    methods and, for "consensus", the resampling report described below.
+
     Args:
-        method:                     "hdbscan" (default, no k needed) or "kmedoids"
+        method:                     "consensus" (default: bagged HDBSCAN, see below),
+                                    "hdbscan" (a single fit) or "kmedoids"
         n_clusters:                 number of clusters for kmedoids
         min_cluster_size:           minimum cluster size for hdbscan
         min_samples:                hdbscan conservativeness / noise aggressiveness.
@@ -237,6 +287,17 @@ def cluster_traces(
                                     units. Clusters whose separation is below this
                                     are fused, so raise it to get fewer clusters
                                     (0.0 = HDBSCAN's default, no forced merging).
+        bootstraps:                 replicates for "consensus". 200 was verified as
+                                    converged, not assumed — consensus labels on
+                                    w8l2s0 (n=761) reach ARI 1.000 against B=800,
+                                    and two seeds at B=800 differ by 0.998, so 200
+                                    already sits at the seed-to-seed noise floor.
+        frac:                       subsample fraction for "consensus", drawn
+                                    **without replacement**: duplicate points sit at
+                                    distance 0 and inflate local density, which is
+                                    specifically corrosive to a density-based method.
+        seed:                       replicate draws are seeded, so consensus labels
+                                    are reproducible.
         dist_matrix:                a precomputed Fréchet distance matrix. If given,
                                     ``traces`` is not needed and no distances are
                                     computed — this is the cheap path for re-running
@@ -249,17 +310,74 @@ def cluster_traces(
             raise ValueError("cluster_traces needs either traces or a precomputed dist_matrix.")
         dist_matrix = frechet_distance_matrix(traces, n_jobs=n_jobs)
 
-    if method == "hdbscan":
+    if method == "consensus":
+        return _consensus(dist_matrix, min_cluster_size=min_cluster_size,
+                          min_samples=min_samples,
+                          cluster_selection_epsilon=cluster_selection_epsilon,
+                          bootstraps=bootstraps, frac=frac, seed=seed,
+                          consensus_epsilon=consensus_epsilon, scheme=scheme,
+                          n_jobs=n_jobs)
+    elif method == "hdbscan":
         return hdbscan.HDBSCAN(
             metric="precomputed",
             min_cluster_size=min_cluster_size,
             min_samples=min_samples,
             cluster_selection_epsilon=float(cluster_selection_epsilon),
-        ).fit_predict(dist_matrix).tolist()
+        ).fit_predict(dist_matrix).tolist(), None
     elif method == "kmedoids":
-        return kmedoids(dist_matrix, n_clusters=n_clusters).tolist()
+        return kmedoids(dist_matrix, n_clusters=n_clusters).tolist(), None
     else:
-        raise ValueError(f"Unknown method '{method}'. Use 'hdbscan' or 'kmedoids'.")
+        raise ValueError(f"Unknown method '{method}'. "
+                         f"Use 'consensus', 'hdbscan' or 'kmedoids'.")
+
+
+def _consensus(dist_matrix, *, min_cluster_size, min_samples,
+               cluster_selection_epsilon, bootstraps, frac, seed,
+               consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging", n_jobs=1):
+    """Bagged HDBSCAN: resample, average the partitions, cluster the average.
+
+    The ensemble *produces* the labels here rather than annotating a single fit.
+    Each replicate re-fits HDBSCAN on a random ``frac`` of the traces; the
+    co-association matrix records how often each pair landed together given both
+    were drawn; and the final partition is HDBSCAN on ``1 - C``. A cluster
+    therefore has to survive resampling to exist at all, instead of being found
+    once and trusted.
+    """
+    from analysis.stability import (
+        resample_labels, coassociation, consensus_labels,
+        jaccard_stability, stable_share, trace_confidence,
+    )
+
+    n = len(dist_matrix)
+    replicates = resample_labels(
+        dist_matrix, min_cluster_size=min_cluster_size, min_samples=min_samples,
+        epsilon=cluster_selection_epsilon, B=bootstraps, frac=frac, seed=seed,
+        scheme=scheme, n_jobs=n_jobs,
+    )
+    coassoc, co_sampled = coassociation(n, replicates, return_counts=True)
+    # NB: cluster_selection_epsilon is in Fréchet units and belongs to the replicate
+    # fits above. The consensus fit runs on 1 - C, bounded in [0, 1], where that
+    # threshold would exceed every distance and collapse the scene to one cluster.
+    labels = consensus_labels(coassoc, min_cluster_size=min_cluster_size,
+                              min_samples=min_samples,
+                              epsilon=consensus_epsilon)
+
+    jaccard = jaccard_stability(labels, replicates)
+    ks = [len({int(l) for l in lab.tolist()} - {-1}) for _, lab in replicates]
+    off_diagonal = ~np.eye(n, dtype=bool)
+
+    stability = {
+        "per_cluster": {str(k): round(v, 4) for k, v in sorted(jaccard.items())},
+        "per_trace": [round(float(v), 4) for v in trace_confidence(coassoc, labels)],
+        "stable_share": round(stable_share(labels, jaccard), 4),
+        "k_replicates": {"mean": round(float(np.mean(ks)), 2),
+                         "sd": round(float(np.std(ks)), 2)},
+        "noise_frac": round(float((labels == -1).mean()), 4),
+        # Smallest denominator anywhere in the co-association matrix: the
+        # diagnostic for whether `bootstraps` was large enough.
+        "min_co_sampled": int(co_sampled[off_diagonal].min()) if n > 1 else 0,
+    }
+    return labels.tolist(), stability
 
 
 def run_clustering(
@@ -274,6 +392,11 @@ def run_clustering(
     n_jobs: int = 1,
     frechet_cache_dir: Path | None = None,
     recompute_frechet: bool = False,
+    bootstraps: int = 200,
+    frac: float = 0.8,
+    seed: int = 0,
+    consensus_epsilon: float = CONSENSUS_EPSILON,
+    scheme: str = "subagging",
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
 
@@ -295,19 +418,28 @@ def run_clustering(
     dist_matrix = frechet_matrix_cached(traces, cache_dir / f"{scene_id}.npy",
                                         n_jobs=n_jobs, recompute=recompute_frechet)
     print(f"Scene {scene_id}: clustering {len(traces)} traces (method={method})...")
-    labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size, min_samples=min_samples,
-                             cluster_selection_epsilon=cluster_selection_epsilon)
+    labels, stability = cluster_traces(
+        dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
+        min_cluster_size=min_cluster_size, min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        bootstraps=bootstraps, frac=frac, seed=seed,
+        consensus_epsilon=consensus_epsilon, scheme=scheme, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
-    print(f"Scene {scene_id}: {n_found} clusters found ({labels.count(-1)} noise points)")
+    stable = "" if stability is None else f", {stability['stable_share']:.0%} of traces stable"
+    print(f"Scene {scene_id}: {n_found} clusters found "
+          f"({labels.count(-1)} noise points{stable})")
 
     out = output_dir / f"{scene_id}_clusters.json"
     out.write_text(json.dumps({
         "scene": scene_id,
         "method": method,
+        "params": _params_record(method, n_clusters, min_cluster_size, min_samples,
+                                 cluster_selection_epsilon, bootstraps, frac, seed,
+                                 consensus_epsilon, scheme),
         "labels": labels,
         "metadata": metadata,
+        "stability": stability,
     }, indent=2))
 
 
@@ -323,6 +455,11 @@ def run_clustering_by_category(
     n_jobs: int = 1,
     frechet_cache_dir: Path | None = None,
     recompute_frechet: bool = False,
+    bootstraps: int = 200,
+    frac: float = 0.8,
+    seed: int = 0,
+    consensus_epsilon: float = CONSENSUS_EPSILON,
+    scheme: str = "subagging",
 ) -> None:
     """Cluster behavioural traces pooled across every scene tagged with a category.
 
@@ -363,9 +500,12 @@ def run_clustering_by_category(
                                         n_jobs=n_jobs, recompute=recompute_frechet)
     print(f"Category '{category}': clustering {len(traces)} traces "
           f"across {len(scene_ids)} scenes (method={method})...")
-    labels = cluster_traces(dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
-                             min_cluster_size=min_cluster_size, min_samples=min_samples,
-                             cluster_selection_epsilon=cluster_selection_epsilon)
+    labels, stability = cluster_traces(
+        dist_matrix=dist_matrix, method=method, n_clusters=n_clusters,
+        min_cluster_size=min_cluster_size, min_samples=min_samples,
+        cluster_selection_epsilon=cluster_selection_epsilon,
+        bootstraps=bootstraps, frac=frac, seed=seed,
+        consensus_epsilon=consensus_epsilon, scheme=scheme, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Category '{category}': {n_found} clusters found ({labels.count(-1)} noise points)")
@@ -374,6 +514,10 @@ def run_clustering_by_category(
     out.write_text(json.dumps({
         "category": category,
         "method": method,
+        "params": _params_record(method, n_clusters, min_cluster_size, min_samples,
+                                 cluster_selection_epsilon, bootstraps, frac, seed,
+                                 consensus_epsilon, scheme),
         "labels": labels,
         "metadata": metadata,
+        "stability": stability,
     }, indent=2))

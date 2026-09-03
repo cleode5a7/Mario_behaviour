@@ -34,6 +34,7 @@ from analysis.trace_plots import (
     resolve_background,
     scene_entry_map,
 )
+from analysis.stability import coassociation_path
 
 # Per-clip summary fields carried into the payload for the hover tooltip, mapped
 # to short keys (these arrays are the bulk of the file — every byte is repeated
@@ -104,11 +105,52 @@ def _downsample(trace: np.ndarray, step: int, x_offset: int = 0) -> tuple[list, 
     return x_out, y_out
 
 
+def export_coassociation(scene_id, source_dir, output_dir, web_dir, out_traces) -> bool:
+    """Write one scene's co-association matrix for the browser. True if written.
+
+    Two things happen here, both necessary.
+
+    **Downcast to uint8.** The stored matrix is uint16 because the analysis copy has
+    to re-derive the labels exactly; the browser only paints it, so one byte per cell
+    halves the transfer and is still finer than a screen pixel can show.
+
+    **Permute into payload order.** The matrix rows follow the cluster JSON's metadata
+    order, and ``out_traces`` follows ``load_traces`` order. Those happen to coincide
+    today, but the whole point of CLIP_KEY_FIELDS is that nothing may *rely* on that.
+    So the permutation is built by clip key, and a scene whose keys do not line up is
+    skipped rather than silently transposed into nonsense.
+    """
+    import json
+
+    src = coassociation_path(scene_id, output_dir)
+    if not src.exists():
+        return False
+
+    stored = np.load(src)
+    clusters = Path(output_dir) / "clusters" / f"{scene_id}_clusters.json"
+    meta = json.loads(clusters.read_text())["metadata"]
+    row_of = {(m.get("Subject"), m.get("Session"), m.get("Run"), m.get("ClipCode")): i
+              for i, m in enumerate(meta)}
+
+    order = [row_of.get((t["s"], t["ses"], t["run"], t["clip"])) for t in out_traces]
+    if any(o is None for o in order) or len(stored) != len(meta):
+        print(f"  {scene_id}: co-association rows do not match the payload, skipping matrix.")
+        return False
+
+    order = np.asarray(order)
+    small = (stored[np.ix_(order, order)] // 257).astype(np.uint8)   # 65535 -> 255
+
+    out_dir = Path(web_dir) / "coassoc"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / f"{scene_id}.bin").write_bytes(small.tobytes())
+    return True
+
+
 def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
                  entry_map=None, background_dir=None) -> dict | None:
     """Write one scene's dashboard payload; return its index entry (None if empty)."""
     source_dir, output_dir, web_dir = Path(source_dir), Path(output_dir), Path(web_dir)
-    traces, metadata, labels, method = load_labeled_traces(scene_id, source_dir, output_dir)
+    traces, metadata, labels, method, stability = load_labeled_traces(scene_id, source_dir, output_dir)
     if not traces:
         print(f"No trace data found for scene {scene_id}, skipping export.")
         return None
@@ -132,8 +174,12 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
     xmin, xmax = _shared_xlim(traces)
     ylo, yhi = playfield_ylim(traces)
 
+    # Per-trace stability is NOT derivable from the payload (unlike `a`/`st` in
+    # add_derived), so adding it is a real re-export, never a --backfill.
+    stab = stability if stability is not None else [None] * len(traces)
+
     out_traces = []
-    for trace, meta, label in zip(traces, metadata, labels):
+    for trace, meta, label, sb in zip(traces, metadata, labels, stab):
         x, y = _downsample(trace, step, x_offset=entry)
         rec = {
             "s": meta.get("Subject", "?"),
@@ -148,6 +194,8 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
             "x": x,
             "y": y,
         }
+        if sb is not None:
+            rec["sb"] = round(float(sb), 2)
         rec.update({short: meta.get(field) for field, short in EXTRA_FIELDS.items()})
         out_traces.append(rec)
 
@@ -164,6 +212,9 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
         "step": step,
         "traces": out_traces,
     }
+
+    payload["coassoc"] = export_coassociation(
+        scene_id, source_dir, output_dir, web_dir, out_traces)
 
     scenes_dir = web_dir / "scenes"
     scenes_dir.mkdir(parents=True, exist_ok=True)
@@ -188,6 +239,7 @@ def _index_entry(scene_id: str, out_traces: list[dict], method: str) -> dict:
     """Summary row for index.json, derived from the payload we just built."""
     labels = [t["c"] for t in out_traces]
     n_noise = sum(1 for l in labels if l == -1)
+    stabilities = [t["sb"] for t in out_traces if t.get("sb") is not None]
     world, rest = scene_id[1:].split("l", 1)
     level, scene_no = rest.split("s", 1)
     return {
@@ -198,6 +250,7 @@ def _index_entry(scene_id: str, out_traces: list[dict], method: str) -> dict:
         "n": len(out_traces),
         "k": len({l for l in labels if l != -1}),
         "noise": round(n_noise / len(out_traces), 3) if out_traces else 0.0,
+        "sb": round(sum(stabilities) / len(stabilities), 3) if stabilities else None,
         "subjects": sorted({t["s"] for t in out_traces}),
         "phases": sorted({t["ph"] for t in out_traces if t["ph"]}),
         "method": method,

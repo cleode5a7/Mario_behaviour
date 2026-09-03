@@ -39,6 +39,17 @@ const VIRIDIS_STOPS = [
   "#6ccd5a", "#7fd34e", "#93d741", "#a8db34", "#c0df25", "#d5e21a", "#eae51a", "#fde725",
 ];
 
+/* Magma ramp for cluster stability, verbatim from STABILITY_STOPS in
+ * analysis/trace_plots.py. Deliberately not viridis — that already means
+ * "attempt #", and two sequential encodings sharing a palette is how a reader
+ * mistakes one for the other. */
+const STABILITY_STOPS = [
+  "#000004", "#040414", "#0b0924", "#140e36", "#1f0c48", "#2b115a", "#381a6c", "#440f76",
+  "#4f127b", "#5a167e", "#65197f", "#701f81", "#7b2382", "#862781", "#912b81", "#9c2e7f",
+  "#a7327d", "#b3357a", "#be3d72", "#c8436a", "#d34b62", "#dc5459", "#e45d51", "#eb6a4a",
+  "#f07948", "#f4894b", "#f79952", "#f9a95e", "#fbb96d", "#fcc97f", "#fdd893", "#fcfdbf",
+];
+
 /* Legend order for the six stages, mirroring STAGES in analysis/stages.py. The
  * payload stores only the tertile letter; the stage is that plus the phase. */
 const STAGES = ["early_discovery", "middle_discovery", "late_discovery",
@@ -48,8 +59,8 @@ const stageName = (t) => (t.st && t.ph ? `${TERTILE_NAMES[t.st]}_${t.ph}` : "");
 
 /* Matplotlib linewidths are points at dpi=150; these are the CSS-pixel
  * equivalents that read the same on screen. */
-const LW = { direct: 1.6, faint: 1.0, outcome: 1.0, subject: 1.2, attempt: 1.2, stage: 1.2 };
-const ALPHA = { direct: 0.85, faint: 0.35, outcome: 0.5, subject: 0.6, attempt: 0.6, stage: 0.6 };
+const LW = { direct: 1.6, faint: 1.0, outcome: 1.0, subject: 1.2, attempt: 1.2, stage: 1.2, stability: 1.2 };
+const ALPHA = { direct: 0.85, faint: 0.35, outcome: 0.5, subject: 0.6, attempt: 0.6, stage: 0.6, stability: 0.6 };
 const MARKER_PX = { overlay: 7, panel: 6 };
 
 /* ---------- state ---------- */
@@ -206,6 +217,14 @@ function attemptColor(t) {
   return VIRIDIS_STOPS[Math.round(attemptFrac(t) * (VIRIDIS_STOPS.length - 1))];
 }
 
+/* Stability is already a 0-1 confidence in the payload, so unlike the attempt
+ * ramp it needs no per-subject normalisation — the scale is absolute and
+ * comparable across scenes. */
+function stabilityColor(t) {
+  const v = Math.min(1, Math.max(0, t.sb == null ? 0 : t.sb));
+  return STABILITY_STOPS[Math.round(v * (STABILITY_STOPS.length - 1))];
+}
+
 /* Painting order for sequential colour modes.
  *
  * Traces in a scene overlap almost completely — everyone runs the same corridor —
@@ -225,6 +244,11 @@ function drawOrder(traces) {
   }
   if (state.colorBy === "stage") {   // STAGES is already in chronological order
     return [...traces].sort((a, b) => STAGES.indexOf(stageName(a)) - STAGES.indexOf(stageName(b)));
+  }
+  if (state.colorBy === "stability") {
+    // Descending: the point of this view is to find the traces their cluster
+    // barely agreed with, so they paint last. Same order as _draw_by_stability.
+    return [...traces].sort((a, b) => (b.sb ?? 0) - (a.sb ?? 0));
   }
   return traces;
 }
@@ -264,6 +288,11 @@ function styleFor(t, rank, counts) {
     color = i === -1 ? OTHER_COLOR : STAGE_COLORS[i];
     alpha = ALPHA.stage; lw = LW.stage;
     name = stageName(t) || "unknown stage";
+  } else if (state.colorBy === "stability") {
+    color = stabilityColor(t);
+    marker = null;
+    alpha = ALPHA.stability; lw = LW.stability;
+    name = t.sb == null ? "no stability" : `stability ${t.sb.toFixed(2)}`;
   }
   return { color, marker, name, alpha, lw };
 }
@@ -495,6 +524,19 @@ function renderLegend(traces, rank, counts) {
     return;
   }
 
+  if (state.colorBy === "stability") {
+    const shown = traces.filter((t) => t.sb != null);
+    if (!shown.length) {
+      legend.appendChild(legendItem(OTHER_COLOR, null,
+                                    "no stability recorded — not a consensus run", null));
+      return;
+    }
+    const mean = shown.reduce((a, t) => a + t.sb, 0) / shown.length;
+    legend.appendChild(legendRamp(`unstable 0 → 1 stable (mean ${mean.toFixed(2)})`,
+                                  STABILITY_STOPS));
+    return;
+  }
+
   // cluster mode: stable rank order, clickable to toggle. Every cluster in the
   // scene stays listed even at n=0, so a filter that empties one shows that
   // plainly instead of silently dropping it from the legend.
@@ -547,9 +589,9 @@ function legendItem(color, marker, text, toggleLabel) {
   return btn;
 }
 
-/* Gradient swatch for the continuous attempt ramp — same shape as legendItem so
- * it sits in the legend row without special-casing the layout. */
-function legendRamp(text) {
+/* Gradient swatch for a continuous ramp (attempt, stability) — same shape as
+ * legendItem so it sits in the legend row without special-casing the layout. */
+function legendRamp(text, stops = VIRIDIS_STOPS) {
   const btn = document.createElement("button");
   btn.className = "legend-item";
   btn.type = "button";
@@ -564,7 +606,7 @@ function legendRamp(text) {
   const mctx = mark.getContext("2d");
   mctx.scale(dpr, dpr);
   const grad = mctx.createLinearGradient(0, 0, 44, 0);
-  VIRIDIS_STOPS.forEach((c, i) => grad.addColorStop(i / (VIRIDIS_STOPS.length - 1), c));
+  stops.forEach((c, i) => grad.addColorStop(i / (stops.length - 1), c));
   mctx.fillStyle = grad;
   mctx.fillRect(0, 2, 44, 8);
   btn.appendChild(mark);
@@ -578,8 +620,8 @@ function legendRamp(text) {
 /* ---------- panels view ---------- */
 
 /* Which composition pills a panel should carry, or null for modes where the
- * breakdown is not meaningful (cluster: it is the panel itself; attempt: a
- * continuous quantity, not categories). */
+ * breakdown is not meaningful (cluster: it is the panel itself; attempt and
+ * stability: continuous quantities, not categories). */
 function compositionSpec(members) {
   if (!members.length) return null;
   if (state.colorBy === "subject") {
@@ -738,6 +780,7 @@ function showTooltip(t, clientX, clientY) {
     ["outcome", t.out],
     ["duration", t.dur == null ? "—" : `${t.dur} s`],
     ["cluster", t.c === -1 ? "noise" : t.c],
+    ["stability", t.sb == null ? "—" : t.sb.toFixed(2)],
     ["x travelled", t.xt ?? "—"],
     ["hits taken", t.ht ?? "—"],
     ["enemies killed", t.ek ?? "—"],
@@ -934,6 +977,177 @@ function loadImage(src) {
 
 /* ---------- render dispatch ---------- */
 
+/* ---------- co-association matrix view ---------- */
+
+/* The matrix the consensus labels were actually derived from: cell (i, j) is how
+ * often traces i and j landed in the same cluster, over the replicates in which
+ * both were drawn. Shipped as one uint8 per cell in payload order (see
+ * webexport.export_coassociation), so the browser does the ordering.
+ *
+ * It is a *view*, like everything else here: the filters select a submatrix, they
+ * never recompute anything. Rows are ordered by the whole-scene cluster ranking —
+ * the same order that fixes the colour slots — so blocks line up with the legend
+ * and narrowing to one subject cannot reshuffle them. */
+
+const matrixCache = new Map();   // scene id -> Uint8Array
+
+async function loadCoassoc(sceneId) {
+  if (matrixCache.has(sceneId)) return matrixCache.get(sceneId);
+  const res = await fetch(`data/coassoc/${sceneId}.bin`);
+  if (!res.ok) throw new Error(`no co-association matrix for ${sceneId}`);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  matrixCache.set(sceneId, buf);
+  return buf;
+}
+
+function coassocColor(v) {
+  return STABILITY_STOPS[Math.round((v / 255) * (STABILITY_STOPS.length - 1))];
+}
+
+/* Payload index of every visible trace, ordered by cluster (rank-by-size, noise
+ * last) so the diagonal blocks are the clusters. */
+function matrixOrder() {
+  const rank = sceneRanking();
+  const slot = (t) => (t.c === -1 ? Number.MAX_SAFE_INTEGER : rank.ranked.indexOf(t.c));
+  const visible = new Set(visibleTraces());
+  const rows = [];
+  state.scene.traces.forEach((t, i) => { if (visible.has(t)) rows.push({ t, i }); });
+  rows.sort((a, b) => (slot(a.t) - slot(b.t)) || (a.i - b.i));
+  return rows;
+}
+
+let matrixRows = [];      // current row order, for hit-testing
+let matrixSide = 0;
+
+async function renderMatrix() {
+  const note = $("matrix-note");
+  const canvas = $("matrix-canvas");
+
+  if (!state.scene.coassoc) {
+    note.textContent =
+      "No co-association matrix exported for this scene — it was not clustered with " +
+      "the consensus method, or `invoke run-coassociation` has not been run.";
+    canvas.width = canvas.height = 0;
+    $("matrix-legend").innerHTML = "";
+    return;
+  }
+
+  let data;
+  try {
+    data = await loadCoassoc(state.scene.scene);
+  } catch (err) {
+    note.textContent = String(err.message);
+    return;
+  }
+
+  const n = state.scene.traces.length;
+  matrixRows = matrixOrder();
+  const m = matrixRows.length;
+  matrixSide = m;
+  if (!m) { note.textContent = "No traces match the current filters."; return; }
+
+  // One image pixel per cell, drawn at native size; CSS scales it with
+  // image-rendering: pixelated, so no interpolation invents values.
+  canvas.width = m;
+  canvas.height = m;
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(m, m);
+
+  // Pre-resolve the 256 ramp entries to RGB once, rather than per cell.
+  const lut = new Uint8Array(256 * 3);
+  for (let v = 0; v < 256; v++) {
+    const hex = coassocColor(v);
+    lut[v * 3] = parseInt(hex.slice(1, 3), 16);
+    lut[v * 3 + 1] = parseInt(hex.slice(3, 5), 16);
+    lut[v * 3 + 2] = parseInt(hex.slice(5, 7), 16);
+  }
+
+  for (let r = 0; r < m; r++) {
+    const src = matrixRows[r].i * n;
+    const dst = r * m * 4;
+    for (let cIdx = 0; cIdx < m; cIdx++) {
+      const v = data[src + matrixRows[cIdx].i];
+      const o = dst + cIdx * 4;
+      img.data[o] = lut[v * 3];
+      img.data[o + 1] = lut[v * 3 + 1];
+      img.data[o + 2] = lut[v * 3 + 2];
+      img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
+
+  renderMatrixLegend();
+  const total = state.scene.traces.length;
+  note.textContent =
+    `${m} of ${total} traces. Cell (i, j) = share of resampling replicates in which ` +
+    `both traces landed in the same cluster, among replicates that drew both. ` +
+    `Rows ordered by cluster, noise last — so each bright diagonal block is a cluster.`;
+}
+
+function renderMatrixLegend() {
+  const legend = $("matrix-legend");
+  legend.innerHTML = "";
+  const dpr = window.devicePixelRatio || 1;
+  const bar = document.createElement("canvas");
+  bar.width = 120 * dpr; bar.height = 12 * dpr;
+  bar.style.width = "120px"; bar.style.height = "12px";
+  const bctx = bar.getContext("2d");
+  bctx.scale(dpr, dpr);
+  const grad = bctx.createLinearGradient(0, 0, 120, 0);
+  STABILITY_STOPS.forEach((c, i) => grad.addColorStop(i / (STABILITY_STOPS.length - 1), c));
+  bctx.fillStyle = grad;
+  bctx.fillRect(0, 0, 120, 12);
+
+  const lo = document.createElement("span"); lo.textContent = "never together (0)";
+  const hi = document.createElement("span"); hi.textContent = "always (1)";
+  legend.append(lo, bar, hi);
+}
+
+/* Hit-testing is index arithmetic on the canvas, not a colour read: the same
+ * reason the overlay uses a geometric nearest-point search rather than a picking
+ * buffer — a scaled pixel must never be decoded back into a value. */
+function bindMatrix() {
+  const canvas = $("matrix-canvas");
+  const box = $("matrix-box");
+
+  canvas.addEventListener("mousemove", (e) => {
+    if (!matrixSide || !matrixRows.length) return;
+    const r = canvas.getBoundingClientRect();
+    const col = Math.floor(((e.clientX - r.left) / r.width) * matrixSide);
+    const row = Math.floor(((e.clientY - r.top) / r.height) * matrixSide);
+    if (row < 0 || col < 0 || row >= matrixSide || col >= matrixSide) return;
+
+    const a = matrixRows[row].t, b = matrixRows[col].t;
+    const data = matrixCache.get(state.scene.scene);
+    const n = state.scene.traces.length;
+    const v = data[matrixRows[row].i * n + matrixRows[col].i] / 255;
+    showMatrixTooltip(a, b, v, e.clientX, e.clientY);
+  });
+  canvas.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+  box.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+}
+
+function showMatrixTooltip(a, b, v, clientX, clientY) {
+  const tip = $("tooltip");
+  const name = (t) => (t.c === -1 ? "noise" : `cluster ${t.c}`);
+  const rows = a === b
+    ? [["trace", a.clip], ["subject", `sub-${a.s}`], [name(a), ""],
+       ["clustered (not noise) in", `${(v * 100).toFixed(0)}% of replicates`]]
+    : [["row", `${a.clip} — ${name(a)}`], ["column", `${b.clip} — ${name(b)}`],
+       ["same cluster in", `${(v * 100).toFixed(0)}% of shared replicates`]];
+  tip.innerHTML =
+    `<div class="tt-head"><span class="tt-dot" style="background:${coassocColor(v * 255)}"></span>` +
+    `<span>co-association ${v.toFixed(2)}</span></div>` +
+    `<dl>${rows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join("")}</dl>`;
+  tip.dataset.show = "true";
+  const r = tip.getBoundingClientRect();
+  let x = clientX + 14, y = clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = clientY - r.height - 14;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+
 let rafPending = false;
 function render() {
   if (rafPending) return;
@@ -941,11 +1155,14 @@ function render() {
   requestAnimationFrame(() => {
     rafPending = false;
     if (!state.scene) return;
-    const overlay = state.view === "overlay";
-    $("overlay-wrap").hidden = !overlay;
-    $("panels").hidden = overlay;
-    $("reset-view").hidden = !overlay;
-    if (overlay) renderOverlay(); else renderPanels();
+    const view = state.view;
+    $("overlay-wrap").hidden = view !== "overlay";
+    $("panels").hidden = view !== "panels";
+    $("matrix-wrap").hidden = view !== "matrix";
+    $("reset-view").hidden = view !== "overlay";
+    if (view === "overlay") renderOverlay();
+    else if (view === "panels") renderPanels();
+    else renderMatrix();
   });
 }
 
@@ -1069,6 +1286,7 @@ async function init() {
   bindSeg("stage-seg", "stage");
   bindSeg("outcome-seg", "outcome");
   bindSeg("view-seg", "view");
+  bindMatrix();
   bindSeg("color-seg", "colorBy");
   $("toggle-noise").addEventListener("change", (e) => {
     state.showNoise = e.target.checked; render();

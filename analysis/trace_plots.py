@@ -73,6 +73,28 @@ VIRIDIS_STOPS = [
 ]
 
 
+# 32-stop magma ramp for cluster-stability coloring. Deliberately NOT viridis:
+# that ramp already means "attempt #", and two sequential encodings sharing a
+# palette in the same figure set is how a reader mistakes one for the other.
+# Dark = a trace that its cluster-mates rarely agreed with, bright = solidly held.
+# Same verbatim-copy rule as the lists above — web/app.js must match.
+STABILITY_STOPS = [
+    "#000004", "#040414", "#0b0924", "#140e36", "#1f0c48", "#2b115a", "#381a6c", "#440f76",
+    "#4f127b", "#5a167e", "#65197f", "#701f81", "#7b2382", "#862781", "#912b81", "#9c2e7f",
+    "#a7327d", "#b3357a", "#be3d72", "#c8436a", "#d34b62", "#dc5459", "#e45d51", "#eb6a4a",
+    "#f07948", "#f4894b", "#f79952", "#f9a95e", "#fbb96d", "#fcc97f", "#fdd893", "#fcfdbf",
+]
+
+STABILITY_ALPHA = 0.6
+STABILITY_LW = 1.2
+
+
+def stability_color(value) -> str:
+    """Nearest stop on STABILITY_STOPS for a 0-1 confidence value."""
+    v = 0.0 if value is None else min(1.0, max(0.0, float(value)))
+    return STABILITY_STOPS[round(v * (len(STABILITY_STOPS) - 1))]
+
+
 def subject_color_map(metadata) -> dict:
     """Stable ``Subject -> color`` dict, assigned by sorted subject id.
 
@@ -133,19 +155,32 @@ def load_labeled_traces(scene_id, source_dir, output_dir, y_mode="screen"):
     before the ordering fix.
 
     Returns:
-        traces, metadata, labels (np.ndarray aligned to traces), method (str)
+        traces, metadata, labels (np.ndarray aligned to traces), method (str),
+        stability (np.ndarray of 0-1 per-trace confidence, or None when the stored
+        run recorded none)
     """
     result = json.loads((Path(output_dir) / "clusters" / f"{scene_id}_clusters.json").read_text())
     key_to_label = {_clip_key(m): l for m, l in zip(result["metadata"], result["labels"])}
 
+    # Per-trace stability is stored parallel to labels/metadata, so it joins by the
+    # same clip key and for the same reason — never by position. Absent for the
+    # single-fit methods and for files written before stability existed.
+    per_trace = (result.get("stability") or {}).get("per_trace")
+    key_to_stability = (
+        {_clip_key(m): v for m, v in zip(result["metadata"], per_trace)}
+        if per_trace else {}
+    )
+
     traces, metadata = load_traces(scene_id, source_dir, y_mode=y_mode)
     labels = np.array([key_to_label.get(_clip_key(m), -1) for m in metadata])
+    stability = (np.array([key_to_stability.get(_clip_key(m), 0.0) for m in metadata])
+                 if key_to_stability else None)
 
     missing = sum(1 for m in metadata if _clip_key(m) not in key_to_label)
     if missing:
         print(f"  warning: {missing}/{len(metadata)} traces in {scene_id} had no "
               f"stored label (drawn as noise)")
-    return traces, metadata, labels, result.get("method", "")
+    return traces, metadata, labels, result.get("method", ""), stability
 
 
 def _draw_by_cluster(ax, traces, labels, x_offset):
@@ -192,6 +227,26 @@ def _draw_by_outcome(ax, traces, metadata, x_offset):
     return None
 
 
+def _draw_by_stability(ax, traces, stability, x_offset):
+    """Draw traces colored by how reliably their cluster reproduced (0-1).
+
+    Painted in **descending** stability so the low-confidence traces land on top:
+    the point of this view is to find the mush, and a stable majority drawn last
+    would bury it. (The attempt ramp sorts the other way, because there the latest
+    attempt is the thing worth seeing.)
+    """
+    order = np.argsort(-np.asarray(stability))
+    for i in order:
+        ax.plot(traces[i][:, 0] - x_offset, traces[i][:, 1],
+                color=stability_color(stability[i]),
+                alpha=STABILITY_ALPHA, linewidth=STABILITY_LW)
+
+    # A row per distinct value would be meaningless, so the ramp is the legend.
+    for frac, name in ((0.0, "unstable (0.0)"), (0.5, "0.5"), (1.0, "stable (1.0)")):
+        ax.plot([], [], color=stability_color(frac), linewidth=2.5, label=name)
+    return None
+
+
 def plot_scene_clusters(
     scene_id,
     source_dir,
@@ -206,8 +261,10 @@ def plot_scene_clusters(
     """Draw one scene's trajectories onto `ax` (own figure if None).
 
     Args:
-        color_by:       "cluster" (rank-by-size cluster colors, default) or
-                        "outcome" (green=completed, red=death).
+        color_by:       "cluster" (rank-by-size cluster colors, default),
+                        "outcome" (green=completed, red=death), or "stability"
+                        (magma ramp over per-trace consensus confidence; needs a
+                        run clustered with method="consensus").
         background_dir: directory holding ``<scene_id>.png`` scene backgrounds.
                         If a matching PNG exists it is drawn under the traces and
                         the y-axis is flipped in image space; otherwise a plain
@@ -216,7 +273,7 @@ def plot_scene_clusters(
     source_dir = Path(source_dir)
     output_dir = Path(output_dir)
 
-    traces, metadata, labels, method = load_labeled_traces(scene_id, source_dir, output_dir)
+    traces, metadata, labels, method, stability = load_labeled_traces(scene_id, source_dir, output_dir)
     if not traces:
         print(f"No trace data found for scene {scene_id}, skipping plot.")
         return None
@@ -238,8 +295,15 @@ def plot_scene_clusters(
         n_clusters = _draw_by_outcome(ax, traces, metadata, x_offset)
     elif color_by == "cluster":
         n_clusters = _draw_by_cluster(ax, traces, labels, x_offset)
+    elif color_by == "stability":
+        if stability is None:
+            raise ValueError(
+                f"{scene_id} has no stored per-trace stability — it was clustered "
+                f"with method='{method}'. Re-run with the consensus method.")
+        n_clusters = _draw_by_stability(ax, traces, stability, x_offset)
     else:
-        raise ValueError(f"Unknown color_by '{color_by}'. Use 'cluster' or 'outcome'.")
+        raise ValueError(f"Unknown color_by '{color_by}'. "
+                         f"Use 'cluster', 'outcome' or 'stability'.")
 
     if bg_path is not None:
         ax.set_xlim(0, bg.shape[1])
@@ -258,7 +322,8 @@ def plot_scene_clusters(
 
     if standalone:
         fig.tight_layout()
-        out_path = output_dir / "clusters" / f"figure_clustering_{scene_id}.png"
+        suffix = "" if color_by == "cluster" else f"_by_{color_by}"
+        out_path = output_dir / "clusters" / f"figure_clustering_{scene_id}{suffix}.png"
         fig.savefig(out_path, dpi=150, bbox_inches="tight")
         print(f"Saved -> {out_path}")
         plt.show()
@@ -328,7 +393,7 @@ def plot_scene_cluster_panels(
     if color_by not in ("cluster", "subject"):
         raise ValueError(f"Unknown color_by '{color_by}'. Use 'cluster' or 'subject'.")
 
-    traces, metadata, labels, method = load_labeled_traces(scene_id, source_dir, output_dir)
+    traces, metadata, labels, method, stability = load_labeled_traces(scene_id, source_dir, output_dir)
     if not traces:
         print(f"No trace data found for scene {scene_id}, skipping plot.")
         return None

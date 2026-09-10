@@ -1133,13 +1133,29 @@ function bindMatrix() {
   box.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
 }
 
+/* Who a trace is, in terms a reader can act on.
+ *
+ * NOT the ClipCode. That field is session-run-ordinal-startframe concatenated
+ * (00101010000122 = ses-001, run-01, 0th bk2, frame 122), so putting it beside a
+ * label like "row" makes a 14-digit identifier look like a quantity. It stays
+ * available on the diagonal, where the tooltip is describing one trace and the id
+ * is the thing you would copy. */
+function traceLabel(t) {
+  const who = `sub-${t.s}`;
+  const when = t.a != null ? `attempt ${t.a}` : `${t.ses}/${t.run}`;
+  const cluster = t.c === -1 ? "noise" : `cluster ${t.c}`;
+  return `${who} · ${when} · ${cluster}`;
+}
+
 function showMatrixTooltip(a, b, v, clientX, clientY) {
   const tip = $("tooltip");
   const name = (t) => (t.c === -1 ? "noise" : `cluster ${t.c}`);
   const rows = a === b
-    ? [["trace", a.clip], ["subject", `sub-${a.s}`], [name(a), ""],
+    ? [["trace", `sub-${a.s} · ${a.a != null ? `attempt ${a.a}` : `${a.ses}/${a.run}`}`],
+       ["cluster", name(a)],
+       ["clip id", a.clip],
        ["clustered (not noise) in", `${(v * 100).toFixed(0)}% of replicates`]]
-    : [["row", `${a.clip} — ${name(a)}`], ["column", `${b.clip} — ${name(b)}`],
+    : [["row", traceLabel(a)], ["column", traceLabel(b)],
        ["same cluster in", `${(v * 100).toFixed(0)}% of shared replicates`]];
   tip.innerHTML =
     `<div class="tt-head"><span class="tt-dot" style="background:${coassocColor(v * 255)}"></span>` +

@@ -40,9 +40,13 @@ unique-point deficit is what actually drives the bias.)
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import hdbscan
-from sklearn.metrics import adjusted_rand_score
+from scipy.cluster.hierarchy import ClusterWarning, cut_tree, linkage
+from scipy.spatial.distance import squareform
+from sklearn.metrics import adjusted_rand_score, silhouette_score
 
 # A cluster counts as reproduced when its mean bootstrap Jaccard clears this.
 # Hennig (2007): <0.6 dissolved, 0.6-0.85 pattern present but not trustworthy,
@@ -64,6 +68,33 @@ RECOVERY_EPSILONS = (0.0, 5.0, 10.0, 15.0, 20.0, 25.0, 30.0, 40.0, 50.0)
 
 # ARI at or above this counts as an exact reproduction of a stored partition.
 RECOVERY_TOL = 0.999
+
+# Consensus (Ward) k-selection. The silhouette is also capped at n - 1 by definition.
+CONSENSUS_K_MAX = 15
+
+# The selection rule is the plain one: score every cut by silhouette, take the best.
+# Both constants below are the *off* setting of a guard, kept as parameters rather
+# than deleted because each one has a measured failure mode behind it.
+#
+# CONSENSUS_K_TOL > 0 is a plateau tie-break — among cuts within `tol` of the best
+# score, the smallest k wins. It exists because the silhouette on 1 - C does not fall
+# once clusters are isolated (a pair that never co-clustered sits at distance exactly
+# 1.0), so the curve flattens and the argmax walks up that tail. At 0.0 the rule is
+# exactly "highest silhouette, smallest k among exact ties".
+CONSENSUS_K_TOL = 0.0
+
+# CONSENSUS_MIN_CLUSTER_SIZE > 1 restricts candidates to cuts whose smallest cluster
+# clears it. Ward assigns every point and has no noise class, so nothing else stops a
+# cut from being mostly singletons — and the silhouette cannot object, since sklearn
+# scores a singleton as 0 and a never-co-clustered point already scores 0 inside its
+# parent, making the split strictly non-negative. Measured over 12 scenes with both
+# guards off, plain argmax produced a singleton cluster in 5 of them (w1l1s5 paid
+# +0.0029 of silhouette to go from k=4 to k=15). At 1 the filter never fires.
+#
+# This is deliberately NOT the replicate `min_cluster_size`: that one is a density
+# parameter for the HDBSCAN fits and is scaled by `frac`; this one is an eligibility
+# test on a full-data cut, with nothing to scale.
+CONSENSUS_MIN_CLUSTER_SIZE = 1
 
 
 def _fit(dist: np.ndarray, min_cluster_size, min_samples, epsilon) -> np.ndarray:
@@ -246,6 +277,13 @@ def coassociation(n, replicates, return_counts=False):
 def consensus_labels(coassoc, *, min_cluster_size=5, min_samples=None, epsilon=0.0):
     """Cluster the ensemble itself: HDBSCAN on 1 - C as a precomputed distance.
 
+    **No longer the default** — ``ward_consensus_labels`` is. Kept because the corpus
+    was built with this until the switch, so reproducing an old cluster file needs it,
+    and because ``run-consensus-comparison`` scores it against the Ward aggregations.
+    The epsilon note below is the record of why it was demoted: the fit needed a tuned
+    constant to stop it out-resolving the ensemble it summarises, and Ward plus a
+    silhouette-chosen k does the same job without one.
+
     **``epsilon`` here is NOT the Fréchet-units epsilon used for the replicate
     fits.** Co-association distance is bounded in [0, 1], so a Fréchet threshold
     like 20 would exceed every distance in the matrix and merge the whole scene
@@ -260,6 +298,199 @@ def consensus_labels(coassoc, *, min_cluster_size=5, min_samples=None, epsilon=0
     d = 1.0 - np.asarray(coassoc, dtype=float)
     np.fill_diagonal(d, 0.0)
     return _fit(d, min_cluster_size, min_samples, epsilon)
+
+
+def _relabel_by_size(labels) -> np.ndarray:
+    """0-based labels, ordered by descending cluster size.
+
+    ``cut_tree`` numbers clusters arbitrarily. Everything downstream — the dashboard's
+    colour slots, the plot legends — ranks by size anyway, so doing it here makes the
+    stored file readable at a glance and the numbering deterministic.
+    """
+    labels = np.asarray(labels)
+    found, counts = np.unique(labels, return_counts=True)
+    order = found[np.argsort(-counts, kind="stable")]
+    remap = {int(old): new for new, old in enumerate(order.tolist())}
+    return np.array([remap[int(l)] for l in labels], dtype=int)
+
+
+def _consensus_tree(coassoc, *, input, linkage_method):
+    """Build the linkage tree over the ensemble. Returns ``(Z, d)``.
+
+    ``d`` is always the co-association distance ``1 - C``, returned separately because
+    it is what the silhouette is scored on regardless of how the tree was built — that
+    is what keeps the two ``input`` modes comparable.
+
+    Two ways to hand the ensemble to scipy, and they are **not** the same measurement:
+
+    - ``input="features"`` (the default, and what the BASC reference does) passes ``C``
+      itself as an *observation matrix*. Each row is one trace's co-occurrence profile
+      against every other trace, and the tree is built on ordinary Euclidean distances
+      between those profiles. This is what makes Ward well posed: its criterion is
+      defined on squared Euclidean distances, and the rows of ``C`` are vectors in R^n
+      no matter what the input space was. Ours is Fréchet — a metric, but not
+      Euclidean-embeddable — so this step is precisely what launders it.
+    - ``input="distance"`` passes ``1 - C`` as a precomputed dissimilarity. First-order
+      ("how often did *these two* cluster together") rather than second-order ("how
+      differently do they relate to everything else"). Measured over all 308 scenes it
+      is marginally the better of the two — 81.1% trace-weighted stable against 79.7%,
+      at the same median k — but it applies the Lance-Williams update to something not
+      guaranteed to be Euclidean, and the two partitions agree at median ARI 0.985
+      anyway. Kept so the choice stays checkable rather than asserted;
+      ``run-consensus-comparison`` is what produced those numbers.
+
+    The diagonal is handled differently per branch, on purpose. Under "features" it is
+    forced to 1.0, matching ``part2adj`` in the reference — an object always co-occurs
+    with itself. Under "distance" the diagonal of ``1 - C`` is zeroed for the reason
+    ``consensus_labels`` documents: a trace called noise in every replicate has
+    C[i,i] = 0 and would otherwise sit at distance 1.0 from itself.
+    """
+    C = np.asarray(coassoc, dtype=float)
+    d = 1.0 - C
+    np.fill_diagonal(d, 0.0)
+    d = (d + d.T) / 2.0          # float drift only; C is symmetric by construction
+
+    if input == "features":
+        feats = C.copy()
+        np.fill_diagonal(feats, 1.0)
+        with warnings.catch_warnings():
+            # A co-occurrence matrix is square, symmetric and near-hollow, so scipy
+            # warns it "looks suspiciously like an uncondensed distance matrix". Here
+            # that shape is the whole point, not a mistake.
+            warnings.simplefilter("ignore", ClusterWarning)
+            Z = linkage(feats, method=linkage_method, metric="euclidean")
+    elif input == "distance":
+        Z = linkage(squareform(d, checks=False), method=linkage_method)
+    else:
+        raise ValueError(f"Unknown consensus input '{input}'. Use 'features' or 'distance'.")
+
+    return Z, d
+
+
+def ward_consensus_labels(coassoc, *, dist=None, input="features",
+                          linkage_method="ward",
+                          min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE,
+                          k_max=CONSENSUS_K_MAX, tol=CONSENSUS_K_TOL):
+    """Cluster the ensemble with Ward linkage, choosing k by silhouette.
+
+    The default consensus aggregation, replacing ``consensus_labels`` and its tuned
+    ``CONSENSUS_EPSILON``. Returns ``(labels, report)``; the report carries the whole
+    selection curve so the choice is inspectable without a re-run.
+
+    The method in one sentence: **Ward linkage on the co-association matrix, cut at the
+    k with the highest silhouette on 1 - C.** Ward itself has no k — ``linkage`` returns
+    the full merge tree — so every k from 2 to ``k_max`` is cut, scored, and the best
+    taken. Ties go to the smaller k.
+
+    Two guards sit on that rule and both default to **off**; ``tol`` and
+    ``min_cluster_size`` turn them on. See the module constants for the measured
+    failure mode behind each — briefly, the silhouette on 1 - C plateaus rather than
+    falling (so the argmax drifts up a flat tail) and cannot penalise a singleton (so
+    unguarded cuts can be mostly dust). Neither is switched on by default: the plain
+    rule is what the analysis reports, and the guards are there to be turned on
+    deliberately and compared.
+
+    **Ward assigns every point, so there is no noise label.** When ``min_cluster_size``
+    is raised and nothing qualifies, the k=2 cut is taken and ``selection`` says
+    ``"fallback_k2"`` rather than the scene being silently dropped. At the default of 1
+    the filter never fires and that branch is unreachable.
+
+    Args:
+        dist: the Fréchet matrix. Optional, and **does not select** — it only adds a
+              ``silhouette_frechet`` to each candidate, so a reader can see where the
+              ensemble's cut and the raw trajectory geometry disagree. It is not used
+              for selection because it systematically prefers coarser cuts, and coarser
+              flatters ``stable_share`` for free (the same gameability ``select_params``
+              guards against by maximising k above a floor).
+    """
+    C = np.asarray(coassoc, dtype=float)
+    n = len(C)
+    settings = {
+        "consensus_cluster": "ward",
+        "input": input,
+        "linkage": linkage_method,
+        "min_cluster_size": int(min_cluster_size),
+        "k_max": int(k_max),
+        "tol": float(tol),
+    }
+
+    if n < 3:
+        # Nothing to select between: silhouette needs 2 <= k <= n - 1.
+        return (np.zeros(n, dtype=int),
+                {**settings, "k": 1 if n else 0, "selection": "too_small",
+                 "silhouette": None, "silhouette_frechet": None, "k_candidates": []})
+
+    # An ensemble that never once put any pair together carries no information: every
+    # replicate called every point noise. 1 - C is then all ones, the silhouette is
+    # exactly 0, and Ward would cut that flat matrix into arbitrary blocks — inventing
+    # structure the resampling explicitly failed to find. Report no clusters instead,
+    # which is what the HDBSCAN aggregation did for these scenes and is the honest
+    # answer. Measured on the corpus: 8 scenes, all small (n = 3 to 36).
+    off_diagonal = ~np.eye(n, dtype=bool)
+    if C[off_diagonal].max() == 0.0:
+        return (np.full(n, -1, dtype=int),
+                {**settings, "k": 0, "selection": "no_ensemble_signal",
+                 "silhouette": None, "silhouette_frechet": None, "k_candidates": []})
+
+    Z, d = _consensus_tree(C, input=input, linkage_method=linkage_method)
+    frechet = None if dist is None else np.asarray(dist, dtype=float)
+
+    def cut(k):
+        return np.squeeze(np.asarray(cut_tree(Z, n_clusters=k)))
+
+    # cut_tree returns exactly k where fcluster(..., "maxclust") returns *at most* k —
+    # that difference bit in testing, where a collapsed cut reached silhouette_score as
+    # a single label and raised. Ties can still collapse a cut, so candidates are keyed
+    # by the k actually returned (duplicates collapse) and single-label cuts dropped.
+    candidates: dict[int, np.ndarray] = {}
+    for k in range(2, min(int(k_max), n - 1) + 1):
+        labels = cut(k)
+        found, counts = np.unique(labels, return_counts=True)
+        if len(found) < 2 or counts.min() < min_cluster_size:
+            continue
+        candidates.setdefault(len(found), labels)
+
+    rows = []
+    for k, labels in sorted(candidates.items()):
+        row = {
+            "k": int(k),
+            "silhouette": round(float(silhouette_score(d, labels, metric="precomputed")), 4),
+            "min_size": int(np.unique(labels, return_counts=True)[1].min()),
+        }
+        if frechet is not None:
+            row["silhouette_frechet"] = round(
+                float(silhouette_score(frechet, labels, metric="precomputed")), 4)
+        rows.append(row)
+
+    if rows:
+        best = max(r["silhouette"] for r in rows)
+        chosen = min((r for r in rows if r["silhouette"] >= best - tol),
+                     key=lambda r: r["k"])
+        labels = candidates[chosen["k"]]
+        selection = "silhouette"
+    else:
+        # No cut clears the size floor. Take the coarsest partition available and say
+        # so, rather than dropping a small scene entirely.
+        labels = cut(2)
+        selection = "fallback_k2"
+        chosen = {"silhouette": None, "silhouette_frechet": None}
+        if len(np.unique(labels)) > 1:
+            chosen["silhouette"] = round(
+                float(silhouette_score(d, labels, metric="precomputed")), 4)
+            if frechet is not None:
+                chosen["silhouette_frechet"] = round(
+                    float(silhouette_score(frechet, labels, metric="precomputed")), 4)
+
+    labels = _relabel_by_size(labels)
+    report = {
+        **settings,
+        "k": int(len(np.unique(labels))),
+        "selection": selection,
+        "silhouette": chosen.get("silhouette"),
+        "silhouette_frechet": chosen.get("silhouette_frechet"),
+        "k_candidates": rows,
+    }
+    return labels, report
 
 
 def trace_confidence(coassoc, labels) -> np.ndarray:
@@ -608,8 +839,15 @@ def select_global_params(output_dir, floor=0.80, min_k=2) -> dict:
     return result
 
 
-def _compare_one(scene, output_dir, params, B, frac, seed, consensus_epsilon):
-    """Cluster one scene under both resampling schemes. Returns a comparison row."""
+def _compare_one(scene, output_dir, params, B, frac, seed, consensus_epsilon,
+                 consensus_cluster="ward", consensus_input="features"):
+    """Cluster one scene under both resampling schemes. Returns a comparison row.
+
+    The consensus settings are forwarded rather than left at their defaults so this
+    compares the two *schemes* under whatever aggregation the corpus actually uses —
+    otherwise a later change of default would silently make this measure two things
+    at once.
+    """
     import json
     from pathlib import Path
     from sklearn.metrics import adjusted_rand_score
@@ -629,6 +867,7 @@ def _compare_one(scene, output_dir, params, B, frac, seed, consensus_epsilon):
             min_cluster_size=params["min_cluster_size"],
             cluster_selection_epsilon=params["cluster_selection_epsilon"],
             bootstraps=B, frac=frac, seed=seed, consensus_epsilon=consensus_epsilon,
+            consensus_cluster=consensus_cluster, consensus_input=consensus_input,
         )
         labels[scheme] = lab
         row[scheme] = {
@@ -645,7 +884,8 @@ def _compare_one(scene, output_dir, params, B, frac, seed, consensus_epsilon):
 
 
 def run_scheme_comparison(scenes, output_dir, *, params=None, B=200, frac=0.8,
-                          seed=0, consensus_epsilon=0.4, n_jobs=1) -> dict:
+                          seed=0, consensus_epsilon=0.4, consensus_cluster="ward",
+                          consensus_input="features", n_jobs=1) -> dict:
     """Cluster every scene under both subagging and Breiman bootstrap; write the result.
 
     The point is to make the choice inspectable rather than asserted. Both schemes
@@ -666,12 +906,14 @@ def run_scheme_comparison(scenes, output_dir, *, params=None, B=200, frac=0.8,
     params = params or {"min_cluster_size": 5, "cluster_selection_epsilon": 20.0}
 
     if n_jobs == 1:
-        rows = [_compare_one(s, output_dir, params, B, frac, seed, consensus_epsilon)
+        rows = [_compare_one(s, output_dir, params, B, frac, seed, consensus_epsilon,
+                             consensus_cluster, consensus_input)
                 for s in scenes]
     else:
         from joblib import Parallel, delayed
         rows = Parallel(n_jobs=n_jobs, verbose=5)(
-            delayed(_compare_one)(s, output_dir, params, B, frac, seed, consensus_epsilon)
+            delayed(_compare_one)(s, output_dir, params, B, frac, seed, consensus_epsilon,
+                                  consensus_cluster, consensus_input)
             for s in scenes
         )
     rows = [r for r in rows if r is not None]
@@ -698,7 +940,9 @@ def run_scheme_comparison(scenes, output_dir, *, params=None, B=200, frac=0.8,
 
     result = {
         "params": {**params, "bootstraps": int(B), "frac": float(frac),
-                   "seed": int(seed), "consensus_epsilon": float(consensus_epsilon)},
+                   "seed": int(seed), "consensus_epsilon": float(consensus_epsilon),
+                   "consensus_cluster": consensus_cluster,
+                   "consensus_input": consensus_input},
         "scenes": len(rows),
         "summary": {"subagging": summarise("subagging"),
                     "bootstrap": summarise("bootstrap")},
@@ -707,6 +951,187 @@ def run_scheme_comparison(scenes, output_dir, *, params=None, B=200, frac=0.8,
     }
     out_path = out_dir / "scheme_comparison.json"
     out_path.write_text(json.dumps(result, indent=2))
+    print(f"Compared {len(rows)} scenes -> {out_path}")
+    return result
+
+
+# The three ways the ensemble can be turned into labels, as
+# (name, consensus_cluster, consensus_input).
+CONSENSUS_AGGREGATIONS = (
+    ("ward_features", "ward", "features"),
+    ("ward_distance", "ward", "distance"),
+    ("hdbscan", "hdbscan", None),
+)
+
+
+def _silhouette_excluding_noise(d, labels):
+    """Silhouette on ``1 - C``, computed over non-noise points only.
+
+    HDBSCAN partitions carry a -1 class that is not a cluster but a leftover pile, and
+    scoring it as though it were one would make the comparison against Ward — which has
+    no noise class — meaningless. Returns None when fewer than two clusters remain.
+    """
+    labels = np.asarray(labels)
+    keep = np.flatnonzero(labels != -1)
+    if len(keep) < 3 or len(set(labels[keep].tolist())) < 2:
+        return None
+    return round(float(silhouette_score(d[np.ix_(keep, keep)], labels[keep],
+                                        metric="precomputed")), 4)
+
+
+def _compare_consensus_one(scene, output_dir, params, B, frac, seed, scheme,
+                           consensus_epsilon):
+    """Score one scene under every consensus aggregation. Returns a comparison row.
+
+    **The ensemble is built once and shared.** The replicate fits are the expensive part
+    (~4-5 s a scene) and are identical across the three aggregations, which differ only
+    in what they do with ``C``. Refitting per aggregation would triple the cost and, worse,
+    leave room for the comparison to be confounded by a differing ensemble; this way the
+    three are guaranteed to be reading the same matrix.
+    """
+    from pathlib import Path
+
+    matrix = Path(output_dir) / "frechet" / f"{scene}.npy"
+    if not matrix.exists():
+        return None
+    dist = np.load(matrix)
+    n = len(dist)
+    if n < 3:
+        return None
+
+    replicates = resample_labels(
+        dist, min_cluster_size=params["min_cluster_size"],
+        min_samples=params.get("min_samples"),
+        epsilon=params["cluster_selection_epsilon"],
+        B=B, frac=frac, seed=seed, scheme=scheme,
+    )
+    coassoc = coassociation(n, replicates)
+    d = 1.0 - coassoc
+    np.fill_diagonal(d, 0.0)
+    d = (d + d.T) / 2.0
+
+    row = {"scene": scene, "n": int(n)}
+    labels = {}
+    for name, cluster_kind, input_kind in CONSENSUS_AGGREGATIONS:
+        if cluster_kind == "ward":
+            # The Ward floor, not the replicate density parameter — they are separate
+            # settings now, and passing the latter here is what made an earlier run of
+            # this comparison score Ward under a floor of 5 it does not ship with.
+            lab, report = ward_consensus_labels(
+                coassoc, dist=dist, input=input_kind,
+                min_cluster_size=params.get("consensus_min_cluster_size",
+                                            CONSENSUS_MIN_CLUSTER_SIZE))
+            silhouette = report["silhouette"]
+            silhouette_frechet = report["silhouette_frechet"]
+            selection = report["selection"]
+        else:
+            lab = consensus_labels(coassoc,
+                                   min_cluster_size=params["min_cluster_size"],
+                                   min_samples=params.get("min_samples"),
+                                   epsilon=consensus_epsilon)
+            silhouette = _silhouette_excluding_noise(d, lab)
+            silhouette_frechet = _silhouette_excluding_noise(dist, lab)
+            selection = "epsilon"
+
+        jac = jaccard_stability(lab, replicates)
+        labels[name] = np.asarray(lab)
+        row[name] = {
+            "k": len(_cluster_ids(np.asarray(lab))),
+            "stable_share": round(stable_share(lab, jac), 4),
+            "noise_frac": round(float((np.asarray(lab) == -1).mean()), 4),
+            "silhouette": silhouette,
+            "silhouette_frechet": silhouette_frechet,
+            "selection": selection,
+        }
+
+    # Do the partitions actually differ, beyond their summary statistics?
+    names = [name for name, _, _ in CONSENSUS_AGGREGATIONS]
+    row["ari"] = {f"{a}|{b}": round(float(adjusted_rand_score(labels[a], labels[b])), 4)
+                  for i, a in enumerate(names) for b in names[i + 1:]}
+    return row
+
+
+def run_consensus_comparison(scenes, output_dir, *, params=None, B=200, frac=0.8,
+                             seed=0, scheme="subagging", consensus_epsilon=0.4,
+                             n_jobs=1) -> dict:
+    """Score every scene under all three consensus aggregations; write the result.
+
+    Ward on the co-association matrix as a feature matrix (the BASC form, and the
+    default), Ward on ``1 - C`` as a precomputed dissimilarity, and the older HDBSCAN
+    fit on ``1 - C`` at ``consensus_epsilon``. Same replicate parameters, same B, same
+    seed, same ensemble — the only difference is the last step.
+
+    The point is the same as ``run_scheme_comparison``'s: make the choice inspectable
+    rather than asserted. A 12-scene probe put the three within about a point of each
+    other on trace-weighted ``stable_share``; this is what checks that over the corpus.
+
+    Parallelism is over **scenes** for the reason given in ``run_scheme_comparison``:
+    one scene is seconds of work, one replicate fit is milliseconds, and at that
+    granularity joblib's per-task overhead exceeds the fit.
+    """
+    import json
+    from pathlib import Path
+
+    output_dir = Path(output_dir)
+    out_dir = output_dir / "stability"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    params = params or {"min_cluster_size": 5, "cluster_selection_epsilon": 20.0}
+
+    if n_jobs == 1:
+        rows = [_compare_consensus_one(s, output_dir, params, B, frac, seed, scheme,
+                                       consensus_epsilon)
+                for s in scenes]
+    else:
+        from joblib import Parallel, delayed
+        rows = Parallel(n_jobs=n_jobs, verbose=5)(
+            delayed(_compare_consensus_one)(s, output_dir, params, B, frac, seed, scheme,
+                                            consensus_epsilon)
+            for s in scenes
+        )
+    rows = [r for r in rows if r is not None]
+    if not rows:
+        raise FileNotFoundError("No cached Fréchet matrices found for the given scenes.")
+
+    traces = sum(r["n"] for r in rows)
+
+    def summarise(name):
+        ks = [r[name]["k"] for r in rows]
+        ss = [r[name]["stable_share"] for r in rows]
+        sil = [r[name]["silhouette"] for r in rows if r[name]["silhouette"] is not None]
+        return {
+            "median_k": float(np.median(ks)),
+            "mean_k": round(float(np.mean(ks)), 2),
+            "median_stable_share": round(float(np.median(ss)), 4),
+            # Trace-weighted, so it is comparable with selected_params.json.
+            "weighted_stable_share": round(
+                float(sum(r[name]["stable_share"] * r["n"] for r in rows) / traces), 4),
+            "median_noise_frac": round(float(np.median([r[name]["noise_frac"] for r in rows])), 4),
+            "median_silhouette": round(float(np.median(sil)), 4) if sil else None,
+            "scenes_below_60pct": sum(1 for v in ss if v < 0.60),
+            "scenes_at_or_above_80pct": sum(1 for v in ss if v >= 0.80),
+            "scenes_with_zero_clusters": sum(1 for v in ks if v == 0),
+            "scenes_fallback_k2": sum(1 for r in rows if r[name]["selection"] == "fallback_k2"),
+        }
+
+    names = [name for name, _, _ in CONSENSUS_AGGREGATIONS]
+    result = {
+        "params": {**params, "bootstraps": int(B), "frac": float(frac),
+                   "seed": int(seed), "scheme": scheme,
+                   "consensus_epsilon": float(consensus_epsilon)},
+        "scenes": len(rows),
+        "summary": {name: summarise(name) for name in names},
+        "median_ari": {
+            pair: round(float(np.median([r["ari"][pair] for r in rows])), 4)
+            for pair in rows[0]["ari"]
+        },
+        "rows": rows,
+    }
+    out_path = out_dir / "consensus_comparison.json"
+    out_path.write_text(json.dumps(result, indent=2))
+    for name in names:
+        sm = result["summary"][name]
+        print(f"  {name:14} median k={sm['median_k']:.0f}  "
+              f"{sm['weighted_stable_share']:.1%} of traces stable")
     print(f"Compared {len(rows)} scenes -> {out_path}")
     return result
 

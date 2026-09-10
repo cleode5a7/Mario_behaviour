@@ -67,6 +67,7 @@
           <button data-value="overlay" aria-pressed="true">Overlay</button>
           <button data-value="panels" aria-pressed="false">Per-cluster panels</button>
           <button data-value="matrix" aria-pressed="false">Co-association</button>
+          <button data-value="selection" aria-pressed="false">k selection</button>
         </div>
       </div>
       <div class="field">
@@ -91,7 +92,7 @@
     <div id="topbar">
       <div>
         <h2 id="chart-title">Select a scene</h2>
-        <p id="chart-sub">Cluster labels come from HDBSCAN over every trace in the scene; filters only change what is drawn.</p>
+        <p id="chart-sub">Cluster labels come from the Ward consensus over every trace in the scene; filters only change what is drawn.</p>
       </div>
       <div id="topbar-actions">
         <button class="ghost" id="reset-view" hidden>Reset view</button>
@@ -114,6 +115,13 @@
         <div id="matrix-box"><canvas id="matrix-canvas"></canvas></div>
         <div id="matrix-legend"></div>
         <p class="note" id="matrix-note"></p>
+      </div>
+
+      <div id="selection-wrap" hidden>
+        <div id="selection-box"><canvas id="selection-canvas"></canvas></div>
+        <div id="selection-legend"></div>
+        <dl id="selection-facts"></dl>
+        <p class="note" id="selection-note"></p>
       </div>
     </div>
   </main>

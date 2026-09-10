@@ -9,6 +9,8 @@ import hdbscan
 from joblib import Parallel, delayed
 
 from analysis.changepoints import _SCENE_PATTERN
+from analysis.stability import (CONSENSUS_K_MAX, CONSENSUS_K_TOL,
+                                CONSENSUS_MIN_CLUSTER_SIZE)
 
 # Binary scene-design-pattern columns in scenes_mastersheet.csv (Zenodo 15586709).
 SCENE_PATTERN_COLS = [
@@ -211,9 +213,14 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
     return labels
 
 
-# Merge threshold for the *consensus* fit, in co-association distance (1 - C),
-# NOT in Fréchet units. 0.4 means "merge clusters whose members co-clustered in
-# more than 60% of the replicates they shared".
+# Merge threshold for the legacy HDBSCAN consensus fit, in co-association distance
+# (1 - C), NOT in Fréchet units. 0.4 means "merge clusters whose members co-clustered
+# in more than 60% of the replicates they shared".
+#
+# This applies only to `consensus_cluster="hdbscan"`, which is no longer the default —
+# Ward with a silhouette-chosen k is (see `analysis.stability.ward_consensus_labels`).
+# The comment below is kept as the record of *why* it was demoted: the fit needed a
+# hand-swept constant to stop it out-resolving the ensemble it was meant to summarise.
 #
 # It cannot be 0. At 0 the consensus fit splits on tiny co-association differences
 # and comes out systematically *finer* than the ensemble it is meant to summarise —
@@ -223,10 +230,25 @@ def kmedoids(dist_matrix: np.ndarray, n_clusters: int, max_iter: int = 100, seed
 # stable share, median k=4) and 0.0 the worst row (82%, k=5).
 CONSENSUS_EPSILON = 0.4
 
+# How the ensemble itself is clustered once the co-association matrix is built.
+# "ward" (default) is Ward linkage with k chosen by silhouette; "hdbscan" is the older
+# fit on 1 - C that CONSENSUS_EPSILON belongs to. "features"/"ward" match the BASC
+# reference: C is handed to scipy as an observation matrix, so Ward runs on Euclidean
+# distances between co-occurrence profiles and its criterion is well posed.
+CONSENSUS_CLUSTER = "ward"
+CONSENSUS_INPUT = "features"
+CONSENSUS_LINKAGE = "ward"
+
 
 def _params_record(method, n_clusters, min_cluster_size, min_samples,
                    cluster_selection_epsilon, bootstraps, frac, seed,
-                   consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging") -> dict:
+                   consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging",
+                   consensus_cluster=CONSENSUS_CLUSTER,
+                   consensus_input=CONSENSUS_INPUT,
+                   consensus_linkage=CONSENSUS_LINKAGE,
+                   consensus_k_max=CONSENSUS_K_MAX,
+                   consensus_tol=CONSENSUS_K_TOL,
+                   consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE) -> dict:
     """The settings that produced a partition, stored alongside it.
 
     Earlier cluster files recorded no parameters at all, and the scenes were not
@@ -234,6 +256,10 @@ def _params_record(method, n_clusters, min_cluster_size, min_samples,
     nobody could say what produced any given file without a grid search against its
     labels (see ``analysis.stability.recover_params``). Writing this closes that gap
     going forward.
+
+    ``consensus_epsilon`` is recorded **only** on the hdbscan aggregation path, since
+    it means nothing to the Ward one; a file therefore says which aggregation made it
+    rather than carrying a setting that had no effect.
     """
     record = {"method": method}
     if method == "kmedoids":
@@ -246,9 +272,16 @@ def _params_record(method, n_clusters, min_cluster_size, min_samples,
     })
     if method == "consensus":
         record.update({"bootstraps": int(bootstraps), "frac": float(frac),
-                       "seed": int(seed),
-                       "consensus_epsilon": float(consensus_epsilon),
-                       "scheme": scheme})
+                       "seed": int(seed), "scheme": scheme,
+                       "consensus_cluster": consensus_cluster})
+        if consensus_cluster == "hdbscan":
+            record["consensus_epsilon"] = float(consensus_epsilon)
+        else:
+            record.update({"consensus_input": consensus_input,
+                           "consensus_linkage": consensus_linkage,
+                           "consensus_k_max": int(consensus_k_max),
+                           "consensus_tol": float(consensus_tol),
+                           "consensus_min_cluster_size": int(consensus_min_cluster_size)})
     return record
 
 
@@ -266,6 +299,12 @@ def cluster_traces(
     seed: int = 0,
     consensus_epsilon: float = CONSENSUS_EPSILON,
     scheme: str = "subagging",
+    consensus_cluster: str = CONSENSUS_CLUSTER,
+    consensus_input: str = CONSENSUS_INPUT,
+    consensus_linkage: str = CONSENSUS_LINKAGE,
+    consensus_k_max: int = CONSENSUS_K_MAX,
+    consensus_tol: float = CONSENSUS_K_TOL,
+    consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
 ) -> tuple[list[int], dict | None]:
     """Pairwise Fréchet distance + clustering. Shared by per-scene and per-category runs.
 
@@ -298,6 +337,25 @@ def cluster_traces(
                                     specifically corrosive to a density-based method.
         seed:                       replicate draws are seeded, so consensus labels
                                     are reproducible.
+        consensus_cluster:          how the ensemble itself is clustered: "ward"
+                                    (default; Ward linkage, k chosen by silhouette) or
+                                    "hdbscan" (the older fit on 1 - C, which is what
+                                    ``consensus_epsilon`` applies to).
+        consensus_input:            for "ward": "features" (default) hands C to scipy as
+                                    an observation matrix so Ward runs on Euclidean
+                                    distances between co-occurrence profiles — which is
+                                    what makes its criterion well posed; "distance"
+                                    passes 1 - C as a precomputed dissimilarity instead.
+        consensus_linkage:          linkage method for "ward" (ward/average/complete).
+        consensus_k_max:            largest k considered by the silhouette selection.
+        consensus_tol:              plateau tie-break, off at 0.0 (the default): among
+                                    cuts within this of the best silhouette, the
+                                    smallest k wins.
+        consensus_min_cluster_size: eligibility floor on a Ward cut, off at 1 (the
+                                    default): a cut is a candidate only if its smallest
+                                    cluster clears it. Distinct from ``min_cluster_size``
+                                    above, which is an HDBSCAN density parameter for the
+                                    replicate fits.
         dist_matrix:                a precomputed Fréchet distance matrix. If given,
                                     ``traces`` is not needed and no distances are
                                     computed — this is the cheap path for re-running
@@ -316,6 +374,12 @@ def cluster_traces(
                           cluster_selection_epsilon=cluster_selection_epsilon,
                           bootstraps=bootstraps, frac=frac, seed=seed,
                           consensus_epsilon=consensus_epsilon, scheme=scheme,
+                          consensus_cluster=consensus_cluster,
+                          consensus_input=consensus_input,
+                          consensus_linkage=consensus_linkage,
+                          consensus_k_max=consensus_k_max,
+                          consensus_tol=consensus_tol,
+                          consensus_min_cluster_size=consensus_min_cluster_size,
                           n_jobs=n_jobs)
     elif method == "hdbscan":
         return hdbscan.HDBSCAN(
@@ -333,18 +397,27 @@ def cluster_traces(
 
 def _consensus(dist_matrix, *, min_cluster_size, min_samples,
                cluster_selection_epsilon, bootstraps, frac, seed,
-               consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging", n_jobs=1):
-    """Bagged HDBSCAN: resample, average the partitions, cluster the average.
+               consensus_epsilon=CONSENSUS_EPSILON, scheme="subagging",
+               consensus_cluster=CONSENSUS_CLUSTER, consensus_input=CONSENSUS_INPUT,
+               consensus_linkage=CONSENSUS_LINKAGE, consensus_k_max=CONSENSUS_K_MAX,
+               consensus_tol=CONSENSUS_K_TOL,
+               consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE, n_jobs=1):
+    """Bagged clustering: resample, average the partitions, cluster the average.
 
     The ensemble *produces* the labels here rather than annotating a single fit.
-    Each replicate re-fits HDBSCAN on a random ``frac`` of the traces; the
+    Each replicate re-fits HDBSCAN on a random ``frac`` of the traces, and the
     co-association matrix records how often each pair landed together given both
-    were drawn; and the final partition is HDBSCAN on ``1 - C``. A cluster
-    therefore has to survive resampling to exist at all, instead of being found
-    once and trusted.
+    were drawn. A cluster therefore has to survive resampling to exist at all,
+    instead of being found once and trusted.
+
+    Only the last step is configurable. ``consensus_cluster="ward"`` (default) cuts a
+    Ward tree over the ensemble at a silhouette-chosen k; ``"hdbscan"`` is the older
+    fit on ``1 - C`` at ``consensus_epsilon``. The replicate fits are identical either
+    way, so the co-association matrices under ``output_data/coassociation/`` are
+    unaffected by the choice.
     """
     from analysis.stability import (
-        resample_labels, coassociation, consensus_labels,
+        resample_labels, coassociation, consensus_labels, ward_consensus_labels,
         jaccard_stability, stable_share, trace_confidence,
     )
 
@@ -355,12 +428,30 @@ def _consensus(dist_matrix, *, min_cluster_size, min_samples,
         scheme=scheme, n_jobs=n_jobs,
     )
     coassoc, co_sampled = coassociation(n, replicates, return_counts=True)
-    # NB: cluster_selection_epsilon is in Fréchet units and belongs to the replicate
-    # fits above. The consensus fit runs on 1 - C, bounded in [0, 1], where that
-    # threshold would exceed every distance and collapse the scene to one cluster.
-    labels = consensus_labels(coassoc, min_cluster_size=min_cluster_size,
-                              min_samples=min_samples,
-                              epsilon=consensus_epsilon)
+
+    if consensus_cluster == "ward":
+        # NB: `consensus_min_cluster_size`, not the replicate `min_cluster_size`.
+        # The first is an eligibility test on a full-data Ward cut; the second is an
+        # HDBSCAN density parameter, scaled by `frac` inside resample_labels. They
+        # were one flag until the selection rule was simplified, which is why a cut
+        # was floored at 5 by a number swept for a different purpose entirely.
+        labels, consensus_report = ward_consensus_labels(
+            coassoc, dist=dist_matrix, input=consensus_input,
+            linkage_method=consensus_linkage,
+            min_cluster_size=consensus_min_cluster_size,
+            k_max=consensus_k_max, tol=consensus_tol)
+    elif consensus_cluster == "hdbscan":
+        # NB: cluster_selection_epsilon is in Fréchet units and belongs to the replicate
+        # fits above. This fit runs on 1 - C, bounded in [0, 1], where that threshold
+        # would exceed every distance and collapse the scene to one cluster.
+        labels = consensus_labels(coassoc, min_cluster_size=min_cluster_size,
+                                  min_samples=min_samples,
+                                  epsilon=consensus_epsilon)
+        consensus_report = {"consensus_cluster": "hdbscan",
+                            "consensus_epsilon": float(consensus_epsilon)}
+    else:
+        raise ValueError(f"Unknown consensus_cluster '{consensus_cluster}'. "
+                         f"Use 'ward' or 'hdbscan'.")
 
     jaccard = jaccard_stability(labels, replicates)
     ks = [len({int(l) for l in lab.tolist()} - {-1}) for _, lab in replicates]
@@ -376,6 +467,9 @@ def _consensus(dist_matrix, *, min_cluster_size, min_samples,
         # Smallest denominator anywhere in the co-association matrix: the
         # diagnostic for whether `bootstraps` was large enough.
         "min_co_sampled": int(co_sampled[off_diagonal].min()) if n > 1 else 0,
+        # How the ensemble was turned into labels, and — for Ward — the whole
+        # silhouette-vs-k curve, so the cut can be second-guessed without a re-run.
+        "consensus": consensus_report,
     }
     return labels.tolist(), stability
 
@@ -397,6 +491,12 @@ def run_clustering(
     seed: int = 0,
     consensus_epsilon: float = CONSENSUS_EPSILON,
     scheme: str = "subagging",
+    consensus_cluster: str = CONSENSUS_CLUSTER,
+    consensus_input: str = CONSENSUS_INPUT,
+    consensus_linkage: str = CONSENSUS_LINKAGE,
+    consensus_k_max: int = CONSENSUS_K_MAX,
+    consensus_tol: float = CONSENSUS_K_TOL,
+    consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
 
@@ -423,7 +523,11 @@ def run_clustering(
         min_cluster_size=min_cluster_size, min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
         bootstraps=bootstraps, frac=frac, seed=seed,
-        consensus_epsilon=consensus_epsilon, scheme=scheme, n_jobs=n_jobs)
+        consensus_epsilon=consensus_epsilon, scheme=scheme,
+        consensus_cluster=consensus_cluster, consensus_input=consensus_input,
+        consensus_linkage=consensus_linkage, consensus_k_max=consensus_k_max,
+        consensus_tol=consensus_tol,
+        consensus_min_cluster_size=consensus_min_cluster_size, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     stable = "" if stability is None else f", {stability['stable_share']:.0%} of traces stable"
@@ -436,7 +540,13 @@ def run_clustering(
         "method": method,
         "params": _params_record(method, n_clusters, min_cluster_size, min_samples,
                                  cluster_selection_epsilon, bootstraps, frac, seed,
-                                 consensus_epsilon, scheme),
+                                 consensus_epsilon, scheme,
+                                 consensus_cluster=consensus_cluster,
+                                 consensus_input=consensus_input,
+                                 consensus_linkage=consensus_linkage,
+                                 consensus_k_max=consensus_k_max,
+                                 consensus_tol=consensus_tol,
+                                 consensus_min_cluster_size=consensus_min_cluster_size),
         "labels": labels,
         "metadata": metadata,
         "stability": stability,
@@ -460,6 +570,12 @@ def run_clustering_by_category(
     seed: int = 0,
     consensus_epsilon: float = CONSENSUS_EPSILON,
     scheme: str = "subagging",
+    consensus_cluster: str = CONSENSUS_CLUSTER,
+    consensus_input: str = CONSENSUS_INPUT,
+    consensus_linkage: str = CONSENSUS_LINKAGE,
+    consensus_k_max: int = CONSENSUS_K_MAX,
+    consensus_tol: float = CONSENSUS_K_TOL,
+    consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
 ) -> None:
     """Cluster behavioural traces pooled across every scene tagged with a category.
 
@@ -505,7 +621,11 @@ def run_clustering_by_category(
         min_cluster_size=min_cluster_size, min_samples=min_samples,
         cluster_selection_epsilon=cluster_selection_epsilon,
         bootstraps=bootstraps, frac=frac, seed=seed,
-        consensus_epsilon=consensus_epsilon, scheme=scheme, n_jobs=n_jobs)
+        consensus_epsilon=consensus_epsilon, scheme=scheme,
+        consensus_cluster=consensus_cluster, consensus_input=consensus_input,
+        consensus_linkage=consensus_linkage, consensus_k_max=consensus_k_max,
+        consensus_tol=consensus_tol,
+        consensus_min_cluster_size=consensus_min_cluster_size, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Category '{category}': {n_found} clusters found ({labels.count(-1)} noise points)")
@@ -516,7 +636,13 @@ def run_clustering_by_category(
         "method": method,
         "params": _params_record(method, n_clusters, min_cluster_size, min_samples,
                                  cluster_selection_epsilon, bootstraps, frac, seed,
-                                 consensus_epsilon, scheme),
+                                 consensus_epsilon, scheme,
+                                 consensus_cluster=consensus_cluster,
+                                 consensus_input=consensus_input,
+                                 consensus_linkage=consensus_linkage,
+                                 consensus_k_max=consensus_k_max,
+                                 consensus_tol=consensus_tol,
+                                 consensus_min_cluster_size=consensus_min_cluster_size),
         "labels": labels,
         "metadata": metadata,
         "stability": stability,

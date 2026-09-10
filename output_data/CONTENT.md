@@ -36,8 +36,17 @@ One JSON file per scene produced by `invoke run-clustering`:
 
   `params` records the settings that produced the partition — method, `min_cluster_size`,
   `min_samples`, `cluster_selection_epsilon`, and for the consensus method `bootstraps`,
-  `frac`, `seed` and `consensus_epsilon` (the merge threshold for the final fit, in
-  co-association distance rather than Fréchet units — see CLAUDE.md). Files written before this field existed carried no parameters at all,
+  `frac`, `seed`, `scheme` and `consensus_cluster` (how the ensemble itself was turned
+  into labels). On `consensus_cluster: "ward"` — the default — it also carries
+  `consensus_input`, `consensus_linkage`, `consensus_k_max`, `consensus_tol` and
+  `consensus_min_cluster_size` (the eligibility floor on a Ward cut — a different knob
+  from `min_cluster_size`, which is the HDBSCAN density parameter for the replicate
+  fits; both ship at their off values, `0.0` and `1`). On
+  `consensus_cluster: "hdbscan"` it carries `consensus_epsilon` instead (the merge
+  threshold for that fit, in co-association distance rather than Fréchet units — see
+  CLAUDE.md). The two sets are mutually exclusive on purpose, so a file says which
+  aggregation made it rather than recording a setting that had no effect.
+  Files written before this field existed carried no parameters at all,
   and the corpus was not made uniformly (an audit recovered 14 distinct settings across
   308 scenes), so `analysis.stability.recover_params` exists to reconstruct them by grid
   search against the stored labels.
@@ -48,6 +57,18 @@ One JSON file per scene produced by `invoke run-clustering`:
   cluster count across replicates), `noise_frac`, and `min_co_sampled` — the smallest
   number of replicates any pair was drawn into together, which is the diagnostic for
   whether `bootstraps` was large enough.
+
+  `stability.consensus` records how the ensemble was cut. For Ward: the selected `k`,
+  `selection` — `"silhouette"` normally, meaning the cut with the highest silhouette on
+  `1 - C` was taken; `"fallback_k2"` when no cut cleared the minimum cluster size (only
+  reachable when `consensus_min_cluster_size` is raised above its default of 1); `"no_ensemble_signal"` when no pair of traces ever co-clustered in any
+  replicate, in which case every trace is labelled `-1` and `k` is 0, because cutting an
+  informationless matrix would invent structure the resampling did not find — the chosen
+  `silhouette` and `silhouette_frechet`, and
+  `k_candidates` — the whole silhouette-vs-k curve, so the cut can be second-guessed
+  without re-running the ensemble. Note `noise_frac` is 0 on any Ward run that produced
+  clusters at all: Ward assigns every trace, so `-1` appears only in the
+  `no_ensemble_signal` case above.
   A label of `-1` is HDBSCAN noise. Each `metadata` entry is the trace's
   `*_summary.json` record verbatim (21 fields: `Subject`, `Session`, `Run`, `Level`,
   `SceneID`, `ClipCode`, `StartFrame`, `EndFrame`, `Duration`, `Outcome`, `Phase`,
@@ -71,8 +92,9 @@ e.g. `2-Horde`, `Gap stair valley`) produced by `invoke run-clustering-by-catego
 
 ## `stability/`
 
-Resampling diagnostics written by `invoke run-cluster-audit`, `invoke run-cluster-sweep`
-and `invoke select-cluster-params`. All three read only `output_data/` — the stored labels
+Resampling diagnostics written by `invoke run-cluster-audit`, `invoke run-cluster-sweep`,
+`invoke select-cluster-params`, `invoke run-scheme-comparison` and
+`invoke run-consensus-comparison`. All three read only `output_data/` — the stored labels
 and the cached Fréchet matrices — and never open `source_data/mario.scenes/`.
 
 - `audit.json` — one entry per already-clustered scene: the parameters behind it, plus
@@ -102,6 +124,13 @@ and the cached Fréchet matrices — and never open `source_data/mario.scenes/`.
   difference is how replicates are drawn. `rows` carries per-scene `k`, `stable_share`,
   `noise_frac`, replicate-`k` spread and the ARI between the two partitions; `summary`
   aggregates each scheme. Written by `invoke run-scheme-comparison`.
+- `consensus_comparison.json` — every scene clustered under all three consensus
+  aggregations (Ward on the co-association matrix as features, Ward on `1 - C` as a
+  precomputed distance, and the older HDBSCAN fit on `1 - C`) from **one shared
+  ensemble per scene**, so nothing but the last step differs. `rows` carries per-scene
+  `k`, `stable_share`, `noise_frac`, both silhouettes and the pairwise ARI between the
+  three partitions; `summary` aggregates each. Written by
+  `invoke run-consensus-comparison`.
 - `selected_params.json` — the corpus-wide choice. `rows` aggregates every sweep
   trace-weighted; `selected` is the winner under the rule "largest median k whose stable
   share clears `floor`", and `cleared_floor` says whether the floor was reached at all.
@@ -153,6 +182,15 @@ explicit `invoke clean-frechet` throws them away.
 
 ## Trace figures
 
+`figure_clustering_silhouette.png` shows how the consensus cut is chosen: silhouette
+against k for three representative scenes with the selected k marked, every scene's curve
+overlaid, whether the chosen k is an interior peak or the largest candidate offered
+(276 vs 24, the latter all scenes that hit the `k_max = 15` ceiling), and how many traces
+are in the smallest cluster of each chosen cut — the check the silhouette itself cannot
+perform, since it scores a singleton at 0 and so cannot penalise a cut for peeling one
+off. Drawn from the `stability.consensus.k_candidates` block, so it needs no
+recomputation.
+
 `notebooks/figure_clustering.ipynb` also writes trajectory figures into `clusters/`
 (`figure_clustering_<scene_id>.png`, `figure_clustering_category_<slug>.png`, etc.).
 Traces use a screen-corrected vertical coordinate and are colored by cluster (default)
@@ -185,13 +223,14 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
 `invoke run-web-export`; roughly 50 MB in total.
 
 - `output_data/web/data/index.json` — one row per exported scene (`id`, `world`, `level`, `scene`, `n`
-  traces, `k` clusters, `noise` fraction, `sb` mean stability, `subjects`, `phases`,
+  traces, `k` clusters, `noise` fraction, `sb` mean stability, `sil` — the silhouette of
+  the cut that was taken — `sel` — how it was chosen — `subjects`, `phases`,
   `method`, pattern `tags`),
   plus the corpus-wide subject/phase/tag lists. Drives the scene picker without loading
   any scene payload.
 - `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
-  `playfield_ylim`), `step`, and a `traces` array. Each trace carries its cluster label
+  `playfield_ylim`), `step`, `cons` (below), and a `traces` array. Each trace carries its cluster label
   `c`, the filterable metadata (`s` subject, `ses`, `run`, `clip`, `sf`, `ph` phase,
   `out` outcome, `dur`), its consensus confidence `sb` (below), two derived time fields
   (`a`, `st` — below), tooltip counters (`xt`, `ht`, `ek`, `ll`), and the polyline as
@@ -205,6 +244,15 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   at the 1/3 and 2/3 `ClipCode` quantiles. The full stage name is `st + "_" + ph`, so
   only the letter is stored. Both fields come from `analysis/stages.py` and can be added
   to an existing payload with `invoke run-web-export --backfill`.
+- `cons` — the **k-selection record**, lifted verbatim out of the scene's cluster file
+  by `analysis.webexport.selection_report`: the aggregation used, the chosen `k` and its
+  `silhouette`, the `selection` route, the whole `k_candidates` curve (one row per
+  candidate cut: `k`, `silhouette`, `silhouette_frechet`, `min_size`), plus the ensemble
+  numbers the curve should be read against (`stable_share`, `k_replicates`,
+  `bootstraps`, `frac`, `scheme`). It is what the dashboard's **k selection** view draws
+  — a few hundred bytes a scene, and `null` for a single-fit run, which has no ensemble
+  and therefore no k to choose. Not derivable from the payload, so it arrives by
+  re-export rather than by `--backfill`.
 - `sb` — **consensus confidence**, 0-1: how often this trace's cluster-mates agreed with
   it across the bootstrap replicates. Present only for scenes clustered with the
   consensus method. Unlike `a` and `st` it is **not** derivable from what the payload

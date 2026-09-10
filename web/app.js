@@ -7,9 +7,12 @@
  * filters the static figures cannot offer.
  *
  * The one rule that matters scientifically: filters NEVER re-derive cluster
- * labels. HDBSCAN ran once over every trace in the scene; a filter only changes
- * which of those traces are drawn. Counts recompute for the visible subset, and
- * the title says "N of M" so a filtered view can't be mistaken for the full one.
+ * labels. The consensus ran once over every trace in the scene — HDBSCAN refit on
+ * 200 subsamples, a co-association matrix, then a Ward cut at the k with the best
+ * silhouette — and a filter only changes which of those traces are drawn. Counts
+ * recompute for the visible subset, and the title says "N of M" so a filtered view
+ * can't be mistaken for the full one. The `k selection` view shows that cut being
+ * made; the `matrix` view shows what it was made from.
  */
 
 "use strict";
@@ -826,8 +829,11 @@ function renderSceneList() {
     btn.className = "scene-row";
     btn.type = "button";
     btn.setAttribute("aria-current", state.scene && state.scene.scene === s.id ? "true" : "false");
+    // The silhouette of the cut that was taken, straight from index.json, so the
+    // picker says how well-separated each scene's partition is before it is opened.
+    const sil = typeof s.sil === "number" ? ` · s=${s.sil.toFixed(2)}` : "";
     btn.innerHTML = `<span class="scene-id">${s.id}</span>` +
-      `<span class="scene-meta">${s.n} traces · ${s.k} cl</span>`;
+      `<span class="scene-meta">${s.n} traces · ${s.k} cl${sil}</span>`;
     btn.addEventListener("click", () => selectScene(s.id));
     host.appendChild(btn);
     shown++;
@@ -1148,6 +1154,350 @@ function showMatrixTooltip(a, b, v, clientX, clientY) {
   tip.style.top = y + "px";
 }
 
+
+/* ---------- k-selection view ---------- */
+
+/* How k was chosen, drawn from the record the run itself stored.
+ *
+ * Ward returns a whole tree and no k: `linkage` gives n-1 merges and nothing says
+ * where to stop. Every cut from k=2 to k_max is therefore scored by silhouette on
+ * 1 - C (the co-association distance the ensemble lives in) and the best one taken.
+ * That curve is `cons.k_candidates`, written by ward_consensus_labels — this view
+ * only draws it, exactly like every other view here draws a stored result.
+ *
+ * The second, dashed series is the same cut scored on the raw Fréchet distances.
+ * It is recorded and NOT used to select, because it systematically prefers coarser
+ * cuts and coarser flatters stable_share for free. Drawing both is the point: where
+ * the two disagree is where the ensemble and the raw trajectory geometry disagree.
+ */
+
+const SELECTION_PAD = { l: 48, r: 18, t: 20, b: 38 };
+let selectionPoints = [];        // {k, cx, cy, row} for hit-testing
+
+function selectionRows() {
+  const cons = state.scene && state.scene.cons;
+  return cons && Array.isArray(cons.k_candidates) ? cons.k_candidates : [];
+}
+
+function renderSelection() {
+  const note = $("selection-note");
+  const canvas = $("selection-canvas");
+  const facts = $("selection-facts");
+  const cons = state.scene.cons;
+  selectionPoints = [];
+
+  if (!cons) {
+    canvas.width = canvas.height = 0;
+    facts.innerHTML = "";
+    $("selection-legend").innerHTML = "";
+    note.textContent =
+      "No selection record for this scene — it was not clustered with the consensus " +
+      "method, so there was no ensemble to cut and no k to choose.";
+    return;
+  }
+
+  renderSelectionFacts(cons);
+  const rows = selectionRows();
+
+  if (!rows.length) {
+    canvas.width = canvas.height = 0;
+    $("selection-legend").innerHTML = "";
+    note.textContent = selectionExplainer(cons);
+    return;
+  }
+
+  const box = $("selection-box");
+  const w = box.clientWidth, h = box.clientHeight;
+  const ctx = sizeCanvas(canvas, w, h);
+  const css = getComputedStyle(document.documentElement);
+  const ink2 = css.getPropertyValue("--ink-2").trim() || "#55554e";
+  const ink3 = css.getPropertyValue("--ink-3").trim() || "#8a8a80";
+  const line = css.getPropertyValue("--line").trim() || "#dcdcd5";
+  const accent = css.getPropertyValue("--accent").trim() || "#2a78d6";
+
+  ctx.clearRect(0, 0, w, h);
+
+  const x0 = SELECTION_PAD.l, x1 = w - SELECTION_PAD.r;
+  const y0 = SELECTION_PAD.t, y1 = h - SELECTION_PAD.b;
+
+  // Silhouette is bounded in [-1, 1] and everything here is positive, so the axis
+  // is fixed at 0..1 rather than auto-scaled. Auto-scaling would magnify a 0.005
+  // difference into a visible cliff and make scenes incomparable side by side.
+  const px = (i) => (rows.length === 1
+    ? (x0 + x1) / 2
+    : x0 + ((x1 - x0) * i) / (rows.length - 1));
+  const py = (v) => y1 - (y1 - y0) * Math.max(0, Math.min(1, v));
+
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.strokeStyle = line;
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= 4; g++) {
+    const v = g / 4;
+    const y = py(v);
+    ctx.beginPath();
+    ctx.moveTo(x0, y);
+    ctx.lineTo(x1, y);
+    ctx.stroke();
+    ctx.fillStyle = ink3;
+    ctx.textAlign = "right";
+    ctx.fillText(v.toFixed(2), x0 - 6, y + 3);
+  }
+
+  // The cut that was taken: a rule through it, drawn under the series.
+  const chosenIdx = rows.findIndex((r) => r.k === cons.k);
+  if (chosenIdx >= 0) {
+    ctx.save();
+    ctx.strokeStyle = accent;
+    ctx.globalAlpha = 0.35;
+    ctx.setLineDash([4, 3]);
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.moveTo(px(chosenIdx), y0);
+    ctx.lineTo(px(chosenIdx), y1);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  const series = (key, color, dashed) => {
+    const pts = rows
+      .map((r, i) => ({ i, v: r[key] }))
+      .filter((p) => typeof p.v === "number");
+    if (!pts.length) return false;
+    ctx.save();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = dashed ? 1.4 : 2;
+    if (dashed) ctx.setLineDash([5, 4]);
+    ctx.beginPath();
+    pts.forEach((p, n) => (n ? ctx.lineTo(px(p.i), py(p.v)) : ctx.moveTo(px(p.i), py(p.v))));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // A cut whose smallest cluster is 1-2 traces is drawn hollow. This is the whole
+    // reason the curve has a flat tail: a trace that never co-clustered sits at
+    // distance exactly 1.0 from everything, so peeling it off costs the silhouette
+    // nothing (sklearn scores a singleton as 0, and it already scored ~0 inside its
+    // parent) while tightening every cluster it left. The metric cannot object to
+    // dust, so the marker says what the score will not.
+    for (const p of pts) {
+      const dusty = (rows[p.i].min_size ?? 99) <= 2;
+      ctx.beginPath();
+      ctx.arc(px(p.i), py(p.v), dashed ? 2 : 3.2, 0, Math.PI * 2);
+      if (dusty && !dashed) {
+        ctx.fillStyle = css.getPropertyValue("--surface-2").trim() || "#f2f2ef";
+        ctx.fill();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1.6;
+        ctx.stroke();
+      } else {
+        ctx.fillStyle = color;
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+    return true;
+  };
+
+  const hasFrechet = series("silhouette_frechet", ink3, true);
+  series("silhouette", accent, false);
+
+  // Ring the chosen point so the cut is findable without reading the axis.
+  if (chosenIdx >= 0 && typeof rows[chosenIdx].silhouette === "number") {
+    ctx.save();
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px(chosenIdx), py(rows[chosenIdx].silhouette), 7, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
+  // Axis frame and k labels.
+  ctx.strokeStyle = line;
+  ctx.beginPath();
+  ctx.moveTo(x0, y0);
+  ctx.lineTo(x0, y1);
+  ctx.lineTo(x1, y1);
+  ctx.stroke();
+
+  ctx.textAlign = "center";
+  rows.forEach((r, i) => {
+    const chosen = r.k === cons.k;
+    ctx.fillStyle = chosen ? accent : ink3;
+    ctx.font = `${chosen ? "600 " : ""}10px system-ui, sans-serif`;
+    ctx.fillText(String(r.k), px(i), y1 + 14);
+    selectionPoints.push({ k: r.k, cx: px(i), cy: py(r.silhouette), row: r, chosen });
+  });
+
+  ctx.fillStyle = ink2;
+  ctx.font = "10px system-ui, sans-serif";
+  ctx.fillText("k (clusters in the cut)", (x0 + x1) / 2, h - 6);
+  ctx.save();
+  ctx.translate(12, (y0 + y1) / 2);
+  ctx.rotate(-Math.PI / 2);
+  ctx.fillText("silhouette", 0, 0);
+  ctx.restore();
+
+  renderSelectionLegend(accent, ink3, hasFrechet);
+  note.textContent = selectionExplainer(cons);
+}
+
+function renderSelectionLegend(accent, ink3, hasFrechet) {
+  const legend = $("selection-legend");
+  legend.innerHTML = "";
+  const item = (color, dashed, text) => {
+    const el = document.createElement("span");
+    el.className = "legend-item";
+    el.style.cursor = "default";
+    const mark = document.createElement("canvas");
+    const dpr = window.devicePixelRatio || 1;
+    mark.className = "legend-mark";
+    mark.width = 22 * dpr; mark.height = 12 * dpr;
+    mark.style.width = "22px"; mark.style.height = "12px";
+    const c = mark.getContext("2d");
+    c.scale(dpr, dpr);
+    c.strokeStyle = color;
+    c.lineWidth = dashed ? 1.4 : 2;
+    if (dashed) c.setLineDash([4, 3]);
+    c.beginPath(); c.moveTo(1, 6); c.lineTo(21, 6); c.stroke();
+    el.appendChild(mark);
+    const span = document.createElement("span");
+    span.textContent = text;
+    el.appendChild(span);
+    legend.appendChild(el);
+  };
+  item(accent, false, "silhouette on 1 − C  (selects k)");
+  if (hasFrechet) item(ink3, true, "silhouette on Fréchet distance  (recorded only)");
+  hollowNote(accent);
+}
+
+/* Hollow marker key — drawn the same way the chart draws it, so the two agree. */
+function hollowNote(accent) {
+  const legend = $("selection-legend");
+  const el = document.createElement("span");
+  el.className = "legend-item";
+  el.style.cursor = "default";
+  const dpr = window.devicePixelRatio || 1;
+  const mark = document.createElement("canvas");
+  mark.className = "legend-mark";
+  mark.width = 22 * dpr; mark.height = 12 * dpr;
+  mark.style.width = "22px"; mark.style.height = "12px";
+  const c = mark.getContext("2d");
+  c.scale(dpr, dpr);
+  c.beginPath();
+  c.arc(11, 6, 3.2, 0, Math.PI * 2);
+  c.fillStyle = getComputedStyle(document.documentElement)
+    .getPropertyValue("--surface-2").trim() || "#f2f2ef";
+  c.fill();
+  c.strokeStyle = accent;
+  c.lineWidth = 1.6;
+  c.stroke();
+  el.appendChild(mark);
+  const span = document.createElement("span");
+  span.textContent = "hollow: smallest cluster ≤ 2 traces";
+  el.appendChild(span);
+  legend.appendChild(el);
+}
+
+/* One sentence saying what happened, in the terms of the run that happened. */
+function selectionExplainer(cons) {
+  const rule = cons.tol > 0
+    ? `smallest k scoring within ${cons.tol} of the best`
+    : "highest silhouette (ties to the smaller k)";
+  const floor = cons.min_cluster_size > 1
+    ? `Cuts whose smallest cluster fell below ${cons.min_cluster_size} traces were not eligible.`
+    : "Every cut from k=2 upward was eligible — no minimum cluster size was imposed on the Ward cut.";
+
+  switch (cons.selection) {
+    case "silhouette":
+      return `Ward linkage over the co-association matrix (${cons.input} form), cut at ` +
+        `k=${cons.k} of the ${(cons.k_candidates || []).length} candidates from 2 to ${cons.k_max}. ` +
+        `Rule: ${rule}. ${floor}`;
+    case "fallback_k2":
+      return `No cut cleared the minimum cluster size of ${cons.min_cluster_size}, so the ` +
+        `k=2 cut was taken rather than dropping the scene. The silhouette did not choose here.`;
+    case "no_ensemble_signal":
+      return "Every replicate called every trace noise, so no pair ever co-clustered and " +
+        "1 − C is uniformly 1. Ward would carve that flat matrix into arbitrary blocks, " +
+        "so the scene is reported as all-noise instead — the honest answer, not a failure to tune.";
+    case "too_small":
+      return "Too few traces to select between cuts: the silhouette needs 2 ≤ k ≤ n − 1.";
+    default:
+      return "The ensemble was cut by HDBSCAN on 1 − C, which chooses no k and records no " +
+        "silhouette curve. Re-run with --consensus-cluster ward to get one.";
+  }
+}
+
+function renderSelectionFacts(cons) {
+  const facts = $("selection-facts");
+  facts.innerHTML = "";
+  const reps = cons.k_replicates || {};
+  const pct = (v) => (typeof v === "number" ? `${(v * 100).toFixed(0)}%` : "—");
+  const num = (v, d = 4) => (typeof v === "number" ? v.toFixed(d) : "—");
+
+  const rows = [
+    ["clusters chosen (k)", String(cons.k ?? "—"), true],
+    ["silhouette at that k", num(cons.silhouette), true],
+    ["silhouette on Fréchet", num(cons.silhouette_frechet), false],
+    ["selection", cons.selection || "—", false],
+    ["aggregation", `${cons.consensus_cluster || "—"} / ${cons.input || "—"} / ${cons.linkage || "—"}`, false],
+    ["k searched", `2 … ${cons.k_max ?? "—"}`, false],
+    ["plateau tolerance", cons.tol > 0 ? String(cons.tol) : "0 (off)", false],
+    ["min cluster size (cut)", cons.min_cluster_size > 1 ? String(cons.min_cluster_size) : "1 (off)", false],
+    ["replicate k", reps.mean != null ? `${reps.mean} ± ${reps.sd}` : "—", false],
+    ["replicates", cons.bootstraps != null ? `${cons.bootstraps} × ${cons.frac} (${cons.scheme})` : "—", false],
+    ["traces in a stable cluster", pct(cons.stable_share), false],
+    ["noise", pct(cons.noise_frac), false],
+  ];
+
+  for (const [term, value, highlight] of rows) {
+    const wrap = document.createElement("div");
+    const dt = document.createElement("dt");
+    dt.textContent = term;
+    const dd = document.createElement("dd");
+    dd.textContent = value;
+    if (highlight) dd.className = "chosen";
+    wrap.append(dt, dd);
+    facts.appendChild(wrap);
+  }
+}
+
+function bindSelectionCanvas() {
+  const canvas = $("selection-canvas");
+  canvas.addEventListener("mousemove", (ev) => {
+    if (!selectionPoints.length) return;
+    const r = canvas.getBoundingClientRect();
+    const mx = ev.clientX - r.left;
+    let best = null, bestD = Infinity;
+    for (const p of selectionPoints) {
+      const d = Math.abs(p.cx - mx);
+      if (d < bestD) { bestD = d; best = p; }
+    }
+    if (!best || bestD > 40) { $("tooltip").dataset.show = "false"; return; }
+    showSelectionTooltip(best, ev.clientX, ev.clientY);
+  });
+  canvas.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+}
+
+function showSelectionTooltip(point, clientX, clientY) {
+  const tip = $("tooltip");
+  const r0 = point.row;
+  const rows = [
+    ["silhouette (1 − C)", typeof r0.silhouette === "number" ? r0.silhouette.toFixed(4) : "—"],
+    ["silhouette (Fréchet)", typeof r0.silhouette_frechet === "number" ? r0.silhouette_frechet.toFixed(4) : "—"],
+    ["smallest cluster", r0.min_size != null ? `${r0.min_size} traces` : "—"],
+  ];
+  tip.innerHTML =
+    `<div class="tt-head"><span>k = ${point.k}</span>` +
+    `<span>${point.chosen ? "chosen" : "not chosen"}</span></div>` +
+    `<dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+  tip.dataset.show = "true";
+  const r = tip.getBoundingClientRect();
+  let x = clientX + 14, y = clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = clientY - r.height - 14;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+
 let rafPending = false;
 function render() {
   if (rafPending) return;
@@ -1159,9 +1509,11 @@ function render() {
     $("overlay-wrap").hidden = view !== "overlay";
     $("panels").hidden = view !== "panels";
     $("matrix-wrap").hidden = view !== "matrix";
+    $("selection-wrap").hidden = view !== "selection";
     $("reset-view").hidden = view !== "overlay";
     if (view === "overlay") renderOverlay();
     else if (view === "panels") renderPanels();
+    else if (view === "selection") renderSelection();
     else renderMatrix();
   });
 }
@@ -1287,6 +1639,7 @@ async function init() {
   bindSeg("outcome-seg", "outcome");
   bindSeg("view-seg", "view");
   bindMatrix();
+  bindSelectionCanvas();
   bindSeg("color-seg", "colorBy");
   $("toggle-noise").addEventListener("change", (e) => {
     state.showNoise = e.target.checked; render();

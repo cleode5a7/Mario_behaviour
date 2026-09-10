@@ -457,3 +457,49 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
 }
 
 #matrix-legend canvas { border-radius: 2px; }
+
+
+/* ---------- k-selection view ---------- */
+
+/* The silhouette-vs-k curve the consensus cut was chosen from. Wide and short:
+   k is a short ordinal axis (2..k_max) and the reading that matters is where the
+   curve peaks, not a precise value — those are in the facts list below it. */
+#selection-box {
+  position: relative;
+  width: 100%;
+  height: min(46vh, 380px);
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+
+#selection-box canvas { display: block; width: 100%; height: 100%; cursor: crosshair; }
+
+#selection-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  padding: 10px 2px 0;
+}
+
+/* Two columns of term/value, so the settings that produced the cut read as a
+   record rather than as prose. */
+#selection-facts {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+  gap: 2px 18px;
+  margin: 14px 0 0;
+  padding: 0;
+}
+#selection-facts > div {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 5px 8px;
+  border-bottom: 1px solid var(--line);
+  font-size: 12px;
+}
+#selection-facts dt { color: var(--ink-3); margin: 0; }
+#selection-facts dd { margin: 0; color: var(--ink); font-family: var(--mono); }
+#selection-facts dd.chosen { color: var(--accent); font-weight: 600; }

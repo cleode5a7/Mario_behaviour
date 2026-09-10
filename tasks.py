@@ -161,11 +161,19 @@ def run_changepoints_by_category(c, subjects=None, smoke=False, beta=1.0, n_bkps
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=20.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging"):
+def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=20.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1):
     """Cluster behavioural traces within each scene using Fréchet distance.
 
     Defaults to `consensus` — bagged HDBSCAN, where the ensemble produces the
-    labels rather than a single fit being trusted. min_cluster_size=5 and
+    labels rather than a single fit being trusted. The ensemble is then cut by Ward
+    linkage at a silhouette-chosen k (`--consensus-cluster ward`), which replaced a
+    hand-swept merge threshold; `--consensus-cluster hdbscan` restores the older fit
+    on 1 - C that `--consensus-epsilon` belongs to.
+
+    The k rule is the plain one: cut the Ward tree at every k from 2 to
+    `--consensus-k-max`, score each on 1 - C, take the highest silhouette. Two guards
+    on that rule ship **off** (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`)
+    and are documented on those flags; turn them on to compare. min_cluster_size=5 and
     epsilon=20 are not arbitrary: they are what `select-cluster-params` chose from
     a 12-point sweep over 288 scenes (82% of all traces land in a cluster that
     survives resampling, median k=4). See output_data/stability/selected_params.json
@@ -180,9 +188,32 @@ def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5
         bootstraps:                 consensus replicates (200 verified converged)
         frac:                       subsample fraction, drawn without replacement
         seed:                       makes the consensus labels reproducible
-        consensus_epsilon:          merge threshold for the consensus fit, in
-                                    co-association distance (NOT Fréchet units);
-                                    0.4 = "co-clustered in >60% of shared replicates"
+        consensus_cluster:          how the ensemble is turned into labels: ward
+                                    (default) or hdbscan
+        consensus_input:            for ward: features (default) treats C as an
+                                    observation matrix, so Ward runs on Euclidean
+                                    distances between co-occurrence profiles — which is
+                                    what makes its criterion well posed; distance passes
+                                    1 - C as a precomputed dissimilarity instead
+        consensus_linkage:          linkage for ward (ward/average/complete)
+        consensus_k_max:            largest k the silhouette selection considers
+        consensus_tol:              plateau tie-break, off at 0.0 (default) — among
+                                    cuts within this of the best silhouette, the
+                                    smallest k wins. The silhouette on 1 - C flattens
+                                    rather than falling, so raising this stops the
+                                    argmax drifting up that tail
+        consensus_min_cluster_size: eligibility floor on a Ward cut, off at 1 (default)
+                                    — a cut is a candidate only if its smallest cluster
+                                    clears it. NOT the same knob as min_cluster_size
+                                    below, which is an HDBSCAN density parameter for the
+                                    replicate fits (and is scaled by frac); this one is
+                                    a test on the full-data cut. Raise it to keep Ward
+                                    from cutting off singletons — it has no noise class,
+                                    and the silhouette cannot penalise one
+        consensus_epsilon:          merge threshold for the *hdbscan* consensus fit
+                                    only, in co-association distance (NOT Fréchet
+                                    units); 0.4 = "co-clustered in >60% of shared
+                                    replicates". Ignored when consensus_cluster=ward.
         scheme:                     subagging (default; 80% without replacement) or
                                     bootstrap (Breiman: n with replacement). Bootstrap
                                     replicates hold ~63% unique points and overestimate
@@ -220,11 +251,11 @@ def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme)
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size))
 
 
 @task
-def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging"):
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1):
     """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
 
     Traces are pooled across every scene tagged with the category (from
@@ -237,7 +268,8 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
     memory strategy (float32, a lower B, and the Jaccard-only path with no
     co-association matrix) that is not built yet. `--method consensus` works and is
     correct for the small categories; size the job accordingly before using it on a
-    large one.
+    large one. The Ward consensus step adds an O(n^2) linkage on top of that, so it
+    is the same warning, not a new one.
 
     The Fréchet distance matrix is cached under output_data/frechet/; re-running
     with a different epsilon/k/method reuses it (skipping the expensive O(n^2)
@@ -277,7 +309,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme)
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size))
 
 
 @task
@@ -380,13 +412,18 @@ def select_cluster_params(c, floor=0.80):
 @task
 def run_scheme_comparison(c, scenes=None, smoke=False, bootstraps=200, frac=0.8,
                           min_cluster_size=5, cluster_selection_epsilon=20.0,
-                          consensus_epsilon=0.4, n_jobs=None):
+                          consensus_epsilon=0.4, consensus_cluster="ward",
+                          consensus_input="features", n_jobs=None):
     """Cluster every scene under BOTH resampling schemes and write the comparison.
 
     subagging (frac*n without replacement, the default) vs Breiman bootstrap
     (n with replacement), at identical parameters, B and seed — so the only thing
     that differs is how replicates are drawn. Writes
     output_data/stability/scheme_comparison.json.
+
+    The consensus aggregation is held fixed at whatever `--consensus-cluster` says
+    (ward by default, matching run-clustering) so this isolates the scheme. To compare
+    the aggregations instead, use run-consensus-comparison.
 
     Reads only the cached Fréchet matrices; never opens mario.scenes. Parallel over
     scenes, so -1 uses all cores.
@@ -412,6 +449,50 @@ def run_scheme_comparison(c, scenes=None, smoke=False, bootstraps=200, frac=0.8,
              params={"min_cluster_size": int(min_cluster_size),
                      "cluster_selection_epsilon": float(cluster_selection_epsilon)},
              B=int(bootstraps), frac=float(frac),
+             consensus_epsilon=float(consensus_epsilon),
+             consensus_cluster=consensus_cluster, consensus_input=consensus_input,
+             n_jobs=_n_jobs)
+
+
+@task
+def run_consensus_comparison(c, scenes=None, smoke=False, bootstraps=200, frac=0.8,
+                             min_cluster_size=5, cluster_selection_epsilon=20.0,
+                             consensus_epsilon=0.4, scheme="subagging", n_jobs=None):
+    """Score every scene under all three consensus aggregations and write the comparison.
+
+    Ward on the co-association matrix as a feature matrix (the default), Ward on 1 - C
+    as a precomputed dissimilarity, and the older HDBSCAN fit on 1 - C at
+    --consensus-epsilon. Identical replicate parameters, B and seed, and in fact the
+    identical ensemble — it is built once per scene and shared — so the only thing that
+    differs is the last step. Writes output_data/stability/consensus_comparison.json.
+
+    This is what makes the choice of aggregation inspectable rather than asserted, the
+    same job run-scheme-comparison does for the resampling scheme.
+
+    Reads only the cached Fréchet matrices; never opens mario.scenes. Parallel over
+    scenes, so -1 uses all cores.
+    """
+    from analysis.stability import run_consensus_comparison as _compare
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    frechet_dir = output_dir / "frechet"
+    if not frechet_dir.exists():
+        print("No cached Fréchet matrices — run invoke run-clustering first.")
+        return
+
+    all_scenes = sorted(p.stem for p in frechet_dir.glob("*.npy")
+                        if re.fullmatch(r"w\d+l\d+s\d+", p.stem))
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    _n_jobs = int(n_jobs) if n_jobs is not None else int(
+        os.environ.get("SLURM_CPUS_PER_TASK", os.cpu_count() or 1))
+    _compare(all_scenes, output_dir,
+             params={"min_cluster_size": int(min_cluster_size),
+                     "cluster_selection_epsilon": float(cluster_selection_epsilon)},
+             B=int(bootstraps), frac=float(frac), scheme=scheme,
              consensus_epsilon=float(consensus_epsilon), n_jobs=_n_jobs)
 
 
@@ -687,7 +768,11 @@ def clean_web_export(c):
 
 @task
 def clean_stability(c):
-    """Remove the cluster audit, sweep and selected-parameter outputs."""
+    """Remove the cluster audit, sweep, selected-parameter and comparison outputs.
+
+    Removes the whole stability/ directory, so the scheme and consensus comparisons
+    go with it — they need no clean- task of their own.
+    """
     output_dir = Path(c.config.get("output_data_dir")) / "stability"
     if output_dir.exists():
         shutil.rmtree(output_dir)

@@ -146,6 +146,41 @@ def export_coassociation(scene_id, source_dir, output_dir, web_dir, out_traces) 
     return True
 
 
+def selection_report(scene_id, output_dir) -> dict | None:
+    """The k-selection record for one scene, read back from its cluster file.
+
+    Everything here already exists in ``<scene>_clusters.json`` — the ``params``
+    block and ``stability.consensus`` report ``ward_consensus_labels`` returns. It is
+    lifted into the payload so the dashboard can show *how* k was chosen without the
+    browser ever seeing the cluster files, which is the same export-once rule the
+    trace geometry follows.
+
+    Returns None for a single-fit run, which has no ensemble and so no selection to
+    report. The whole silhouette-vs-k curve is at most ``k_max`` rows, so this costs a
+    few hundred bytes a scene.
+    """
+    path = Path(output_dir) / "clusters" / f"{scene_id}_clusters.json"
+    if not path.exists():
+        return None
+    stored = json.loads(path.read_text())
+    consensus = (stored.get("stability") or {}).get("consensus")
+    if not consensus:
+        return None
+
+    stability = stored["stability"]
+    report = dict(consensus)
+    # Ensemble-level numbers the curve should be read against: a cut is only as
+    # meaningful as the replicates it summarises.
+    report["stable_share"] = stability.get("stable_share")
+    report["k_replicates"] = stability.get("k_replicates")
+    report["noise_frac"] = stability.get("noise_frac")
+    params = stored.get("params") or {}
+    report["bootstraps"] = params.get("bootstraps")
+    report["frac"] = params.get("frac")
+    report["scheme"] = params.get("scheme")
+    return report
+
+
 def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
                  entry_map=None, background_dir=None) -> dict | None:
     """Write one scene's dashboard payload; return its index entry (None if empty)."""
@@ -213,6 +248,8 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
         "traces": out_traces,
     }
 
+    payload["cons"] = selection_report(scene_id, output_dir)
+
     payload["coassoc"] = export_coassociation(
         scene_id, source_dir, output_dir, web_dir, out_traces)
 
@@ -232,10 +269,11 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
         if not dest.exists():
             shutil.copy2(bg_path, dest)
 
-    return _index_entry(scene_id, out_traces, method)
+    return _index_entry(scene_id, out_traces, method, payload.get("cons"))
 
 
-def _index_entry(scene_id: str, out_traces: list[dict], method: str) -> dict:
+def _index_entry(scene_id: str, out_traces: list[dict], method: str,
+                 cons: dict | None = None) -> dict:
     """Summary row for index.json, derived from the payload we just built."""
     labels = [t["c"] for t in out_traces]
     n_noise = sum(1 for l in labels if l == -1)
@@ -254,13 +292,18 @@ def _index_entry(scene_id: str, out_traces: list[dict], method: str) -> dict:
         "subjects": sorted({t["s"] for t in out_traces}),
         "phases": sorted({t["ph"] for t in out_traces if t["ph"]}),
         "method": method,
+        # The silhouette of the cut that was taken, so the scene picker can sort and
+        # filter on it without opening a payload.
+        "sil": (cons or {}).get("silhouette"),
+        "sel": (cons or {}).get("selection"),
     }
 
 
 def _index_entry_from_file(path: Path) -> dict:
     """Rebuild an index row from an already-exported scene file (skip path)."""
     payload = json.loads(path.read_text())
-    return _index_entry(payload["scene"], payload["traces"], payload.get("method", ""))
+    return _index_entry(payload["scene"], payload["traces"],
+                        payload.get("method", ""), payload.get("cons"))
 
 
 def write_index(web_dir: Path, source_dir: Path) -> Path:

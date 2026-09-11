@@ -80,6 +80,8 @@ const state = {
   view: "overlay",
   showNoise: true,
   showBg: true,
+  matrixOrder: "leaves",     // dendrogram leaf order; "cluster" = rank-by-size blocks
+  showPartition: true,
   hiddenClusters: new Set(),
   hover: null,          // trace object under the cursor
   pinned: null,         // trace object clicked
@@ -882,6 +884,7 @@ function bindSeg(id, key, after) {
     const value = btn.dataset.value;
     if (key === "view") state.view = value;
     else if (key === "colorBy") state.colorBy = value;
+    else if (key === "matrixOrder") state.matrixOrder = value;
     else state.filters[key] = value;
     state.pinned = null; state.hover = null;
     if (after) after();
@@ -1012,14 +1015,44 @@ function coassocColor(v) {
 
 /* Payload index of every visible trace, ordered by cluster (rank-by-size, noise
  * last) so the diagonal blocks are the clusters. */
+/* Two orderings, and they answer different questions.
+ *
+ * "leaves" is the dendrogram order Ward itself produced, exported as `cons.leaves`
+ * (payload indices). Cut clusters are contiguous in it — cut_tree cannot split a
+ * leaf run — so the blocks still line up, but *within* a block the rows follow the
+ * merge structure, so a cluster that is really two things shows as two sub-blocks.
+ * That is structure the labels have already thrown away, and it is the only view
+ * here that can show it.
+ *
+ * "cluster" is the older rank-by-size order. Inside a block rows fall in payload
+ * order — subject, then time — so sub-structure is scrambled, but the blocks appear
+ * in the same order as the legend and the panels, which makes them easy to match up.
+ *
+ * Both are whole-scene orders that filters only subset, never recompute, so
+ * narrowing to one subject cannot reshuffle what you are looking at. */
 function matrixOrder() {
+  const visible = new Set(visibleTraces());
+  const traces = state.scene.traces;
+  const leaves = (state.scene.cons || {}).leaves;
+
+  if (state.matrixOrder === "leaves" && Array.isArray(leaves) && leaves.length === traces.length) {
+    const rows = [];
+    for (const i of leaves) if (visible.has(traces[i])) rows.push({ t: traces[i], i });
+    return rows;
+  }
+
   const rank = sceneRanking();
   const slot = (t) => (t.c === -1 ? Number.MAX_SAFE_INTEGER : rank.ranked.indexOf(t.c));
-  const visible = new Set(visibleTraces());
   const rows = [];
-  state.scene.traces.forEach((t, i) => { if (visible.has(t)) rows.push({ t, i }); });
+  traces.forEach((t, i) => { if (visible.has(t)) rows.push({ t, i }); });
   rows.sort((a, b) => (slot(a.t) - slot(b.t)) || (a.i - b.i));
   return rows;
+}
+
+/* Does this scene actually have a leaf order to offer? */
+function hasLeafOrder() {
+  const leaves = (state.scene && state.scene.cons || {}).leaves;
+  return Array.isArray(leaves) && leaves.length === state.scene.traces.length;
 }
 
 let matrixRows = [];      // current row order, for hit-testing
@@ -1082,12 +1115,76 @@ async function renderMatrix() {
   }
   ctx.putImageData(img, 0, 0);
 
+  renderPartition();
   renderMatrixLegend();
+
   const total = state.scene.traces.length;
+  const usingLeaves = state.matrixOrder === "leaves" && hasLeafOrder();
+  const ordering = usingLeaves
+    ? "Rows follow the dendrogram, so a cluster that is really two things shows as two " +
+      "sub-blocks — structure the labels no longer carry."
+    : (state.matrixOrder === "leaves"
+        ? "No leaf order exported for this scene, so rows fall back to cluster order."
+        : "Rows ordered by cluster, largest first, noise last — the same order as the legend.");
+  const pair = state.showPartition
+    ? " Left is what Ward was given; right is the cut it returned. A block that is solid " +
+      "on the right but mottled on the left is a cluster the cut asserted over weak agreement."
+    : "";
   note.textContent =
     `${m} of ${total} traces. Cell (i, j) = share of resampling replicates in which ` +
     `both traces landed in the same cluster, among replicates that drew both. ` +
-    `Rows ordered by cluster, noise last — so each bright diagonal block is a cluster.`;
+    ordering + pair;
+}
+
+/* The partition as a matrix: 1 where two traces share a cluster, 0 otherwise —
+ * `part2adj` in the BASC reference, drawn in the same row order as the matrix beside
+ * it so the two are directly comparable. Painted in each cluster's own legend colour
+ * rather than a flat binary, so a block can be matched to the trajectories that made
+ * it without counting along an axis.
+ *
+ * Derived from the labels in the browser: it is a picture of `cons.k`, not a second
+ * measurement, and nothing about it needs exporting. */
+function renderPartition() {
+  const panel = $("partition-panel");
+  const grid = $("matrix-grid");
+  panel.hidden = !state.showPartition;
+  grid.classList.toggle("single", !state.showPartition);
+  if (!state.showPartition) return;
+
+  const canvas = $("partition-canvas");
+  const m = matrixRows.length;
+  canvas.width = m;
+  canvas.height = m;
+  if (!m) return;
+
+  const rank = sceneRanking();
+  const css = getComputedStyle(document.documentElement);
+  const ground = css.getPropertyValue("--surface").trim() || "#fcfcfb";
+  const rgb = (hex) => [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16),
+                        parseInt(hex.slice(5, 7), 16)];
+  const bg = rgb(ground);
+  const colorOf = (label) => {
+    if (label === -1) return rgb(NOISE_COLOR);
+    const slot = rank.direct.get(label);
+    return rgb(slot === undefined ? OTHER_COLOR : CLUSTER_COLORS[slot]);
+  };
+
+  const fill = new Map();
+  for (const row of matrixRows) if (!fill.has(row.t.c)) fill.set(row.t.c, colorOf(row.t.c));
+
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(m, m);
+  for (let r = 0; r < m; r++) {
+    const lr = matrixRows[r].t.c;
+    const dst = r * m * 4;
+    for (let c = 0; c < m; c++) {
+      const same = matrixRows[c].t.c === lr && lr !== -1;
+      const [R, G, B] = same ? fill.get(lr) : bg;
+      const o = dst + c * 4;
+      img.data[o] = R; img.data[o + 1] = G; img.data[o + 2] = B; img.data[o + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 function renderMatrixLegend() {
@@ -1131,6 +1228,52 @@ function bindMatrix() {
   });
   canvas.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
   box.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+
+  // The partition canvas is the same grid in the same order, so the same index
+  // arithmetic locates the same pair. It reports the co-association value too: the
+  // whole reason to show the two side by side is to find cells where the cut says
+  // "same cluster" and the ensemble does not agree.
+  const pcanvas = $("partition-canvas");
+  pcanvas.addEventListener("mousemove", (e) => {
+    if (!matrixSide || !matrixRows.length) return;
+    const r = pcanvas.getBoundingClientRect();
+    const col = Math.floor(((e.clientX - r.left) / r.width) * matrixSide);
+    const row = Math.floor(((e.clientY - r.top) / r.height) * matrixSide);
+    if (row < 0 || col < 0 || row >= matrixSide || col >= matrixSide) return;
+    const a = matrixRows[row].t, b = matrixRows[col].t;
+    const data = matrixCache.get(state.scene.scene);
+    const n = state.scene.traces.length;
+    const v = data ? data[matrixRows[row].i * n + matrixRows[col].i] / 255 : null;
+    showPartitionTooltip(a, b, v, e.clientX, e.clientY);
+  });
+  pcanvas.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+  $("partition-box").addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
+}
+
+function showPartitionTooltip(a, b, v, clientX, clientY) {
+  const tip = $("tooltip");
+  const same = a.c === b.c && a.c !== -1;
+  const rank = sceneRanking();
+  const slot = rank.direct.get(a.c);
+  const dot = a.c === -1 ? NOISE_COLOR
+            : (slot === undefined ? OTHER_COLOR : CLUSTER_COLORS[slot]);
+  const rows = [
+    ["row", traceLabel(a)],
+    ["column", traceLabel(b)],
+    ["the cut says", same ? `same cluster (${a.c})` : "different clusters"],
+    ["the ensemble says", v == null ? "—" : `${(v * 100).toFixed(0)}% of shared replicates`],
+  ];
+  tip.innerHTML =
+    `<div class="tt-head"><span class="tt-dot" style="background:${same ? dot : OTHER_COLOR}"></span>` +
+    `<span>${same ? "in the same cluster" : "split apart"}</span></div>` +
+    `<dl>${rows.map(([k, val]) => `<dt>${k}</dt><dd>${val}</dd>`).join("")}</dl>`;
+  tip.dataset.show = "true";
+  const r = tip.getBoundingClientRect();
+  let x = clientX + 14, y = clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = clientY - r.height - 14;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
 }
 
 /* Who a trace is, in terms a reader can act on.
@@ -1656,6 +1799,11 @@ async function init() {
   bindSeg("view-seg", "view");
   bindMatrix();
   bindSelectionCanvas();
+  bindSeg("order-seg", "matrixOrder");
+  $("toggle-partition").addEventListener("change", (e) => {
+    state.showPartition = e.target.checked;
+    render();
+  });
   bindSeg("color-seg", "colorBy");
   $("toggle-noise").addEventListener("change", (e) => {
     state.showNoise = e.target.checked; render();

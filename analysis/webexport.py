@@ -146,7 +146,63 @@ def export_coassociation(scene_id, source_dir, output_dir, web_dir, out_traces) 
     return True
 
 
-def selection_report(scene_id, output_dir) -> dict | None:
+def _clip_row_map(scene_id, output_dir) -> dict:
+    """clip key -> row index in the cluster file's own order."""
+    path = Path(output_dir) / "clusters" / f"{scene_id}_clusters.json"
+    meta = json.loads(path.read_text())["metadata"]
+    return {(m.get("Subject"), m.get("Session"), m.get("Run"), m.get("ClipCode")): i
+            for i, m in enumerate(meta)}
+
+
+def leaf_order(scene_id, output_dir, out_traces, consensus) -> list[int] | None:
+    """The dendrogram leaf order, expressed as **payload** indices.
+
+    Two translations happen here, and both are the point.
+
+    **Cluster-file order -> payload order.** ``leaves`` indexes the matrix the tree was
+    built on, which follows the cluster file's metadata; the payload follows
+    ``load_traces``. Those coincide today, but the whole reason CLIP_KEY_FIELDS exists
+    is that nothing may rely on it — so the permutation goes through the clip key, the
+    same way ``export_coassociation`` builds its own, and a scene whose keys do not line
+    up returns None rather than a plausible-looking wrong ordering.
+
+    **Reconstruction for older files.** A cluster file written before ``leaves`` existed
+    has none, so the tree is rebuilt here from the stored co-association matrix with the
+    settings that file recorded. ``_consensus_tree`` is a pure function of ``C`` and
+    those two settings, so this is the same tree, not an approximation — the same reason
+    ``run-coassociation`` can regenerate the matrix itself exactly. It costs one linkage
+    on a few hundred points.
+    """
+    from analysis.stability import _consensus_tree, coassociation_path
+    from scipy.cluster.hierarchy import leaves_list
+
+    leaves = consensus.get("leaves")
+    if leaves is None:
+        src = coassociation_path(scene_id, output_dir)
+        if not src.exists():
+            return None
+        C = np.load(src).astype(float) / 65535.0
+        Z, _ = _consensus_tree(C,
+                               input=consensus.get("input", "features"),
+                               linkage_method=consensus.get("linkage", "ward"))
+        leaves = [int(i) for i in leaves_list(Z)]
+
+    row_of = _clip_row_map(scene_id, output_dir)
+    payload_of = {}
+    for p, t in enumerate(out_traces):
+        row = row_of.get((t["s"], t["ses"], t["run"], t["clip"]))
+        if row is None:
+            return None
+        payload_of[row] = p
+    if len(payload_of) != len(leaves):
+        return None
+    try:
+        return [payload_of[i] for i in leaves]
+    except KeyError:
+        return None
+
+
+def selection_report(scene_id, output_dir, out_traces=None) -> dict | None:
     """The k-selection record for one scene, read back from its cluster file.
 
     Everything here already exists in ``<scene>_clusters.json`` — the ``params``
@@ -178,6 +234,13 @@ def selection_report(scene_id, output_dir) -> dict | None:
     report["bootstraps"] = params.get("bootstraps")
     report["frac"] = params.get("frac")
     report["scheme"] = params.get("scheme")
+
+    # Re-expressed in payload indices, so the browser can apply it directly to the
+    # matrix it was served without knowing anything about cluster-file ordering.
+    if out_traces is not None and report.get("consensus_cluster") == "ward":
+        report["leaves"] = leaf_order(scene_id, output_dir, out_traces, report)
+    else:
+        report.pop("leaves", None)
     return report
 
 
@@ -248,7 +311,7 @@ def export_scene(scene_id, source_dir, output_dir, web_dir, *, step=3,
         "traces": out_traces,
     }
 
-    payload["cons"] = selection_report(scene_id, output_dir)
+    payload["cons"] = selection_report(scene_id, output_dir, out_traces)
 
     payload["coassoc"] = export_coassociation(
         scene_id, source_dir, output_dir, web_dir, out_traces)
@@ -381,3 +444,33 @@ def backfill_derived(web_dir: Path) -> int:
         path.write_text(json.dumps(payload, separators=(",", ":")))
     print(f"Backfilled attempt/stage fields in {len(paths)} scene payloads")
     return len(paths)
+
+
+def backfill_selection(web_dir: Path, output_dir: Path) -> int:
+    """Refresh each payload's ``cons`` block in place, from ``output_data`` only.
+
+    A third category, distinct from both of the paths above it. ``cons`` is **not**
+    derivable from the payload — ``backfill_derived``'s rule — but it is derivable
+    without ``mario.scenes``: it lives in the cluster file, and the leaf order can be
+    rebuilt from the stored co-association matrix. So a change to what the selection
+    record carries costs a rewrite of 300-odd small JSON files rather than a ``--force``
+    re-export that re-reads tens of GB to produce byte-identical geometry.
+
+    The trace geometry and labels are untouched. Anything that changes *those* is a
+    real re-export; this is only for the record of how k was chosen.
+    """
+    scenes_dir = Path(web_dir) / "scenes"
+    paths = sorted(scenes_dir.glob("*.json"))
+    updated = skipped = 0
+    for path in paths:
+        payload = json.loads(path.read_text())
+        report = selection_report(payload["scene"], output_dir, payload["traces"])
+        if report is None:
+            skipped += 1
+            continue
+        payload["cons"] = report
+        path.write_text(json.dumps(payload, separators=(",", ":")))
+        updated += 1
+    note = f", {skipped} without a consensus record" if skipped else ""
+    print(f"Refreshed the selection record in {updated} scene payloads{note}")
+    return updated

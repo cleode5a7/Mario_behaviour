@@ -552,14 +552,17 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
                60 fps against a 224 px background, so 3 is visually lossless;
                lower it for more fidelity at the cost of payload size.
         force: re-export scenes whose payload already exists
-        backfill: only add the derived attempt/stage fields to payloads that
-               already exist, then rewrite the index. Reads nothing but the
-               exported JSON, so it takes seconds where --force would re-read
-               the source dataset. Use it after a change that adds a field
-               derivable from what the payload already carries.
+        backfill: update payloads that already exist, then rewrite the index,
+               without reading mario.scenes — seconds, where --force re-reads the
+               source dataset. Two things are refreshed: the derived attempt/stage
+               fields (computed from what the payload already carries) and the `cons`
+               selection record (re-read from the cluster file, with the dendrogram
+               leaf order rebuilt from the stored co-association matrix). Use it after
+               a change to either; a change to trace geometry or labels is a real
+               re-export.
     """
-    from analysis.webexport import (backfill_derived, export_scene, list_clustered_scenes,
-                                    sync_backgrounds, write_index)
+    from analysis.webexport import (backfill_derived, backfill_selection, export_scene,
+                                    list_clustered_scenes, sync_backgrounds, write_index)
     from analysis.trace_plots import default_background_dir, scene_entry_map
 
     source_dir = Path(c.config.get("source_data_dir"))
@@ -572,6 +575,7 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
             print("Nothing to backfill — no payload at output_data/web/data/scenes.")
             return
         backfill_derived(web_dir)
+        backfill_selection(web_dir, output_dir)
         write_index(web_dir, source_dir)
         return
 

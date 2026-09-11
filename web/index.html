@@ -112,7 +112,24 @@
       <div id="panels" hidden></div>
 
       <div id="matrix-wrap" hidden>
-        <div id="matrix-box"><canvas id="matrix-canvas"></canvas></div>
+        <div id="matrix-controls">
+          <span class="ctl-label">Row order</span>
+          <div class="seg" id="order-seg" role="group" aria-label="Row order">
+            <button data-value="leaves" aria-pressed="true">Dendrogram</button>
+            <button data-value="cluster" aria-pressed="false">Cluster size</button>
+          </div>
+          <label class="check"><input type="checkbox" id="toggle-partition" checked> Show partition</label>
+        </div>
+        <div id="matrix-grid">
+          <figure class="matrix-panel">
+            <figcaption>co-association &mdash; what Ward was given</figcaption>
+            <div id="matrix-box"><canvas id="matrix-canvas"></canvas></div>
+          </figure>
+          <figure class="matrix-panel" id="partition-panel">
+            <figcaption>partition &mdash; the cut Ward returned</figcaption>
+            <div id="partition-box"><canvas id="partition-canvas"></canvas></div>
+          </figure>
+        </div>
         <div id="matrix-legend"></div>
         <p class="note" id="matrix-note"></p>
       </div>

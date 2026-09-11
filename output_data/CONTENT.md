@@ -66,7 +66,10 @@ One JSON file per scene produced by `invoke run-clustering`:
   informationless matrix would invent structure the resampling did not find — the chosen
   `silhouette` and `silhouette_frechet`, and
   `k_candidates` — the whole silhouette-vs-k curve, so the cut can be second-guessed
-  without re-running the ensemble. Note `noise_frac` is 0 on any Ward run that produced
+  without re-running the ensemble — and `leaves`, the dendrogram leaf order
+  (`scipy.cluster.hierarchy.leaves_list`, i.e. `dendrogram(..., no_plot=True)["leaves"]`)
+  in this file's own row order. The tree carries structure the labels discard, and the
+  matrix only shows it when permuted into this order. Note `noise_frac` is 0 on any Ward run that produced
   clusters at all: Ward assigns every trace, so `-1` appears only in the
   `no_ensemble_signal` case above.
   A label of `-1` is HDBSCAN noise. Each `metadata` entry is the trace's
@@ -249,7 +252,9 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   `silhouette`, the `selection` route, the whole `k_candidates` curve (one row per
   candidate cut: `k`, `silhouette`, `silhouette_frechet`, `min_size`), plus the ensemble
   numbers the curve should be read against (`stable_share`, `k_replicates`,
-  `bootstraps`, `frac`, `scheme`). It is what the dashboard's **k selection** view draws
+  `bootstraps`, `frac`, `scheme`), and `leaves` — the dendrogram leaf order,
+  re-expressed in **payload** indices so the browser can apply it directly to the
+  matrix it was served. It is what the dashboard's **k selection** view draws
   — a few hundred bytes a scene, and `null` for a single-fit run, which has no ensemble
   and therefore no k to choose. Not derivable from the payload, so it arrives by
   re-export rather than by `--backfill`.

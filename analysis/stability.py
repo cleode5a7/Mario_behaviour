@@ -44,7 +44,7 @@ import warnings
 
 import numpy as np
 import hdbscan
-from scipy.cluster.hierarchy import ClusterWarning, cut_tree, linkage
+from scipy.cluster.hierarchy import ClusterWarning, cut_tree, leaves_list, linkage
 from scipy.spatial.distance import squareform
 from sklearn.metrics import adjusted_rand_score, silhouette_score
 
@@ -418,7 +418,8 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         # Nothing to select between: silhouette needs 2 <= k <= n - 1.
         return (np.zeros(n, dtype=int),
                 {**settings, "k": 1 if n else 0, "selection": "too_small",
-                 "silhouette": None, "silhouette_frechet": None, "k_candidates": []})
+                 "silhouette": None, "silhouette_frechet": None, "k_candidates": [],
+                 "leaves": None})
 
     # An ensemble that never once put any pair together carries no information: every
     # replicate called every point noise. 1 - C is then all ones, the silhouette is
@@ -430,7 +431,8 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
     if C[off_diagonal].max() == 0.0:
         return (np.full(n, -1, dtype=int),
                 {**settings, "k": 0, "selection": "no_ensemble_signal",
-                 "silhouette": None, "silhouette_frechet": None, "k_candidates": []})
+                 "silhouette": None, "silhouette_frechet": None, "k_candidates": [],
+                 "leaves": None})
 
     Z, d = _consensus_tree(C, input=input, linkage_method=linkage_method)
     frechet = None if dist is None else np.asarray(dist, dtype=float)
@@ -489,6 +491,15 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         "silhouette": chosen.get("silhouette"),
         "silhouette_frechet": chosen.get("silhouette_frechet"),
         "k_candidates": rows,
+        # Dendrogram leaf order, in this matrix's own row order. The tree carries
+        # structure the labels throw away — which clusters are adjacent in it, and how
+        # each one is built internally — and that structure is only visible if the
+        # matrix is permuted into this order. Ordering by cluster label instead (what
+        # the dashboard did first) blocks the partition correctly but scrambles
+        # everything inside a block, so sub-structure a finer cut would have found
+        # cannot be seen. `leaves_list` is `dendrogram(..., no_plot=True)["leaves"]`
+        # without building the plot dict.
+        "leaves": [int(i) for i in leaves_list(Z)],
     }
     return labels, report
 

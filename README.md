@@ -120,6 +120,15 @@ singleton at 0 and a never-co-clustered trace already scored ~0 inside its paren
 splitting one off is free and the curve cannot fall — the marker is the only thing in
 the figure that flags it. Below the chart are the settings that produced the cut.
 
+The **co-association** view shows both halves of that step side by side: on the left the
+matrix Ward was given, on the right the partition it returned (`adj[i,j] = 1` where two
+traces share a cluster). Rows default to the **dendrogram leaf order**, so a cluster that
+is really two things appears as two sub-blocks — switch to *Cluster size* to get the
+older order, where blocks match the legend but their internal order is subject-then-time.
+A block that is solid on the right and mottled on the left is a cluster the cut asserted
+over weak agreement; hovering either panel reports what the cut says and what the
+ensemble says for that pair.
+
 Filters only change which traces are **drawn**. Clustering is never re-run, and cluster
 colors are pinned to the whole-scene ordering, so narrowing to one subject cannot
 repaint the clusters that remain. Counts and composition percentages do update, and the

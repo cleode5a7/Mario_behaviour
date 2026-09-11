@@ -1115,11 +1115,23 @@ async function renderMatrix() {
   }
   ctx.putImageData(img, 0, 0);
 
+  const usingLeaves = state.matrixOrder === "leaves" && hasLeafOrder();
+
   renderPartition();
   renderMatrixLegend();
 
+  // The caption has to separate the two, because they come from opposite sides of the
+  // clustering step: the *values* are the matrix Ward was handed and are untouched by
+  // it, while every *ordering* on offer is derived from what Ward returned — `leaves`
+  // is its dendrogram, `cluster` is its cut ranked by size. There is no useful
+  // pre-Ward arrangement to offer instead: in payload order (subject, then time) the
+  // block structure is invisible, which is the whole reason such a figure is permuted
+  // at all. So the caption names both halves rather than claiming one for the pair.
+  $("matrix-caption").textContent = usingLeaves
+    ? "co-association — values as measured, rows in Ward's leaf order"
+    : "co-association — values as measured, rows grouped by Ward's cut";
+
   const total = state.scene.traces.length;
-  const usingLeaves = state.matrixOrder === "leaves" && hasLeafOrder();
   const ordering = usingLeaves
     ? "Rows follow the dendrogram, so a cluster that is really two things shows as two " +
       "sub-blocks — structure the labels no longer carry."

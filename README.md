@@ -122,7 +122,9 @@ the figure that flags it. Below the chart are the settings that produced the cut
 
 The **co-association** view shows both halves of that step side by side: on the left the
 matrix Ward was given, on the right the partition it returned (`adj[i,j] = 1` where two
-traces share a cluster). Rows default to the **dendrogram leaf order**, so a cluster that
+traces share a cluster). Only the left panel's *values* are pre-Ward — both row orderings
+come from its output, since an unordered co-association matrix shows no block structure
+at all, so the caption says which ordering is in force. Rows default to the **dendrogram leaf order**, so a cluster that
 is really two things appears as two sub-blocks — switch to *Cluster size* to get the
 older order, where blocks match the legend but their internal order is subject-then-time.
 A block that is solid on the right and mottled on the left is a cluster the cut asserted

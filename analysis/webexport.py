@@ -405,6 +405,40 @@ def write_index(web_dir: Path, source_dir: Path) -> Path:
     return out_path
 
 
+def _rounded(obj, nd=6):
+    """Round every float in a nested JSON value — the payload is for drawing."""
+    if isinstance(obj, float):
+        return round(obj, nd)
+    if isinstance(obj, dict):
+        return {k: _rounded(v, nd) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_rounded(v, nd) for v in obj]
+    return obj
+
+
+def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
+    """Copy the per-subject practice models into the payload as ``practice.json``.
+
+    The dashboard's stats section draws these; it may not read ``output_data/practice/``
+    directly, so the fits travel through the export like everything else. Only the
+    fitted record is copied — coefficients, CIs, p-values, random-effect variances,
+    AIC and the fixed-effect curves — never the attempts, and nothing is refitted.
+    The ``scenes`` list is reduced to a count. Returns ``None`` when the practice
+    models have not been run.
+    """
+    src = Path(output_dir) / "practice" / "mixed.json"
+    if not src.exists():
+        print("  no practice models (output_data/practice/mixed.json) — stats section empty")
+        return None
+    mixed = json.loads(src.read_text())
+    payload = {k: v for k, v in mixed.items() if k != "scenes"}
+    payload["n_scenes"] = len(mixed.get("scenes", []))
+    out = Path(web_dir) / "practice.json"
+    out.write_text(json.dumps(_rounded(payload), separators=(",", ":")))
+    print(f"Wrote practice models -> {out}")
+    return out
+
+
 def sync_backgrounds(web_dir: Path, source_dir: Path, scene_ids=None) -> int:
     """Copy scene background PNGs into the payload so the served tree is self-contained."""
     web_dir, source_dir = Path(web_dir), Path(source_dir)

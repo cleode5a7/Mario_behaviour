@@ -167,6 +167,90 @@ perturbs enough borderline distances to shift the partition (ARI 0.998). ~26 MB 
 corpus, against ~106 MB for float64. The web export downsamples to uint8, which is a
 display copy and is not exact.
 
+## `practice/`
+
+The practice effect, measured as distance to cluster medoids. Written by
+`invoke run-practice-distances` and `invoke run-practice-models` from `clusters/` and
+`frechet/` only.
+
+- `attempts/<scene_id>.csv` — one row per attempt: `scene`, `subject`, `clip`
+  (ClipCode), `phase`, `stage` (e/m/l tertile within phase), `outcome`, `cluster`,
+  `attempt` (the subject's nth entry into this scene), `cluster_use` (nth use of this
+  cluster by this subject), `switch` (1 if the cluster differs from the subject's
+  previous attempt, empty on the first), `is_medoid`, and the distances:
+  - `d_own` — Fréchet distance to the medoid of the attempt's own cluster.
+  - `d_nearest`, `nearest_cluster` — distance to the nearest medoid among clusters of
+    at least 3 members, and which cluster that was.
+  - `d_nearest_norm` — `d_nearest` divided by that cluster's spread (median
+    member-to-medoid distance); 1.0 = a typical member.
+  - `*_loso` — the same with each subject measured against medoids chosen among the
+    *other* subjects' members only (empty where a cluster holds only that subject).
+
+  A medoid is the member with the smallest summed distance to the rest of its cluster.
+  Medoid rows score 0 by definition and are excluded from every raw-medoid fit (kept
+  in the `_loso` fits, where they are measured against other subjects' medoids). Scenes whose
+  ensemble carried no signal (all `-1`) have no file.
+- `curves.csv` — one row per series with at least 10 non-medoid attempts (`d_own`:
+  subject × scene × cluster; `d_nearest_norm`: subject × scene), for each measure and its
+  `_loso` twin, under each `transform` (`log`, zeros dropped, and `log1p`): AICc of
+  linear, quadratic, power (`a + b·t^-c`) and exponential (`a + b·exp(-c(t-1))`) fits
+  to the transformed distance vs attempt, the `best` model, its `delta_aicc` over the
+  runner-up, the linear `slope`, and `change` (best model's prediction at the last
+  attempt minus the first, in that transform's units; negative = fell).
+- `mixed.json` — one fit per subject × measure × raw/`_loso` × transform × all/completed
+  attempts (80): a MixedLM on the transformed distance fitted to that subject alone —
+  `log(d)` (the primary; attempts at exactly `d = 0` dropped and counted in
+  `n_zero_dropped`) and `log1p(d)` (the original analysis, kept for comparison) — with a random
+  intercept and a random slope per scene (`d_nearest_norm`) or per scene × cluster
+  (`d_own`), in four practice forms (`linear`, `quadratic`, `log`, `log_phase`). The
+  random slope is on the form's own time term — `t = attempt / 10` for linear and
+  quadratic (no random `t²`), `log(attempt)` for the log forms — recorded as
+  `re_formula`. Each form records AIC, coefficients, CIs, p-values, `re` (random
+  intercept and slope variances, their correlation, residual variance) and (except
+  `log_phase`) `curve`, the fixed-effect prediction on an attempt grid (`y`, in the
+  fit's `transform` units). `best_form` is the lowest-AIC form among the first three.
+  Top level: `design` (`per_subject_v2`), `primary` (`d_nearest_norm_loso`),
+  `primary_transform` (`log`), `transforms`, `scenes`, `subjects`; the task refits when
+  the scenes, measures or design change.
+- `nested.json` — alternative random-effect structures for the `log` practice form, fitted
+  beside the main model by `analysis.practice.fit_structure`, for `d_nearest_norm` and
+  its `_loso` twin × transform × all/completed × subject (80 fits). `structure` is
+  `level_scene` (a correlated random intercept + slope per **level**, `w1l1`, with each
+  scene's intercept and slope as independent variance components nested inside) or
+  `scene_uncorr` (the scene effects alone, under the same no-correlation restriction, so
+  the two compare like for like). Each fit records coefficients, CIs, p-values, AIC,
+  `converged`, `re` (`level` and `scene` variances, `resid_var`), `curve`, `fit_note`
+  (which optimiser and start won) and, for `level_scene`, `llf_gain_over_scene_uncorr`
+  (should never be negative: the nested model contains the simpler one). Top level:
+  `design` (`v2`), `scenes`, `structures`, `subjects`.
+- `mixed_summary.csv` — `mixed.json` flattened for reading: one row per subject ×
+  measure × transform × all/completed × form (320 rows), plus the 80 `nested.json` fits,
+  told apart by `structure` (`scene` for the main model, `scene_uncorr`, `level_scene`;
+  the nested rows add `n_levels`, `var_level_intercept`, `var_level_slope`,
+  `corr_level`), with `transform` and `n_zero_dropped` columns. `primary` marks the five main results
+  (`d_nearest_norm_loso` on `log(d)`, all attempts, `log` form) and sorts them first.
+  Slopes are in each row's transform units, so compare transforms through the ratio
+  columns, never the slopes. `slope` is
+  the form's practice coefficient (`t`, per 10 attempts, for linear/quadratic;
+  `log(attempt)` for the log forms) with `slope_ci_low`/`_high`, `slope_p` and
+  `ci_excludes_zero`; `t2` and `phase_step` are the quadratic and phase terms where
+  present; `ratio_first`/`ratio_at_30` back-transform the fixed-effect line to the
+  distance ratio at attempts 1 and 30 with the row's own inverse transform (discovery
+  level for `log_phase`); then the
+  random-effect variances, `corr`, `resid_var`, `aic`, `converged`, `is_best_form`.
+  Written from `mixed.json` alone, so it never needs a refit.
+- `switching.json` — switch rate per subject per bin of attempts (`binned`) and a
+  logistic GLM `switch ~ C(subject) + log(attempt)` with errors clustered by
+  subject × scene (`trend`).
+- `figure_practice_*.png` — from `notebooks/figure_practice.ipynb`: one example
+  participant (`example`), per-subject mixed-model slopes and curves, raw vs
+  leave-subject-out in the log form (`mixed`) and the same in the linear form
+  (`mixed_linear`), linear against log per subject for the primary
+  measure (`forms`), best-curve shares per series (`curves`), and switch rate over attempts
+  (`switching`), and the practice slope and AIC under each random-effect structure
+  (`structures`, both transforms). These are drawn on the primary `log(d)`; the `mixed`, `mixed_linear` and
+  `forms` figures are drawn again on `log1p(d)` with a `_log1p` suffix.
+
 ## `frechet/`
 
 Cached pairwise Fréchet distance matrices, one per clustering unit, written by
@@ -231,6 +315,11 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   `method`, pattern `tags`),
   plus the corpus-wide subject/phase/tag lists. Drives the scene picker without loading
   any scene payload.
+- `output_data/web/data/practice.json` — the per-subject practice models for the dashboard's **Stats
+  analysis** section: `output_data/practice/mixed.json` copied by
+  `analysis.webexport.export_practice`, floats rounded to 6 decimals and the `scenes`
+  list reduced to `n_scenes`. Nothing is refitted and no attempt rows are included.
+  Rewritten by every `run-web-export`, `--backfill` included.
 - `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
   `playfield_ylim`), `step`, `cons` (below), and a `traces` array. Each trace carries its cluster label

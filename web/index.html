@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Mario clustering dashboard</title>
+<title>Mario behaviour dashboard</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,11 +11,49 @@
 
   <aside id="sidebar">
     <header>
-      <h1>Trace clustering</h1>
+      <h1>Mario behaviour</h1>
       <p id="corpus-note">loading…</p>
+      <div class="seg" id="section-seg" role="group" aria-label="Dashboard section">
+        <button data-value="clustering" aria-pressed="true">Clustering</button>
+        <button data-value="stats" aria-pressed="false">Stats analysis</button>
+      </div>
     </header>
 
-    <section class="panel" id="scene-panel">
+    <section class="panel" data-section="stats" hidden>
+      <h2>Practice models</h2>
+      <div class="field">
+        <label for="stats-measure-seg">Measure</label>
+        <div class="seg" id="stats-measure-seg" role="group" aria-label="Measure">
+          <button data-value="d_nearest_norm" aria-pressed="true">Nearest / spread</button>
+          <button data-value="d_own" aria-pressed="false">Own medoid</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="stats-transform-seg">Outcome transform</label>
+        <div class="seg" id="stats-transform-seg" role="group" aria-label="Outcome transform">
+          <button data-value="log" aria-pressed="true">log(d)</button>
+          <button data-value="log1p" aria-pressed="false">log(1 + d)</button>
+        </div>
+        <p class="hint">log is the main analysis (zeros dropped); log1p is the original, kept for comparison</p>
+      </div>
+      <div class="field">
+        <label for="stats-form-seg">Practice form</label>
+        <div class="seg" id="stats-form-seg" role="group" aria-label="Practice form">
+          <button data-value="log" aria-pressed="true">Log</button>
+          <button data-value="linear" aria-pressed="false">Linear</button>
+        </div>
+      </div>
+      <div class="field">
+        <label for="stats-attempts-seg">Attempts</label>
+        <div class="seg" id="stats-attempts-seg" role="group" aria-label="Attempts">
+          <button data-value="all" aria-pressed="true">All</button>
+          <button data-value="completed" aria-pressed="false">Completed only</button>
+        </div>
+      </div>
+      <p class="hint">one mixed model per subject, fitted by <code>run-practice-models</code> &mdash; these controls pick which stored fit is drawn, nothing is refitted</p>
+    </section>
+
+    <section class="panel" id="scene-panel" data-section="clustering">
       <h2>Scene</h2>
       <select id="tag-filter" aria-label="Filter scenes by design-pattern tag">
         <option value="">All design patterns</option>
@@ -24,12 +62,12 @@
       <div id="scene-list" role="listbox" aria-label="Scenes"></div>
     </section>
 
-    <section class="panel">
+    <section class="panel" data-section="clustering">
       <h2>Subject</h2>
       <div class="check-list" id="subject-list"></div>
     </section>
 
-    <section class="panel">
+    <section class="panel" data-section="clustering">
       <h2>Filters</h2>
       <div class="field">
         <label for="phase-seg">Phase</label>
@@ -59,7 +97,7 @@
       </div>
     </section>
 
-    <section class="panel">
+    <section class="panel" data-section="clustering">
       <h2>Display</h2>
       <div class="field">
         <label for="view-seg">View</label>
@@ -132,6 +170,35 @@
         </div>
         <div id="matrix-legend"></div>
         <p class="note" id="matrix-note"></p>
+      </div>
+
+      <div id="stats-wrap" hidden>
+        <p class="note" id="stats-missing" hidden></p>
+        <div id="stats-body">
+          <section class="stats-block">
+            <h3>Practice coefficient per subject</h3>
+            <p class="stats-cap" id="stats-coef-cap"></p>
+            <div class="stats-chart" id="stats-coef"></div>
+            <div class="stats-legend" id="stats-coef-legend"></div>
+          </section>
+          <section class="stats-block">
+            <h3>Fitted curve per subject <span class="muted">&mdash; leave-subject-out, average scene</span></h3>
+            <p class="stats-cap" id="stats-curve-cap"></p>
+            <div class="stats-chart" id="stats-curves"></div>
+            <div class="stats-legend" id="stats-curve-legend"></div>
+          </section>
+          <section class="stats-block">
+            <h3>Linear against log, per subject <span class="muted">&mdash; leave-subject-out</span></h3>
+            <p class="stats-cap" id="stats-forms-cap"></p>
+            <div class="stats-multiples" id="stats-forms"></div>
+            <div class="stats-legend" id="stats-forms-legend"></div>
+          </section>
+          <section class="stats-block">
+            <h3>Results table</h3>
+            <div class="stats-table-wrap"><table class="stats-table" id="stats-table"></table></div>
+          </section>
+          <p class="note" id="stats-note"></p>
+        </div>
       </div>
 
       <div id="selection-wrap" hidden>

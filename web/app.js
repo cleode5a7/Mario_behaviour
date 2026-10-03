@@ -87,6 +87,9 @@ const state = {
   pinned: null,         // trace object clicked
   zoom: 1,
   pan: { x: 0, y: 0 },
+  section: "clustering",   // or "stats": the practice-model section
+  stats: { measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all" },
+  statsSubjectColors: new Map(),
 };
 
 const sceneCache = new Map();
@@ -1675,8 +1678,19 @@ function render() {
   rafPending = true;
   requestAnimationFrame(() => {
     rafPending = false;
-    if (!state.scene) return;
+    const stats = state.section === "stats";
+    $("stats-wrap").hidden = !stats;
+    if (stats) {
+      for (const id of ["empty", "overlay-wrap", "panels", "matrix-wrap", "selection-wrap"]) {
+        $(id).hidden = true;
+      }
+      renderStats();
+      return;
+    }
+    if (!state.scene) { $("empty").hidden = false; return; }
     const view = state.view;
+    // The stats section owns the title while it is open; take it back on return.
+    { const traces = visibleTraces(); renderTitle(traces, sceneRanking(), visibleCounts(traces)); }
     $("overlay-wrap").hidden = view !== "overlay";
     $("panels").hidden = view !== "panels";
     $("matrix-wrap").hidden = view !== "matrix";
@@ -1779,6 +1793,469 @@ function clearFilters() {
   render();
 }
 
+/* ---------- stats analysis section ---------- */
+
+/* Draws the per-subject practice models written by `invoke run-practice-models` and
+ * copied into data/practice.json by `invoke run-web-export`. Like every other view
+ * it only draws a stored result: the controls choose which fit is shown, nothing is
+ * refitted in the browser. Colours match notebooks/figure_practice.ipynb so the
+ * dashboard and figure_practice_*.png are the same figures: raw vs leave-subject-out
+ * are CLUSTER_COLORS[0]/[1], linear vs log CLUSTER_COLORS[2]/[3], subjects take
+ * SUBJECT_COLORS by sorted subject id. */
+
+const STATS_SERIES = [
+  { suffix: "", label: "all-subject medoids", color: CLUSTER_COLORS[0] },
+  { suffix: "_loso", label: "leave-subject-out", color: CLUSTER_COLORS[1] },
+];
+const FORM_COLORS = { linear: CLUSTER_COLORS[2], log: CLUSTER_COLORS[3] };
+const SLOPE_TERM = { linear: "t", quadratic: "t", log: "logt", log_phase: "logt" };
+const MEASURE_INFO = {
+  d_nearest_norm: { name: "distance to nearest medoid / its spread",
+                    unit: "ratio", ref: 1, digits: 2 },
+  d_own: { name: "Fréchet distance to own medoid", unit: "px", ref: null, digits: 1 },
+};
+const STATS_AT = 30;               // the "at attempt 30" column, as in mixed_summary.csv
+/* Back-transforms, mirroring TRANSFORMS in analysis/practice.py. */
+const INVERSE = { log: Math.exp, log1p: Math.expm1 };
+const SVG_NS = "http://www.w3.org/2000/svg";
+let statsData = null;              // practice.json once loaded; false when unavailable
+let statsLoading = false;
+
+function svgEl(tag, attrs, parent) {
+  const el = document.createElementNS(SVG_NS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) el.setAttribute(k, v);
+  if (parent) parent.appendChild(el);
+  return el;
+}
+
+function niceTicks(lo, hi, n) {
+  const span = hi - lo || 1;
+  const mag = 10 ** Math.floor(Math.log10(span / n));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((s) => span / s <= n) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(Number(v.toFixed(10)));
+  }
+  return out;
+}
+
+const signed = (v, d = 4) => (v == null ? "—" : `${v < 0 ? "−" : "+"}${Math.abs(v).toFixed(d)}`);
+const fmtP = (p) => (p == null ? "—" : p < 0.0001 ? "<0.0001" : p.toFixed(4));
+const subjColor = (s) => state.statsSubjectColors.get(s) || NOISE_COLOR;
+
+function statsFit(measure, subject) {
+  const completed = state.stats.attempts === "completed";
+  return statsData.fits.find((f) => f.measure === measure && f.subject === subject
+                                    && f.completed_only === completed
+                                    && f.transform === state.stats.transform);
+}
+
+/* Fixed-effect prediction at one attempt, back-transformed — the same arithmetic as
+ * _predict() in analysis/practice.py followed by the transform's inverse. */
+function statsPredict(coef, form, attempt) {
+  const t = attempt / statsData.t_scale;
+  let y = coef.Intercept;
+  if (form === "linear" || form === "quadratic") {
+    y += coef.t * t + (coef["I(t ** 2)"] || 0) * t * t;
+  } else {
+    y += coef.logt * Math.log(attempt);
+  }
+  return INVERSE[state.stats.transform](y);
+}
+
+function showStatsTooltip(head, color, rows, clientX, clientY) {
+  const tip = $("tooltip");
+  tip.innerHTML =
+    `<div class="tt-head">${color ? `<span class="tt-dot" style="background:${color}"></span>` : ""}` +
+    `<span>${head}</span></div>` +
+    `<dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+  tip.dataset.show = "true";
+  const r = tip.getBoundingClientRect();
+  let x = clientX + 14, y = clientY + 14;
+  if (x + r.width > window.innerWidth - 8) x = clientX - r.width - 14;
+  if (y + r.height > window.innerHeight - 8) y = clientY - r.height - 14;
+  tip.style.left = x + "px";
+  tip.style.top = y + "px";
+}
+const hideStatsTooltip = () => { $("tooltip").dataset.show = "false"; };
+
+function legendHTML(items, dot) {
+  return items.map(([color, text]) =>
+    `<span><i class="${dot ? "dot" : ""}" style="background:${color}"></i>${text}</span>`).join("");
+}
+
+/* Coefficient plot: one row per subject, raw and leave-subject-out side by side. */
+function renderStatsCoef() {
+  const { measure, form } = state.stats;
+  const term = SLOPE_TERM[form];
+  const host = $("stats-coef");
+  host.innerHTML = "";
+  const subjects = statsData.subjects;
+  const pts = [];
+  subjects.forEach((s, i) => {
+    STATS_SERIES.forEach((ser, j) => {
+      const f = statsFit(measure + ser.suffix, s);
+      const r = f && f.forms[form];
+      if (!r || !r.coef) return;
+      pts.push({ s, i, j, ser, f, r, b: r.coef[term], lo: r.ci[term][0], hi: r.ci[term][1] });
+    });
+  });
+  if (!pts.length) { host.textContent = "No fits for this selection."; return; }
+
+  const w = host.clientWidth || 700, rowH = 38;
+  const pad = { l: 64, r: 22, t: 14, b: 44 };
+  const h = pad.t + subjects.length * rowH + pad.b;
+  let lo = Math.min(0, ...pts.map((p) => p.lo)), hi = Math.max(0, ...pts.map((p) => p.hi));
+  const m = (hi - lo) * 0.06; lo -= m; hi += m;
+  const px = (v) => pad.l + ((w - pad.l - pad.r) * (v - lo)) / (hi - lo);
+  const rowY = (i) => pad.t + rowH * (i + 0.5);
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${h}`, height: h, role: "img",
+    "aria-label": `${form}-form practice coefficient per subject, raw and leave-subject-out` }, host);
+
+  for (const v of niceTicks(lo, hi, 6)) {
+    svgEl("line", { x1: px(v), x2: px(v), y1: pad.t, y2: h - pad.b, class: "grid" }, svg);
+    svgEl("text", { x: px(v), y: h - pad.b + 14, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = v === 0 ? "0" : signed(v, 3).replace("+", "");
+  }
+  svgEl("line", { x1: px(0), x2: px(0), y1: pad.t - 4, y2: h - pad.b, class: "zero" }, svg);
+  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: h - 8, "text-anchor": "middle", class: "axis-label" }, svg)
+    .textContent = (form === "log" ? "log(attempt) coefficient" : "coefficient per 10 attempts") +
+      `, ${state.stats.transform} units — left of 0 = closer to the prototypes with practice`;
+  subjects.forEach((s, i) => {
+    svgEl("text", { x: pad.l - 10, y: rowY(i) + 4, "text-anchor": "end", class: "row-label" }, svg)
+      .textContent = `sub-${s}`;
+  });
+
+  for (const p of pts) {
+    const y = rowY(p.i) + (p.j === 0 ? -7 : 7);
+    const g = svgEl("g", {}, svg);
+    svgEl("line", { x1: px(p.lo), x2: px(p.hi), y1: y, y2: y, stroke: p.ser.color,
+                    "stroke-width": 2, "stroke-linecap": "round" }, g);
+    for (const v of [p.lo, p.hi]) {
+      svgEl("line", { x1: px(v), x2: px(v), y1: y - 3.5, y2: y + 3.5, stroke: p.ser.color,
+                      "stroke-width": 2, "stroke-linecap": "round" }, g);
+    }
+    svgEl("circle", { cx: px(p.b), cy: y, r: 4.5, fill: p.ser.color, class: "dot-ring" }, g);
+    const hit = svgEl("rect", { x: px(p.lo) - 6, y: y - 7, width: px(p.hi) - px(p.lo) + 12,
+                                height: 14, class: "hit" }, g);
+    const clear = p.hi < 0 || p.lo > 0;
+    const rows = [
+      ["medoids", p.ser.label],
+      ["coefficient", signed(p.b)],
+      ["95% CI", `${signed(p.lo)} to ${signed(p.hi)}`],
+      ["p", fmtP(p.r.p[term])],
+      ["CI excludes 0", clear ? "yes" : "no"],
+      ["attempts", p.f.n_obs.toLocaleString()],
+      [measure === "d_own" ? "scene × cluster series" : "scenes", p.f.n_groups.toLocaleString()],
+      ["AIC-best form", p.f.best_form || "—"],
+      ["converged", p.r.converged ? "yes" : "no"],
+    ];
+    hit.addEventListener("mousemove", (ev) =>
+      showStatsTooltip(`sub-${p.s} · ${p.f.measure}`, p.ser.color, rows, ev.clientX, ev.clientY));
+    hit.addEventListener("mouseleave", hideStatsTooltip);
+  }
+
+  $("stats-coef-legend").innerHTML = legendHTML(STATS_SERIES.map((s) => [s.color, s.label]), true);
+  $("stats-coef-cap").textContent =
+    `Each dot is one subject's practice coefficient b in the ${form} form, with its 95% ` +
+    "confidence interval. Left of the dashed zero line means attempts moved closer to the " +
+    "cluster prototypes with practice; an interval that crosses it is no clear change. Blue " +
+    "measures against medoids chosen from all five players, orange against medoids chosen " +
+    "from the other four only — read an effect as real where the two agree.";
+}
+
+/* A line chart with a crosshair tooltip. Series need not share x values: each is
+ * read at its own nearest point, and skipped past its own last attempt. */
+function drawLineChart(host, { series, yDomain, yLabel, xLabel, ref, refLabel, height, title, digits, aria }) {
+  host.innerHTML = "";
+  if (title) {
+    const d = document.createElement("div");
+    d.className = "panel-title";
+    d.innerHTML = title;
+    host.appendChild(d);
+  }
+  const w = host.clientWidth || 600;
+  const pad = { l: yLabel ? 54 : 40, r: 16, t: 12, b: xLabel ? 42 : 26 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${height}`, height, role: "img", "aria-label": aria || "" }, host);
+  const xMax = Math.max(...series.flatMap((s) => s.points.map((p) => p[0])));
+  const xMin = 1;
+  const [ylo, yhi] = yDomain;
+  const px = (x) => pad.l + ((w - pad.l - pad.r) * (x - xMin)) / (xMax - xMin || 1);
+  const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (y - ylo)) / (yhi - ylo || 1);
+
+  for (const v of niceTicks(ylo, yhi, 4)) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
+    svgEl("text", { x: pad.l - 6, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = v.toFixed(digits);
+  }
+  for (const v of niceTicks(xMin, xMax, 5)) {
+    svgEl("text", { x: px(v), y: height - pad.b + 14, "text-anchor": "middle", class: "tick" }, svg)
+      .textContent = v;
+  }
+  if (xLabel) {
+    svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 8, "text-anchor": "middle",
+                    class: "axis-label" }, svg).textContent = xLabel;
+  }
+  if (yLabel) {
+    const cy = (pad.t + height - pad.b) / 2;
+    svgEl("text", { x: 13, y: cy, "text-anchor": "middle", class: "axis-label",
+                    transform: `rotate(-90 13 ${cy})` }, svg).textContent = yLabel;
+  }
+  if (ref != null && ref >= ylo && ref <= yhi) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(ref), y2: py(ref), class: "ref" }, svg);
+    if (refLabel) {
+      svgEl("text", { x: w - pad.r - 4, y: py(ref) - 4, "text-anchor": "end", class: "ref-label" }, svg)
+        .textContent = refLabel;
+    }
+  }
+  for (const s of series) {
+    svgEl("polyline", { points: s.points.map(([x, y]) => `${px(x)},${py(y)}`).join(" "),
+                        fill: "none", stroke: s.color, "stroke-width": 2,
+                        "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  }
+
+  const cross = svgEl("g", { visibility: "hidden" }, svg);
+  const vline = svgEl("line", { y1: pad.t, y2: height - pad.b, class: "crosshair" }, cross);
+  const dots = series.map((s) => svgEl("circle", { r: 4, fill: s.color, class: "dot-ring" }, cross));
+  const hit = svgEl("rect", { x: pad.l, y: pad.t, width: w - pad.l - pad.r,
+                              height: height - pad.t - pad.b, class: "hit" }, svg);
+  hit.style.cursor = "crosshair";
+  hit.addEventListener("mousemove", (ev) => {
+    const r = svg.getBoundingClientRect();
+    const sx = ((ev.clientX - r.left) / r.width) * w;
+    const a = Math.round(xMin + ((sx - pad.l) / (w - pad.l - pad.r)) * (xMax - xMin));
+    const rows = [];
+    let shownX = null;
+    series.forEach((s, i) => {
+      const last = s.points[s.points.length - 1][0];
+      if (a > last) { dots[i].setAttribute("visibility", "hidden"); return; }
+      const p = s.points.reduce((best, q) => (Math.abs(q[0] - a) < Math.abs(best[0] - a) ? q : best));
+      dots[i].setAttribute("visibility", "visible");
+      dots[i].setAttribute("cx", px(p[0]));
+      dots[i].setAttribute("cy", py(p[1]));
+      shownX = shownX == null ? p[0] : shownX;
+      rows.push([s.label, p[1].toFixed(digits + 1)]);
+    });
+    if (!rows.length) { cross.setAttribute("visibility", "hidden"); hideStatsTooltip(); return; }
+    vline.setAttribute("x1", px(shownX)); vline.setAttribute("x2", px(shownX));
+    cross.setAttribute("visibility", "visible");
+    showStatsTooltip(`attempt ${shownX} at a scene`, null, rows, ev.clientX, ev.clientY);
+  });
+  hit.addEventListener("mouseleave", () => {
+    cross.setAttribute("visibility", "hidden");
+    hideStatsTooltip();
+  });
+}
+
+function curvePoints(r) {
+  const inv = INVERSE[state.stats.transform];
+  return r.curve.attempt.map((a, i) => [a, inv(r.curve.y[i])]);
+}
+
+function paddedDomain(values, ref) {
+  let lo = Math.min(...values), hi = Math.max(...values);
+  if (ref != null) { lo = Math.min(lo, ref); hi = Math.max(hi, ref); }
+  const m = (hi - lo) * 0.06 || 0.05;
+  return [lo - m, hi + m];
+}
+
+function renderStatsCurves() {
+  const { measure, form } = state.stats;
+  const info = MEASURE_INFO[measure];
+  const series = [];
+  for (const s of statsData.subjects) {
+    const f = statsFit(`${measure}_loso`, s);
+    const r = f && f.forms[form];
+    if (r && r.curve) series.push({ label: `sub-${s}`, color: subjColor(s), points: curvePoints(r) });
+  }
+  const host = $("stats-curves");
+  if (!series.length) { host.textContent = "No fitted curves for this selection."; return; }
+  drawLineChart(host, {
+    series, height: 340, digits: info.digits,
+    yDomain: paddedDomain(series.flatMap((s) => s.points.map((p) => p[1])), info.ref),
+    yLabel: `${info.name} (${info.unit})`, xLabel: "attempt at a scene (restarts at 1 for every scene)",
+    ref: info.ref, refLabel: info.ref != null ? "1.0 = typical cluster member" : null,
+    aria: `${form}-form fitted curve per subject`,
+  });
+  $("stats-curve-legend").innerHTML = legendHTML(series.map((s) => [s.color, s.label]));
+  $("stats-curve-cap").textContent =
+    `Each line is one subject's fitted ${form}-form line — the average scene, with every ` +
+    `scene's own adjustments set to zero — converted back from ${state.stats.transform} to ` +
+    (measure === "d_nearest_norm"
+      ? "the distance ratio (0 would be the medoid itself, 1 a typical member). "
+      : "Fréchet distance in pixels. ") +
+    "Each stops at that subject's 95th-percentile attempt at a scene, past which few scenes " +
+    "still contribute. The y-axis is zoomed to the data, so drops look steeper than they are.";
+}
+
+function renderStatsForms() {
+  const { measure } = state.stats;
+  const info = MEASURE_INFO[measure];
+  const host = $("stats-forms");
+  host.innerHTML = "";
+  const panels = [];
+  for (const s of statsData.subjects) {
+    const f = statsFit(`${measure}_loso`, s);
+    if (!f) continue;
+    const series = ["linear", "log"].filter((k) => f.forms[k] && f.forms[k].curve).map((k) => ({
+      label: k, color: FORM_COLORS[k], points: curvePoints(f.forms[k]) }));
+    const d = f.forms.linear && f.forms.log && f.forms.linear.aic != null
+      ? f.forms.linear.aic - f.forms.log.aic : null;
+    panels.push({ s, f, series, d });
+  }
+  const yDomain = paddedDomain(panels.flatMap((p) => p.series.flatMap((s) => s.points.map((q) => q[1]))),
+                               info.ref);
+  // Every box goes into the grid before any is measured: a box drawn while it is
+  // still the grid's only child reads the full row as its width, and its viewBox is
+  // then squeezed into one column.
+  for (const p of panels) {
+    p.box = document.createElement("div");
+    p.box.className = "stats-chart";
+    host.appendChild(p.box);
+  }
+  for (const p of panels) {
+    const box = p.box;
+    const verdict = p.d == null ? "" : Math.abs(p.d) < 2 ? "tie" : p.d > 0 ? "log fits better" : "linear fits better";
+    drawLineChart(box, {
+      series: p.series, yDomain, height: 210, digits: info.digits, ref: info.ref,
+      title: `sub-${p.s} <span class="muted">· ΔAIC lin−log ${p.d == null ? "—" : signed(p.d, 0)} · ${verdict}</span>`,
+      aria: `sub-${p.s}: linear and log fitted curves`,
+    });
+  }
+  $("stats-forms-legend").innerHTML = legendHTML(["linear", "log"].map((k) => [FORM_COLORS[k], k]));
+  $("stats-forms-cap").textContent =
+    "The same subject's model in both forms, for the leave-subject-out measure, on one shared " +
+    "y-axis. ΔAIC is linear minus log: positive means log fits better, negative linear, and a " +
+    "difference under ~2 is a tie. AIC scores the whole model, scene-to-scene variation " +
+    "included, so a large ΔAIC can sit under two curves that look alike.";
+}
+
+function renderStatsTable() {
+  const { measure, form } = state.stats;
+  const info = MEASURE_INFO[measure];
+  const term = SLOPE_TERM[form];
+  const head = ["subject", "medoids", "coefficient", "95% CI", "p", "CI excludes 0",
+                `at attempt 1 (${info.unit})`, `at attempt ${STATS_AT} (${info.unit})`,
+                "AIC-best form", "ΔAIC lin−log", "attempts", "zeros dropped",
+                measure === "d_own" ? "series" : "scenes", "converged"];
+  const rows = [];
+  for (const s of statsData.subjects) {
+    for (const ser of [...STATS_SERIES].reverse()) {
+      const f = statsFit(measure + ser.suffix, s);
+      const r = f && f.forms[form];
+      if (!r || !r.coef) continue;
+      const [lo, hi] = r.ci[term];
+      const clear = hi < 0 || lo > 0;
+      const d = f.forms.linear && f.forms.log ? f.forms.linear.aic - f.forms.log.aic : null;
+      rows.push(`<tr class="${ser.suffix ? "loso" : ""}">` +
+        `<td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
+        `<td>${ser.suffix ? "leave-subject-out" : "all-subject"}</td>` +
+        `<td>${signed(r.coef[term])}</td><td>${signed(lo)} to ${signed(hi)}</td>` +
+        `<td>${fmtP(r.p[term])}</td>` +
+        `<td class="${clear ? "clear" : "unclear"}">${clear ? "yes" : "no"}</td>` +
+        `<td>${statsPredict(r.coef, form, 1).toFixed(info.digits)}</td>` +
+        `<td>${statsPredict(r.coef, form, STATS_AT).toFixed(info.digits)}</td>` +
+        `<td>${f.best_form || "—"}</td><td>${d == null ? "—" : signed(d, 1)}</td>` +
+        `<td>${f.n_obs.toLocaleString()}</td><td>${(f.n_zero_dropped || 0).toLocaleString()}</td>` +
+        `<td>${f.n_groups.toLocaleString()}</td>` +
+        `<td>${r.converged ? "yes" : "no"}</td></tr>`);
+    }
+  }
+  $("stats-table").innerHTML =
+    `<thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody>`;
+}
+
+function renderStats() {
+  const { measure, form, attempts, transform } = state.stats;
+  $("chart-title").textContent = "Practice effect — one mixed model per subject";
+  $("reset-view").hidden = true;
+  $("clear-filters").hidden = true;
+
+  if (statsData === null) {
+    $("chart-sub").textContent = "loading practice models…";
+    if (!statsLoading) {
+      statsLoading = true;
+      fetch("data/practice.json")
+        .then((res) => (res.ok ? res.json() : false))
+        .catch(() => false)
+        .then((data) => {
+          statsData = data;
+          if (data) {
+            state.statsSubjectColors = new Map(
+              data.subjects.map((s, i) => [s, SUBJECT_COLORS[i % SUBJECT_COLORS.length]]));
+          }
+          render();
+        });
+    }
+    return;
+  }
+  $("stats-missing").hidden = !!statsData;
+  $("stats-body").hidden = !statsData;
+  if (!statsData) {
+    $("chart-sub").textContent = "no practice models in this export";
+    $("stats-missing").textContent =
+      "No practice models found in data/practice.json. Run  invoke run-practice-models  and " +
+      "then  invoke run-web-export --backfill  (a small copy, no re-export), and reload.";
+    return;
+  }
+
+  const isPrimary = `${measure}_loso` === statsData.primary && form === "log" && attempts === "all"
+                    && transform === statsData.primary_transform;
+  $("chart-sub").innerHTML =
+    `${MEASURE_INFO[measure].name} · ${transform}(d) · ${form} form · ` +
+    `${attempts === "all" ? "all attempts" : "completed attempts only"}` +
+    ` · ${statsData.n_scenes} scenes · ` +
+    (isPrimary ? "the main result" : '<span class="filtered">a robustness check, not the main result</span>');
+  renderStatsCoef();
+  renderStatsCurves();
+  renderStatsForms();
+  renderStatsTable();
+  $("stats-note").innerHTML =
+    "Each subject is fitted separately: <code>transform(distance) ~ practice term</code>, with a " +
+    "random intercept and a random slope on the same time term per scene (per scene × cluster " +
+    "for the own-medoid measure), by maximum likelihood. Coefficients are in the transform's " +
+    "units, so compare <code>log</code> and <code>log1p</code> through the curves, not the slopes; " +
+    "curves and the <em>at attempt</em> columns are converted back. Leave-subject-out " +
+    "measures each subject against medoids and spreads chosen from the other subjects only. " +
+    `The main result is <code>${statsData.primary}</code> on <code>${statsData.primary_transform}(d)</code> ` +
+    "(attempts at exactly 0 dropped), log form, all attempts; <code>log1p</code> is the original " +
+    "analysis, kept because its residuals were heavily right-skewed and the switch should stay traceable; " +
+    "everything else here is a check on it. Source: <code>output_data/practice/mixed.json</code> " +
+    "(flattened in <code>mixed_summary.csv</code>).";
+}
+
+function bindStats() {
+  const section = $("section-seg");
+  section.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    for (const b of section.querySelectorAll("button")) {
+      b.setAttribute("aria-pressed", String(b === btn));
+    }
+    state.section = btn.dataset.value;
+    for (const el of document.querySelectorAll("[data-section]")) {
+      el.hidden = el.dataset.section !== state.section;
+    }
+    hideStatsTooltip();
+    render();
+  });
+  for (const [id, key] of [["stats-measure-seg", "measure"], ["stats-transform-seg", "transform"],
+                           ["stats-form-seg", "form"],
+                           ["stats-attempts-seg", "attempts"]]) {
+    const seg = $(id);
+    seg.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn) return;
+      for (const b of seg.querySelectorAll("button")) {
+        b.setAttribute("aria-pressed", String(b === btn));
+      }
+      state.stats[key] = btn.dataset.value;
+      hideStatsTooltip();
+      render();
+    });
+  }
+}
+
 /* ---------- boot ---------- */
 
 async function init() {
@@ -1826,9 +2303,12 @@ async function init() {
   $("reset-view").addEventListener("click", resetView);
   $("clear-filters").addEventListener("click", clearFilters);
   bindCanvas();
+  bindStats();
   window.addEventListener("resize", render);
 
   if (state.index.scenes.length) selectScene(state.index.scenes[0].id);
+  // index.html#stats opens straight onto the stats section, so it can be linked to.
+  if (location.hash === "#stats") $("section-seg").querySelector('[data-value="stats"]').click();
 }
 
 init();

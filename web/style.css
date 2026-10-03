@@ -218,7 +218,7 @@ select { margin-bottom: 6px; }
   font-size: 11px;
   color: var(--ink-2);
 }
-.field .hint {
+.field .hint, .panel > .hint {
   margin: 4px 0 0;
   font-size: 10px;
   line-height: 1.35;
@@ -552,3 +552,101 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
   height: 100%;
   image-rendering: pixelated;
 }
+
+
+/* ---------- stats analysis section ---------- */
+
+/* The section switch sits in the header because it changes what the whole page is
+   about — every panel below it belongs to one section or the other. */
+#section-seg { margin-top: 10px; }
+.hint code { font-family: var(--mono); font-size: 10.5px; }
+
+#stats-wrap { max-width: 1200px; }
+.stats-block { margin-bottom: 26px; }
+.stats-block h3 { margin: 0 0 3px; font-size: 13px; font-weight: 600; }
+.stats-block h3 .muted { color: var(--ink-3); font-weight: 400; }
+.stats-cap {
+  margin: 0 0 8px;
+  max-width: 90ch;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--ink-3);
+}
+
+.stats-chart {
+  position: relative;
+  width: 100%;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius);
+  overflow: hidden;
+}
+.stats-chart svg { display: block; width: 100%; }
+.stats-chart .panel-title {
+  padding: 6px 10px 0;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.stats-chart .panel-title .muted { font-weight: 400; color: var(--ink-3); }
+
+.stats-multiples {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 10px;
+}
+
+/* Chart ink: recessive grid and axes, text in text tokens, never series colours. */
+.stats-chart .grid { stroke: var(--line); stroke-width: 1; }
+.stats-chart .zero { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 3 3; }
+.stats-chart .ref { stroke: var(--ink-3); stroke-width: 1; stroke-dasharray: 2 4; }
+.stats-chart .tick { fill: var(--ink-3); font-size: 10px; font-family: var(--font); }
+.stats-chart .axis-label { fill: var(--ink-2); font-size: 11px; font-family: var(--font); }
+.stats-chart .ref-label { fill: var(--ink-3); font-size: 10px; font-family: var(--font); }
+.stats-chart .row-label { fill: var(--ink-2); font-size: 11px; font-family: var(--font); }
+.stats-chart .crosshair { stroke: var(--ink-3); stroke-width: 1; }
+.stats-chart .hit { fill: transparent; cursor: pointer; }
+.stats-chart .dot-ring { stroke: var(--surface-2); stroke-width: 2; }
+
+.stats-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  padding: 8px 2px 0;
+  font-size: 11.5px;
+  color: var(--ink-2);
+}
+.stats-legend span { display: inline-flex; align-items: center; gap: 6px; }
+.stats-legend i { display: inline-block; width: 18px; height: 3px; border-radius: 2px; }
+.stats-legend i.dot { width: 9px; height: 9px; border-radius: 50%; }
+
+.stats-table-wrap { overflow-x: auto; }
+.stats-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.stats-table th {
+  padding: 6px 8px;
+  text-align: right;
+  font-size: 10.5px;
+  font-weight: 600;
+  color: var(--ink-3);
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.stats-table td {
+  padding: 5px 8px;
+  text-align: right;
+  font-family: var(--mono);
+  font-size: 11.5px;
+  border-bottom: 1px solid var(--line);
+  white-space: nowrap;
+}
+.stats-table th:first-child, .stats-table td:first-child,
+.stats-table th:nth-child(2), .stats-table td:nth-child(2) { text-align: left; }
+.stats-table td.subj { font-family: var(--font); display: flex; align-items: center; gap: 6px; }
+.stats-table td.subj i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
+.stats-table tr.loso td { background: var(--surface-2); }
+.stats-table td.clear { color: var(--ink); font-weight: 600; }
+.stats-table td.unclear { color: var(--ink-3); }

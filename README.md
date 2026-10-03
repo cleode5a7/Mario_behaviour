@@ -42,10 +42,12 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `run-scheme-comparison`       | Cluster every scene under both resampling schemes (subagging vs Breiman bootstrap) and write the side-by-side |
 | `run-consensus-comparison`    | Cluster every scene under all three consensus aggregations (Ward/features, Ward/distance, HDBSCAN) and write the side-by-side |
 | `run-coassociation`           | Store each scene's co-association (consensus) matrix; feeds the dashboard's Co-association view |
+| `run-practice-distances`      | Measure each attempt's Fréchet distance to its cluster's medoid and to the nearest medoid (plus leave-subject-out), per scene |
+| `run-practice-models`         | Model the practice effect on those distances: per-series curve comparison (linear/quadratic/power/exponential), one mixed model per subject, strategy-switch trend |
 | `run-web-export`              | Export clustered traces to a static payload for the interactive dashboard |
-| `dashboard`                   | Serve the interactive clustering dashboard on `localhost` (needs `run-web-export`) |
+| `dashboard`                   | Serve the interactive clustering and stats dashboard on `localhost` (needs `run-web-export`) |
 | `run-notebooks`               | Execute notebooks and save figures to `output_data/`                     |
-| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → web-export → notebooks |
+| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → practice-distances → practice-models → web-export → notebooks |
 | `run-smoke`                   | Minimal end-to-end pass (first subject/scene/category only) to verify pipeline wiring |
 | `verify`                      | Check that the code, config, data and docs still agree (run before committing) |
 | `list-scenes-task`            | Print all scene IDs, one per line (used to build SLURM array inputs)     |
@@ -57,6 +59,7 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `clean-web-export`            | Remove `output_data/web/`                                                |
 | `clean-stability`             | Remove `output_data/stability/` (audit, sweeps, selected parameters)     |
 | `clean-coassociation`         | Remove `output_data/coassociation/`                                      |
+| `clean-practice`              | Remove `output_data/practice/`                                           |
 | `clean-frechet`               | Remove cached Fréchet distance matrices (kept separate so re-clustering reuses them) |
 | `clean`                       | Remove all computed outputs                                              |
 | `clean-mario-scenes`          | Remove the cloned `source_data/mario.scenes/` dataset                    |
@@ -95,6 +98,14 @@ It renders the same figure as `analysis/trace_plots.py` — scene background, cl
 palette and marker shapes, per-cluster panels, per-subject composition — and adds what a
 PNG cannot do: pick any scene, filter to a subject, a phase (discovery / practice), a
 stage or an outcome, hover a trajectory for its clip details, and click to isolate it.
+
+**Stats analysis** (the switch at the top of the sidebar, or `http://localhost:8000/#stats`)
+shows the practice-effect models from `run-practice-models` — one mixed model per
+subject: the practice coefficient with its 95% CI (raw medoids against
+leave-subject-out), each subject's fitted curve, linear against log per subject, and a
+results table. Measure, practice form and attempts (all / completed) pick which stored
+fit is drawn; nothing is refitted. It reads `output_data/web/data/practice.json`, which
+`run-web-export` (or `run-web-export --backfill`) copies in.
 
 **Colour by** offers cluster, outcome, subject, **attempt #** or **stage**. The attempt
 ramp is viridis over the order in which a subject played that scene, normalised per
@@ -211,7 +222,7 @@ category) — see `slurm_clustering.sh` (per scene) and `slurm_clustering_by_cat
 - **Two baseline checks, and they cover different failures.** `invoke run-smoke` is the behavioural one — does the pipeline run end to end and produce something. `invoke verify` is the structural one — do the code, config, data and docs still describe the same project. Run both before committing; neither substitutes for the other.
 - **Gathering assets is a separate job from reproducing results.** `fetch` retrieves; `run` reads what is already on disk and never pulls. A step that finds its input missing says so and points at `invoke fetch` rather than fixing it silently.
 - **Idempotent steps.** Each task checks whether its outputs already exist and skips if they do. Call `invoke clean` then `invoke run` to force a full rerun.
-- **Chunked for reruns.** `run-changepoints` and `run-changepoints-by-category` process one subject at a time (`--subjects`); `run-clustering` chunks by scene (`--scenes`), `run-clustering-by-category` by category (`--categories`), and `run-web-export` by scene (`--scenes`). Any piece can be restricted or retried in isolation.
+- **Chunked for reruns.** `run-changepoints` and `run-changepoints-by-category` process one subject at a time (`--subjects`); `run-clustering` chunks by scene (`--scenes`), `run-clustering-by-category` by category (`--categories`), `run-practice-distances` and `run-web-export` by scene (`--scenes`). Any piece can be restricted or retried in isolation.
 - **Clustering is bagged, and it records its own settings.** `run-clustering` defaults to `method=consensus`: HDBSCAN is refit on 200 random 80% subsamples, a co-association matrix records how often each pair of traces landed together, and the final labels come from clustering that matrix — Ward linkage over the matrix, cut at a k chosen by silhouette. Ward is given the matrix as a **feature matrix** (each row is a trace's co-occurrence profile), following the BASC reference, which is what makes its Euclidean criterion well posed even though the underlying Fréchet distance is not Euclidean. Ward returns a tree and no k, so every cut from k=2 to 15 is scored on the co-association distance `1 - C` and the **highest silhouette wins** — the plain rule. Two guards on it ship off (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`); turn them on to get the earlier, more conservative cut. The plain rule leaves the bulk partition alone (median ARI 0.996 against the guarded one) but raises k in 172 of 300 scenes and puts one or two traces in the smallest cluster of 42% of them — the silhouette scores a singleton at 0 and so cannot penalise a cut for peeling one off, which is why the dashboard and the silhouette figure both report the smallest cluster size separately. `invoke run-consensus-comparison` scores the aggregation against the alternatives over the whole corpus, and the switch to Ward was not free: Ward on the feature matrix reaches 79.1% trace-weighted stability at a median of 6 clusters per scene, against 81.6% at 4 clusters for the older HDBSCAN aggregation, on identical ensembles and with the three partitions agreeing closely (median ARI 0.94-0.99). It buys resolution — and a partition for the 11 scenes the old method left entirely as noise — for about two points of stability. The resampling defaults to **subagging** (subsample without replacement) rather than a Breiman bootstrap. Both are implemented — `--scheme bootstrap` gives classical bagging — and `invoke run-scheme-comparison` runs the corpus under each. Over 308 scenes the two **agree about the clustering** (median ARI 0.97) but not about how much to trust it: a bootstrap replicate holds only ~63% unique points, so its replicates are roughly twice as variable (mean sd of k 1.10 vs 0.61) and it reports a lower stability for the same partition (trace-weighted 70.6% vs 79.1%). That is a property of the estimator, not of the data. A cluster therefore has to survive resampling to exist at all. Each output carries a `params` block and a `stability` report (per-cluster bootstrap Jaccard, per-trace confidence). Earlier files recorded no parameters, and an audit of 308 scenes recovered **14 different settings** in use — `run-cluster-audit` is what reconstructs them for any file predating `params`.
 - **Parameters are chosen on evidence, not by hand.** `run-cluster-sweep` scores a 12-point grid per scene by what share of its traces sit in a cluster that reproduces; `select-cluster-params` aggregates trace-weighted and takes the **largest k that still clears an 80% stability floor**. Maximising stability alone would pick the degenerate two-cluster collapse, so resolution is preferred and only traded away when the finer partition genuinely does not survive.
 - **Export once, serve statically.** The dashboard reads only `output_data/web/` — trace geometry and background images are baked there by `run-web-export`, so nothing at view time touches the 23 GB `mario.scenes` dataset. Re-export after re-clustering; `--force` overwrites existing payloads, and `--backfill` adds fields derivable from what the payload already holds without reading the source dataset at all.

@@ -538,6 +538,62 @@ def clean_coassociation(c):
 
 
 @task
+def run_practice_distances(c, scenes=None, smoke=False, force=False):
+    """Measure every attempt against its scene's cluster medoids.
+
+    Per scene: the medoid of each cluster, then for each attempt its distance to its
+    own cluster's medoid (d_own) and to the nearest medoid (d_nearest, and normalised
+    by that cluster's spread), each also leave-subject-out. Writes
+    output_data/practice/attempts/<scene>.csv. Reads only output_data/ (cluster files
+    and cached Fréchet matrices), so it needs run-clustering and never opens
+    mario.scenes.
+    """
+    from analysis.practice import run_practice_distances as _run
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    clusters_dir = output_dir / "clusters"
+    all_scenes = sorted(p.name[: -len("_clusters.json")]
+                        for p in clusters_dir.glob("*_clusters.json")) if clusters_dir.exists() else []
+    if not all_scenes:
+        print("No clustering output — run invoke run-clustering first.")
+        return
+    if smoke:
+        all_scenes = all_scenes[:1]
+    if scenes:
+        all_scenes = scenes.split(",")
+
+    _run(all_scenes, output_dir, force=force)
+
+
+@task
+def run_practice_models(c, measures="d_nearest_norm,d_own", min_attempts=10,
+                        smoke=False, force=False):
+    """Model the practice effect on the medoid distances.
+
+    Per series (subject x scene x cluster for d_own, subject x scene for
+    d_nearest_norm): linear / quadratic / power / exponential curves compared by
+    AICc. Per subject: a mixed model per measure (random intercept + slope per scene,
+    or per scene x cluster for d_own), raw and leave-subject-out, all attempts and
+    completed only, each on log(d) (primary, zeros dropped) and log1p(d) (original,
+    kept for comparison); fitted in parallel. Beside them, alternative random-effect
+    structures (scenes nested in levels, and its like-for-like scene-only twin) in
+    nested.json. Plus the strategy-switch trend. Writes
+    output_data/practice/{curves.csv,mixed.json,mixed_summary.csv,switching.json}. --smoke fits the
+    first five scenes with attempt files.
+    """
+    from analysis.practice import practice_dir, run_practice_models as _run
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    files = sorted((practice_dir(output_dir) / "attempts").glob("*.csv"))
+    if not files:
+        print("No attempt distances — run invoke run-practice-distances first.")
+        return
+    scenes = [f.stem for f in files[:5]] if smoke else None
+    _run(output_dir, measures=tuple(measures.split(",")),
+         min_attempts=int(min_attempts), scenes=scenes, force=force)
+
+
+@task
 def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=False):
     """Export clustered traces to a static payload for the browser dashboard.
 
@@ -545,7 +601,9 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
     needs the x/y polylines baked out of mario.scenes once. Writes one file per
     scene under output_data/web/data/scenes/, plus an index and a copy of the
     scene background PNGs, so the served tree never reaches back into the 23 GB
-    source dataset.
+    source dataset. Also copies the per-subject practice models
+    (output_data/practice/mixed.json) to data/practice.json for the dashboard's
+    stats section — on every run, --backfill included, since it is a small copy.
 
     Args:
         step:  keep every step-th frame (first and last always kept). Traces are
@@ -561,8 +619,9 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
                a change to either; a change to trace geometry or labels is a real
                re-export.
     """
-    from analysis.webexport import (backfill_derived, backfill_selection, export_scene,
-                                    list_clustered_scenes, sync_backgrounds, write_index)
+    from analysis.webexport import (backfill_derived, backfill_selection, export_practice,
+                                    export_scene, list_clustered_scenes, sync_backgrounds,
+                                    write_index)
     from analysis.trace_plots import default_background_dir, scene_entry_map
 
     source_dir = Path(c.config.get("source_data_dir"))
@@ -576,6 +635,7 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
             return
         backfill_derived(web_dir)
         backfill_selection(web_dir, output_dir)
+        export_practice(output_dir, web_dir)
         write_index(web_dir, source_dir)
         return
 
@@ -603,6 +663,7 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
     copied = sync_backgrounds(web_dir, source_dir)
     if copied:
         print(f"Copied {copied} scene background(s)")
+    export_practice(output_dir, web_dir)
     write_index(web_dir, source_dir)
 
 
@@ -671,7 +732,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_web_export, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_web_export, run_notebooks])
 def run(c):
     """Full pipeline.
 
@@ -682,7 +743,8 @@ def run(c):
     from airoh.provenance import record_run
 
     record_run(c, tasks="fetch,run-changepoints,run-changepoints-by-category,"
-                        "run-clustering,run-clustering-by-category,run-web-export,"
+                        "run-clustering,run-clustering-by-category,run-practice-distances,"
+                        "run-practice-models,run-web-export,"
                         "run-notebooks")
     print("Pipeline complete.")
 
@@ -711,6 +773,8 @@ def run_smoke(c):
     run_changepoints_by_category(c, smoke=True)  # first subject, per category
     run_clustering(c, smoke=True)                # first scene only
     run_clustering_by_category(c, smoke=True)    # first category only
+    run_practice_distances(c, smoke=True)        # medoid distances, first scene
+    run_practice_models(c, smoke=True)           # practice models on what exists
     run_web_export(c, smoke=True)                # dashboard payload, first scene
     run_notebooks(c)
 
@@ -786,6 +850,17 @@ def clean_stability(c):
 
 
 @task
+def clean_practice(c):
+    """Remove practice-effect outputs (medoid distances, fits and figures)."""
+    output_dir = Path(c.config.get("output_data_dir")) / "practice"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No practice output to clean.")
+
+
+@task
 def clean_frechet(c):
     """Remove cached Fréchet distance matrices.
 
@@ -801,7 +876,7 @@ def clean_frechet(c):
         print("No cached Fréchet matrices to clean.")
 
 
-@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_frechet])
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_practice, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass

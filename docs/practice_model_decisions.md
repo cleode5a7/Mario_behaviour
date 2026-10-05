@@ -277,10 +277,88 @@ conservative choice for the CIs; the main model remains the best-fitting descrip
 `output_data/practice/figure_practice_structures.png` shows the slopes and AIC side by
 side.
 
+## Full nested model in lme4: levels and the scene correlation together
+
+The statsmodels nested model above had to drop the scene intercept-slope correlation.
+R's `lme4` fits the model with both — `y ~ log(attempt) + (1 + log(attempt) | level) +
+(1 + log(attempt) | level:scene)` — by maximum likelihood, like every other fit here
+(`docs/practice_lme4.R`, run through `docs/practice_lme4.py`; needs R with lme4).
+
+**Cross-check first.** lme4 also refits the main scene-only model; it matches the
+statsmodels fit to within 1.4e-6 on the slope and 0.0002 on AIC, for every subject,
+transform and attempt set. The two programs agree, so the new model can be trusted on
+the same footing.
+
+| subject (`log(d)`) | main b | full nested b | nested 95% CI (profile) | CI width vs main | levels add anything? (LRT p) | clear? |
+|---|---|---|---|---|---|---|
+| 01 | −0.011 | −0.011 | [−0.033, +0.011] | 1.02 | yes (0.0002) | no |
+| 02 | −0.028 | −0.028 | [−0.047, −0.008] | 1.00 | no (1.0; level variance 0) | yes |
+| 03 | −0.037 | −0.037 | [−0.070, −0.003] | 1.35 | yes (0.04) | yes |
+| 05 | −0.064 | −0.066 | [−0.091, −0.043] | 1.14 | borderline (0.055) | yes |
+| 06 | −0.060 | −0.062 | [−0.086, −0.039] | 1.11 | no (0.44) | yes |
+
+- **Conclusions unchanged**, under both transforms and with completed attempts only.
+- **The widening matches** the level bootstrap and the statsmodels nested model (sub-03:
+  1.35 here, 1.34 level bootstrap, 1.37 statsmodels nested) — three methods agree.
+- **This resolves the earlier AIC puzzle.** The statsmodels nested model fit worse than
+  the main model only because it lacked the scene correlation; with it, the full nested
+  model is as good or better (AIC lower for sub-01, 03, 05; within ~6 for 02, 06).
+- **Singular fits** (sub-02 throughout, and some `log1p` / completed-only fits): lme4
+  estimates the level variances at zero, i.e. levels do not differ for that subject.
+  That is an answer, not a failure — for sub-02 the nested model reduces exactly to the
+  main one. The profile CI could not be computed for three of these fits; the Wald CI is
+  used there (the summary plot does the same).
+- Profile-likelihood CIs are reported because they do not rely on the slope's estimate
+  being normally distributed; they agree with the Wald CIs to within ~0.002.
+
+**Assumption checks for this model.** The same nine checks were run on the full nested
+model (`uv run python docs/practice_residual_diagnostics.py lme4`, figures
+`docs/practice_residual_diagnostics_lme4_log.png` / `_log1p.png`):
+
+| check | main model (`log(d)`) | full nested lme4 (`log(d)`) |
+|---|---|---|
+| trend shape (largest bin bias) | 0.035 | 0.035 |
+| independence (largest lag-1 r) | 0.04 | 0.04 |
+| residual skew / kurtosis | 0.44-1.03 / 3.9-5.4 | 0.44-1.03 / 3.9-5.4 |
+| spread, lowest to highest prediction | up to x1.97 | up to x1.98 |
+| most extreme scene effect | 9.4 SD | 9.4 SD |
+| scenes outside equal-variance funnel (shuffled p95) | 58-64% (35-39%) | 58-64% (35-39%) |
+| random-effect spread across worlds | within chance | within chance |
+| **level** effects bell-shaped (row 6) | — | yes, on the line |
+| row 9: level bootstrap width / this model's CI | — | **0.86-0.96**, every call unchanged |
+
+- **The residual picture is the same as the main model's**, to two or three decimals:
+  adding levels re-divides the scene differences between level and scene effects but
+  leaves each attempt's residual almost unchanged. So everything said above about the
+  main model's residuals — slope-protecting checks pass, CI-related ones partly fail —
+  holds for this model too.
+- **The level effects themselves look normal**, the one assumption this model adds.
+- **Row 9 compares this model's own CI with the level bootstrap** (the bootstrap that,
+  like this model, does not assume a level's scenes are independent). The bootstrap
+  intervals are slightly *narrower* (0.86-0.96x), so the nested model's CI is, if
+  anything, a little conservative — and no call changes. A bootstrap of the nested
+  model itself was not run (it would take hours of refits); the level bootstrap of the
+  scene-only model is the closest available check.
+
+**For the model choice** this is option C from the discussion: design-faithful (scenes
+within levels) and keeping the correlation the data need. It changes no conclusion and
+gives level-aware CIs from the model itself, so it is the natural primary model if R is
+acceptable in the analysis; the statsmodels main model with a level-bootstrap CI is the
+Python-only equivalent.
+
 ## Where everything is
+
+**Start with `docs/practice_summary.png`**: every confidence interval for the main result in
+one figure — the original `log1p` model, the full nested lme4 model and the bootstraps,
+then the same for `log(d)` plus the statsmodels nested model — with each interval's
+clear/not-clear call marked.
+Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refitting).
 
 | what | file |
 |---|---|
+| summary of every CI | `docs/practice_summary.png`, script `docs/practice_summary_plot.py` |
+| full nested model (lme4) | `docs/practice_lme4.csv`; scripts `docs/practice_lme4.py` (entry point) and `docs/practice_lme4.R` |
+| its assumption checks | `docs/practice_residual_diagnostics_lme4_log.png` / `_lme4_log1p.png` (+ `.csv`); residuals from `docs/practice_lme4_resid.R` |
 | model code | `analysis/practice.py` (`fit_mixed`, `TRANSFORMS`, `PRIMARY_TRANSFORM`) |
 | all fits, both transforms | `output_data/practice/mixed.json` |
 | nested (level + scene) and like-for-like fits | `output_data/practice/nested.json`; figure `output_data/practice/figure_practice_structures.png` |

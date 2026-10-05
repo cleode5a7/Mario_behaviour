@@ -1,4 +1,4 @@
-"""Exploratory: residual and random-effect diagnostics for the main practice model.
+"""Exploratory: residual and random-effect diagnostics for the practice models.
 
 Refits the primary model per subject (``<transform>(d_nearest_norm_loso) ~ log(attempt)``,
 random intercept + slope on log(attempt) per scene — the ``log`` form of
@@ -12,11 +12,25 @@ Verdicts are computed from those numbers (thresholds in ``verdicts()``), never w
 by hand, so the figure for each transform says what that transform's residuals show.
 Reads only ``output_data/practice/attempts/``; writes nothing under ``output_data/``.
 
+**lme4 mode.** With ``lme4`` the same nine checks run on the full nested model instead
+(``(1 + log(attempt) | level) + (1 + log(attempt) | level:scene)``, fitted in R by
+``docs/practice_lme4_resid.R`` on the same frames), into
+``docs/practice_residual_diagnostics_lme4_<transform>.png`` / ``.csv``. Residuals then net
+out the level's and the scene's effects; row 6 adds the level effects to the scene ones;
+and row 9 compares that model's own CI (``docs/practice_lme4.csv``: profile, Wald where the
+profile failed) with the level bootstrap — the bootstrap that, like this model, does not
+assume a level's scenes are independent. A bootstrap of the nested model itself (hours of
+refits) is not run.
+
     uv run python docs/practice_residual_diagnostics.py            # both transforms
     uv run python docs/practice_residual_diagnostics.py log        # one
+    uv run python docs/practice_residual_diagnostics.py lme4       # nested lme4 model, both
 """
 
+import shutil
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -29,7 +43,8 @@ import pandas as pd
 import statsmodels.formula.api as smf
 from scipy import stats
 
-from analysis.practice import PRIMARY, PRIMARY_TRANSFORM, TRANSFORMS, _fit_lmm, _mixed_frame, load_attempts
+from analysis.practice import (PRIMARY, PRIMARY_TRANSFORM, TRANSFORMS, _fit_lmm, _mixed_frame,
+                               level_of, load_attempts)
 from analysis.trace_plots import CLUSTER_COLORS, SUBJECT_COLORS
 
 HERE = Path(__file__).parent
@@ -85,10 +100,48 @@ ROWS = [
 BOOT_SUMMARY = Path(__file__).parent / "practice_scene_bootstrap.csv"
 BOOT_DRAWS = Path(__file__).parent / "practice_scene_bootstrap_draws.csv"
 LEVEL_SUMMARY = Path(__file__).parent / "practice_level_bootstrap.csv"
+LEVEL_DRAWS = Path(__file__).parent / "practice_level_bootstrap_draws.csv"
+LME4_SUMMARY = Path(__file__).parent / "practice_lme4.csv"
+LME4_ROW9 = ("9. Does it matter? (level bootstrap)",
+             "Is this model's CI right without its assumptions?",
+             "green lines at the pink band's edges",
+             "CI - the level bootstrap does not assume normal noise, nor that a level's scenes are independent")
 N_SHUFFLE = 200        # permutations behind the chance level in rows 7 and 8
 RNG_SEED = 0
 MIN_SCENE = 5          # scenes with fewer attempts have no usable residual SD
 MIN_WORLD = 10         # worlds with fewer scenes are drawn but not judged
+
+
+def fit_lme4_all(df, transform):
+    """{subject: (d, scene effects, level effects)} for the nested lme4 model, via R."""
+    if shutil.which("Rscript") is None:
+        sys.exit("Rscript not found - install R and lme4: sudo apt install r-base r-cran-lme4")
+    frames = {}
+    for s in sorted(df["subject"].unique()):
+        d = _mixed_frame(df, PRIMARY, s, transform=transform).reset_index(drop=True)
+        d["rid"] = np.arange(len(d))
+        d["level"] = d["group"].map(level_of)
+        frames[s] = d
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        pd.concat([d.assign(subject=s)[["subject", "rid", "y", "logt", "group", "level"]]
+                   .rename(columns={"group": "scene"}) for s, d in frames.items()]
+                  ).to_csv(tmp / "frames.csv", index=False)
+        subprocess.run(["Rscript", str(HERE / "practice_lme4_resid.R"), str(tmp / "frames.csv"),
+                        str(tmp / "resid.csv"), str(tmp / "ranef.csv")], check=True)
+        resid = pd.read_csv(tmp / "resid.csv", dtype={"subject": str})
+        ranef = pd.read_csv(tmp / "ranef.csv", dtype={"subject": str})
+    out = {}
+    for s, d in frames.items():
+        r = resid[resid["subject"] == s].set_index("rid").loc[d["rid"]]
+        attrs = d.attrs
+        d = d.assign(fit=r["fit"].values, res=r["res"].values).sort_values(["group", "attempt"])
+        d.attrs.update(attrs)
+        d["prev"] = d.groupby("group")["res"].shift()
+        re = ranef[(ranef["subject"] == s) & (ranef["kind"] == "scene")].set_index("id")[["u", "v"]]
+        lev = ranef[(ranef["subject"] == s) & (ranef["kind"] == "level")].set_index("id")[["u", "v"]]
+        out[s] = (d, re, lev)
+    return out
 
 
 def fit(df, subject, transform):
@@ -150,7 +203,9 @@ def boot_verdict(boot):
         return ("NOT RUN - run docs/practice_scene_bootstrap.py", WARN)
     flips = int((boot["model_excludes_zero"] != boot["boot_excludes_zero"]).sum())
     lo, hi = boot["width_ratio"].min(), boot["width_ratio"].max()
-    units = "scene + level" if "level" in set(boot.get("unit", [])) else "scene"
+    found = set(boot.get("unit", []))
+    units = ("level boot vs lme4" if found == {"level"} else
+             "scene + level" if "level" in found else "scene")
     if flips:
         return (f"CHANGES - {flips} call(s) flip ({units})", BAD)
     if lo >= 0.8 and hi <= 1.25:
@@ -171,32 +226,75 @@ def load_boot(transform):
     return (summ, draws) if len(summ) else (None, None)
 
 
-def run(df, transform):
-    boot, boot_draws = load_boot(transform)
+def load_lme4_vs_level(transform):
+    """Row 9 in lme4 mode: the nested model's CI against the level bootstrap.
+
+    Returns rows shaped like the bootstrap summary (model_* = the lme4 CI), plus the
+    level-bootstrap draws, so the same verdict and drawing code serve both modes."""
+    if not (LME4_SUMMARY.exists() and LEVEL_SUMMARY.exists() and LEVEL_DRAWS.exists()):
+        return None, None
+    m = pd.read_csv(LME4_SUMMARY, dtype={"subject": str})
+    m = m[(m["model"] == "nested") & (m["transform"] == transform) & ~m["completed_only"].astype(bool)]
+    lv = pd.read_csv(LEVEL_SUMMARY, dtype={"subject": str})
+    lv = lv[lv["transform"] == transform]
+    rows = []
+    for _, r in m.iterrows():
+        b = lv[lv["subject"] == r["subject"]]
+        if b.empty:
+            continue
+        b = b.iloc[0]
+        lo = r["profile_low"] if pd.notna(r["profile_low"]) else r["wald_low"]
+        hi = r["profile_high"] if pd.notna(r["profile_high"]) else r["wald_high"]
+        rows.append({"subject": r["subject"], "unit": "level", "b": r["b"],
+                     "model_ci_low": lo, "model_ci_high": hi,
+                     "boot_ci_low": b["boot_ci_low"], "boot_ci_high": b["boot_ci_high"],
+                     "width_ratio": (b["boot_ci_high"] - b["boot_ci_low"]) / (hi - lo),
+                     "model_excludes_zero": bool(hi < 0 or lo > 0),
+                     "boot_excludes_zero": bool(b["boot_excludes_zero"])})
+    draws = pd.read_csv(LEVEL_DRAWS, dtype={"subject": str})
+    return (pd.DataFrame(rows), draws[draws["transform"] == transform]) if rows else (None, None)
+
+
+def run(df, transform, model="scene"):
+    lme4 = model == "lme4"
+    boot, boot_draws = load_lme4_vs_level(transform) if lme4 else load_boot(transform)
+    fits = fit_lme4_all(df, transform) if lme4 else None
+    rows = ROWS[:-1] + [LME4_ROW9] if lme4 else ROWS
     subjects = sorted(df["subject"].unique())
     n = len(subjects)
-    fig = plt.figure(figsize=(3.7 * n, 3.55 * len(ROWS) + 1.4))
-    gs = fig.add_gridspec(len(ROWS), n, top=1 - 2.6 / (3.55 * len(ROWS) + 1.4),
+    fig = plt.figure(figsize=(3.7 * n, 3.55 * len(rows) + 1.4))
+    gs = fig.add_gridspec(len(rows), n, top=1 - 2.6 / (3.55 * len(rows) + 1.4),
                           bottom=0.02, left=0.05, right=0.99, hspace=0.95, wspace=0.32)
     role = "main analysis" if transform == PRIMARY_TRANSFORM else "original analysis, kept for comparison"
-    fig.suptitle(f"Residual checks: {transform}({PRIMARY}) ~ log(attempt), one LMM per subject "
-                 f"({role})", fontsize=15, fontweight="bold", y=0.997)
-    fig.text(0.5, 0.984, "A residual is observed - predicted (the scene's own u and v "
+    if lme4:
+        fig.suptitle(f"Residual checks: FULL NESTED lme4 model, {transform}({PRIMARY}) ~ log(attempt) "
+                     "+ (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)  "
+                     f"({role})", fontsize=14, fontweight="bold", y=0.997)
+    else:
+        fig.suptitle(f"Residual checks: {transform}({PRIMARY}) ~ log(attempt), one LMM per subject "
+                     f"({role})", fontsize=15, fontweight="bold", y=0.997)
+    effects = "the level's and the scene's u and v" if lme4 else "the scene's own u and v"
+    fig.text(0.5, 0.984, f"A residual is observed - predicted ({effects} "
              "included). If the model captured the structure, residuals look like "
              "patternless noise: centred on 0 everywhere, the same spread everywhere, "
              "independent, bell-shaped.", ha="center", fontsize=10.5, color="#444")
     fig.text(0.5, 0.976, "Each row says what a failure would affect: the SLOPE b itself, or only "
              "its CI (b right on average, uncertainty misjudged). Row 9 checks whether the CI "
-             "problems matter, with the scene bootstrap (docs/practice_scene_bootstrap.py).",
+             "problems matter, with " + ("the level bootstrap against this model's profile CI."
+                                         if lme4 else
+                                         "the scene bootstrap (docs/practice_scene_bootstrap.py)."),
              ha="center", fontsize=10.5, color="#1f3f73", style="italic")
 
     metrics = []
     for j, s in enumerate(subjects):
-        d, re = fit(df, s, transform)
+        if lme4:
+            d, re, lev = fits[s]
+        else:
+            (d, re), lev = fit(df, s, transform), None
         c = SUBJECT_COLORS[j]
         lo, hi = np.percentile(d["res"], [0.1, 99.9])
         lo, hi = min(lo, -1.0), max(hi, 1.5)
-        ax = [fig.add_subplot(gs[i, j]) for i in range(len(ROWS))]
+        ax = [fig.add_subplot(gs[i, j]) for i in range(len(rows))]
         classic, ax = ax[0], ax[1:]
 
         # 0. classic residuals-vs-fitted, with the decile mean and +-SD on top
@@ -272,7 +370,17 @@ def run(df, transform):
             zmax = max(zmax, float(z.abs().max()))
             (qm, qr), _ = stats.probplot(z, dist="norm")
             ax[5].plot(qm, qr, mk, ms=3, color=c, alpha=0.6 if col == "u" else 0.35,
-                       mfc=c if col == "u" else "none", label=lab)
+                       mfc=c if col == "u" else "none", label=("scene " + lab) if lme4 else lab)
+        if lev is not None and len(lev) > 2:
+            for col, mk, lab in (("u", "s", "level u"), ("v", "D", "level v")):
+                sd = lev[col].std()
+                if not sd > 0:
+                    continue        # a level variance estimated at zero: nothing to plot
+                z = (lev[col] - lev[col].mean()) / sd
+                zmax = max(zmax, float(z.abs().max()))
+                (qm, qr), _ = stats.probplot(z, dist="norm")
+                ax[5].plot(qm, qr, mk, ms=5, color="k", alpha=0.75,
+                           mfc="k" if col == "u" else "none", label=lab)
         line = np.array([-3.2, 3.2])
         ax[5].plot(line, line, color="red", lw=1)
         ax[5].set_xlabel("normal quantile", fontsize=8)
@@ -347,7 +455,8 @@ def run(df, transform):
                    transform=ax[7].transAxes, ha="right", va="top", fontsize=8.5, fontweight="bold")
 
         # 9. scene bootstrap: model CI (band) against bootstrap CI (lines), from saved draws
-        row = None if boot is None else boot[(boot["subject"] == s) & (boot["unit"] == "scene")]
+        row = None if boot is None else boot[(boot["subject"] == s)
+                                             & (boot["unit"] == ("level" if lme4 else "scene"))]
         if row is None or row.empty:
             ax[8].text(0.5, 0.5, "bootstrap not run\nfor this subject", ha="center", va="center",
                        transform=ax[8].transAxes, fontsize=9, color="#888")
@@ -356,20 +465,29 @@ def run(df, transform):
             r9 = row.iloc[0]
             x = boot_draws.loc[boot_draws["subject"] == s, "b"].dropna().values
             ax[8].hist(x, bins=30, color=c, alpha=0.7)
-            ax[8].axvspan(r9.model_ci_low, r9.model_ci_high, color=CLUSTER_COLORS[0], alpha=0.15,
-                          label="model CI")
-            ax[8].axvline(r9.boot_ci_low, color=CLUSTER_COLORS[1], lw=1.6, label="scene bootstrap CI")
-            ax[8].axvline(r9.boot_ci_high, color=CLUSTER_COLORS[1], lw=1.6)
+            if lme4:
+                ax[8].axvspan(r9.model_ci_low, r9.model_ci_high, color=CLUSTER_COLORS[4], alpha=0.2,
+                              label="lme4 nested CI")
+                ax[8].axvline(r9.boot_ci_low, color=CLUSTER_COLORS[2], lw=1.6, ls="--",
+                              label="level bootstrap CI")
+                ax[8].axvline(r9.boot_ci_high, color=CLUSTER_COLORS[2], lw=1.6, ls="--")
+            else:
+                ax[8].axvspan(r9.model_ci_low, r9.model_ci_high, color=CLUSTER_COLORS[0], alpha=0.15,
+                              label="model CI")
+                ax[8].axvline(r9.boot_ci_low, color=CLUSTER_COLORS[1], lw=1.6, label="scene bootstrap CI")
+                ax[8].axvline(r9.boot_ci_high, color=CLUSTER_COLORS[1], lw=1.6)
             ax[8].axvline(r9.b, color="k", lw=1.4, label="b")
-            lv = boot[(boot["subject"] == s) & (boot["unit"] == "level")]
+            lv = boot[(boot["subject"] == s) & (boot["unit"] == "level")] if not lme4 else boot.iloc[0:0]
             if len(lv):
                 ax[8].axvline(lv.iloc[0].boot_ci_low, color=CLUSTER_COLORS[2], lw=1.4, ls="--",
                               label="level bootstrap CI")
                 ax[8].axvline(lv.iloc[0].boot_ci_high, color=CLUSTER_COLORS[2], lw=1.4, ls="--")
             ax[8].axvline(0, color="#898781", lw=1, ls=":")
-            ax[8].set_xlabel("bootstrap slope b (200 scene resamples)", fontsize=8)
+            ax[8].set_xlabel("bootstrap slope b (200 " + ("level" if lme4 else "scene")
+                             + " resamples)", fontsize=8)
             ax[8].set_ylabel("replicates", fontsize=8)
-            txt = f"scene x{r9.width_ratio:.2f}"
+            txt = (f"level boot / lme4 x{r9.width_ratio:.2f}" if lme4
+                   else f"scene x{r9.width_ratio:.2f}")
             if len(lv):
                 txt += f"\nlevel x{lv.iloc[0].width_ratio:.2f}"
             ax[8].text(0.03, 0.92, txt, transform=ax[8].transAxes, fontsize=8.5,
@@ -393,7 +511,7 @@ def run(df, transform):
         })
 
     metrics = pd.DataFrame(metrics)
-    for i, ((title, q, look, affects), (verdict, vc)) in enumerate(zip(ROWS, verdicts(metrics, boot))):
+    for i, ((title, q, look, affects), (verdict, vc)) in enumerate(zip(rows, verdicts(metrics, boot))):
         bbox = gs[i, 0].get_position(fig)
         y = bbox.y1 + (0.036 if i == 0 else 0.03)
         fig.text(0.012, y, title, fontsize=12.5, fontweight="bold", va="bottom")
@@ -404,7 +522,7 @@ def run(df, transform):
         fig.text(0.012, y - 0.0045, f"If violated, affects: {affects}", fontsize=9.5,
                  color="#1f3f73", style="italic", va="top")
 
-    out = HERE / f"practice_residual_diagnostics_{transform}.png"
+    out = HERE / f"practice_residual_diagnostics_{'lme4_' if lme4 else ''}{transform}.png"
     fig.savefig(out, dpi=110)
     plt.close(fig)
     metrics.round(4).to_csv(out.with_suffix(".csv"), index=False)
@@ -412,9 +530,11 @@ def run(df, transform):
 
 
 def main():
+    args = sys.argv[1:]
+    model = "lme4" if "lme4" in args else "scene"
     df = load_attempts(Path("output_data"))
-    for transform in sys.argv[1:] or list(TRANSFORMS):
-        run(df, transform)
+    for transform in [a for a in args if a in TRANSFORMS] or list(TRANSFORMS):
+        run(df, transform, model)
 
 
 if __name__ == "__main__":

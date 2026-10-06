@@ -44,10 +44,11 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `run-coassociation`           | Store each scene's co-association (consensus) matrix; feeds the dashboard's Co-association view |
 | `run-practice-distances`      | Measure each attempt's Fréchet distance to its cluster's medoid and to the nearest medoid (plus leave-subject-out), per scene |
 | `run-practice-models`         | Model the practice effect on those distances: per-series curve comparison (linear/quadratic/power/exponential), one mixed model per subject, strategy-switch trend |
+| `run-practice-lme4`           | Fit the practice models in R's lme4 — the primary model (scenes nested in levels) and the within-route model (needs R with lme4; skips without it) |
 | `run-web-export`              | Export clustered traces to a static payload for the interactive dashboard |
 | `dashboard`                   | Serve the interactive clustering and stats dashboard on `localhost` (needs `run-web-export`) |
 | `run-notebooks`               | Execute notebooks and save figures to `output_data/`                     |
-| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → practice-distances → practice-models → web-export → notebooks |
+| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → practice-distances → practice-models → practice-lme4 → web-export → notebooks |
 | `run-smoke`                   | Minimal end-to-end pass (first subject/scene/category only) to verify pipeline wiring |
 | `verify`                      | Check that the code, config, data and docs still agree (run before committing) |
 | `list-scenes-task`            | Print all scene IDs, one per line (used to build SLURM array inputs)     |
@@ -102,9 +103,11 @@ stage or an outcome, hover a trajectory for its clip details, and click to isola
 **Stats analysis** (the switch at the top of the sidebar, or `http://localhost:8000/#stats`)
 shows the practice-effect models from `run-practice-models` — one mixed model per
 subject: the practice coefficient with its 95% CI (raw medoids against
-leave-subject-out), each subject's fitted curve, linear against log per subject, and a
-results table. Measure, practice form and attempts (all / completed) pick which stored
-fit is drawn; nothing is refitted. It reads `output_data/web/data/practice.json`, which
+leave-subject-out), each subject's fitted curve, and a results table. Measure, practice form and attempts (all / completed) pick which stored
+fit is drawn; nothing is refitted. A **Model** switch picks the full nested lme4 model (the
+main analysis, default), the scene-only statsmodels model or the statsmodels nested model,
+and a summary view at the top shows every CI and p-value for the main result — models and
+bootstraps side by side. It reads `output_data/web/data/practice.json`, which
 `run-web-export` (or `run-web-export --backfill`) copies in.
 
 **Colour by** offers cluster, outcome, subject, **attempt #** or **stage**. The attempt

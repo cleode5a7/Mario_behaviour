@@ -17,8 +17,9 @@ Reads only ``output_data/practice/attempts/``; writes nothing under ``output_dat
 ``docs/practice_lme4_resid.R`` on the same frames), into
 ``docs/practice_residual_diagnostics_lme4_<transform>.png`` / ``.csv``. Residuals then net
 out the level's and the scene's effects; row 6 adds the level effects to the scene ones;
-and row 9 compares that model's own CI (``docs/practice_lme4.csv``: profile, Wald where the
-profile failed) with the level bootstrap — the bootstrap that, like this model, does not
+and row 9 compares that model's own CI (the ``lme4_nested`` rows of
+``output_data/practice/mixed_summary.csv``, from ``invoke run-practice-lme4``: profile, Wald
+where the profile failed) with the level bootstrap — the bootstrap that, like this model, does not
 assume a level's scenes are independent. A bootstrap of the nested model itself (hours of
 refits) is not run.
 
@@ -101,7 +102,7 @@ BOOT_SUMMARY = Path(__file__).parent / "practice_scene_bootstrap.csv"
 BOOT_DRAWS = Path(__file__).parent / "practice_scene_bootstrap_draws.csv"
 LEVEL_SUMMARY = Path(__file__).parent / "practice_level_bootstrap.csv"
 LEVEL_DRAWS = Path(__file__).parent / "practice_level_bootstrap_draws.csv"
-LME4_SUMMARY = Path(__file__).parent / "practice_lme4.csv"
+MIXED_SUMMARY = Path(__file__).resolve().parent.parent / "output_data" / "practice" / "mixed_summary.csv"
 LME4_ROW9 = ("9. Does it matter? (level bootstrap)",
              "Is this model's CI right without its assumptions?",
              "green lines at the pink band's edges",
@@ -231,10 +232,11 @@ def load_lme4_vs_level(transform):
 
     Returns rows shaped like the bootstrap summary (model_* = the lme4 CI), plus the
     level-bootstrap draws, so the same verdict and drawing code serve both modes."""
-    if not (LME4_SUMMARY.exists() and LEVEL_SUMMARY.exists() and LEVEL_DRAWS.exists()):
+    if not (MIXED_SUMMARY.exists() and LEVEL_SUMMARY.exists() and LEVEL_DRAWS.exists()):
         return None, None
-    m = pd.read_csv(LME4_SUMMARY, dtype={"subject": str})
-    m = m[(m["model"] == "nested") & (m["transform"] == transform) & ~m["completed_only"].astype(bool)]
+    m = pd.read_csv(MIXED_SUMMARY, dtype={"subject": str})
+    m = m[(m["structure"] == "lme4_nested") & (m["measure"] == PRIMARY)
+          & (m["transform"] == transform) & ~m["completed_only"].astype(bool)]
     lv = pd.read_csv(LEVEL_SUMMARY, dtype={"subject": str})
     lv = lv[lv["transform"] == transform]
     rows = []
@@ -243,9 +245,8 @@ def load_lme4_vs_level(transform):
         if b.empty:
             continue
         b = b.iloc[0]
-        lo = r["profile_low"] if pd.notna(r["profile_low"]) else r["wald_low"]
-        hi = r["profile_high"] if pd.notna(r["profile_high"]) else r["wald_high"]
-        rows.append({"subject": r["subject"], "unit": "level", "b": r["b"],
+        lo, hi = r["slope_ci_low"], r["slope_ci_high"]
+        rows.append({"subject": r["subject"], "unit": "level", "b": r["slope"],
                      "model_ci_low": lo, "model_ci_high": hi,
                      "boot_ci_low": b["boot_ci_low"], "boot_ci_high": b["boot_ci_high"],
                      "width_ratio": (b["boot_ci_high"] - b["boot_ci_low"]) / (hi - lo),

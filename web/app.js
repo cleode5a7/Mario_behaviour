@@ -88,7 +88,7 @@ const state = {
   zoom: 1,
   pan: { x: 0, y: 0 },
   section: "clustering",   // or "stats": the practice-model section
-  stats: { measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all" },
+  stats: { model: "lme4_nested", measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all" },
   statsSubjectColors: new Map(),
 };
 
@@ -906,7 +906,7 @@ async function selectScene(id) {
   const token = ++sceneToken;
   let payload = sceneCache.get(id);
   if (!payload) {
-    const res = await fetch(`data/scenes/${id}.json`);
+    const res = await fetch(`data/scenes/${id}.json`, { cache: "no-cache" });
     if (!res.ok) { console.error("failed to load scene", id); return; }
     payload = await res.json();
     sceneCache.set(id, payload);
@@ -1005,7 +1005,7 @@ const matrixCache = new Map();   // scene id -> Uint8Array
 
 async function loadCoassoc(sceneId) {
   if (matrixCache.has(sceneId)) return matrixCache.get(sceneId);
-  const res = await fetch(`data/coassoc/${sceneId}.bin`);
+  const res = await fetch(`data/coassoc/${sceneId}.bin`, { cache: "no-cache" });
   if (!res.ok) throw new Error(`no co-association matrix for ${sceneId}`);
   const buf = new Uint8Array(await res.arrayBuffer());
   matrixCache.set(sceneId, buf);
@@ -1807,7 +1807,6 @@ const STATS_SERIES = [
   { suffix: "", label: "all-subject medoids", color: CLUSTER_COLORS[0] },
   { suffix: "_loso", label: "leave-subject-out", color: CLUSTER_COLORS[1] },
 ];
-const FORM_COLORS = { linear: CLUSTER_COLORS[2], log: CLUSTER_COLORS[3] };
 const SLOPE_TERM = { linear: "t", quadratic: "t", log: "logt", log_phase: "logt" };
 const MEASURE_INFO = {
   d_nearest_norm: { name: "distance to nearest medoid / its spread",
@@ -1842,6 +1841,68 @@ function niceTicks(lo, hi, n) {
 const signed = (v, d = 4) => (v == null ? "—" : `${v < 0 ? "−" : "+"}${Math.abs(v).toFixed(d)}`);
 const fmtP = (p) => (p == null ? "—" : p < 0.0001 ? "<0.0001" : p.toFixed(4));
 const subjColor = (s) => state.statsSubjectColors.get(s) || NOISE_COLOR;
+
+/* The three models the Model control switches between. Only the main statsmodels model
+ * was fitted in every practice form and for the own-medoid measure; the nested ones are
+ * log form and nearest/spread only, so the other controls are disabled for them. */
+const STATS_MODELS = {
+  lme4_nested: { label: "full nested lme4", short: "full nested (lme4)",
+                 formula: "(1 + log(attempt) | level) + (1 + log(attempt) | level:scene), fitted in R's lme4" },
+  scene: { label: "scene only (statsmodels)", short: "scene only",
+           formula: "(1 + practice | scene), the first model, fitted in statsmodels" },
+  level_scene: { label: "nested, no scene correlation (statsmodels)", short: "nested, no corr.",
+                 formula: "levels + scenes, scene intercept and slope uncorrelated (all statsmodels can nest)" },
+  lme4_route: { label: "within-route lme4 (secondary)", short: "within-route (lme4)",
+                formula: "distance in px to the attempt's OWN route prototype against the nth use of that " +
+                         "route, with (1 + log(use) | level) + (1 + log(use) | level:scene) + " +
+                         "(1 + log(use) | level:scene:route), fitted in R's lme4; Wald CIs" },
+};
+const SUMMARY_COLORS = { lme4: CLUSTER_COLORS[4], model: CLUSTER_COLORS[0], nested: CLUSTER_COLORS[6],
+                         scene_boot: CLUSTER_COLORS[1], level_boot: CLUSTER_COLORS[2] };
+const SUMMARY_LABELS = { lme4: "full nested (lme4) — main", model: "scene only (statsmodels)",
+                         nested: "nested, no scene corr. (statsmodels)", scene_boot: "scene bootstrap",
+                         level_boot: "level bootstrap" };
+
+/* One fit of the selected model as {meta, r}: r carries coef / ci / p (keyed by the
+ * form's slope term), curve and converged, whatever model it came from. */
+function modelFit(measure, subject) {
+  const { model, form, transform } = state.stats;
+  const completed = state.stats.attempts === "completed";
+  if (model === "scene") {
+    const f = statsFit(measure, subject);
+    return f ? { meta: f, r: f.forms[form] } : null;
+  }
+  if (form !== "log") return null;
+  if (model === "lme4_route") {
+    const f = statsData.lme4_route && statsData.lme4_route.fits.find((x) => x.measure === measure
+      && x.subject === subject && x.transform === transform && x.completed_only === completed);
+    if (!f) return null;
+    return {
+      meta: { n_obs: f.n_obs, n_groups: f.n_routes, n_levels: f.n_levels,
+              n_zero_dropped: f.n_zero_dropped, best_form: null, ci_method: f.ci_method,
+              singular: f.singular },
+      r: { coef: { Intercept: f.intercept, logt: f.b }, ci: { logt: f.ci }, p: { logt: f.p_wald },
+           curve: f.curve, converged: !f.warnings },
+    };
+  }
+  if (model === "lme4_nested") {
+    const f = statsData.lme4 && statsData.lme4.fits.find((x) => x.model === "nested"
+      && x.measure === measure && x.subject === subject && x.transform === transform
+      && x.completed_only === completed);
+    if (!f) return null;
+    return {
+      meta: { n_obs: f.n_obs, n_groups: f.n_scenes, n_levels: f.n_levels,
+              n_zero_dropped: f.n_zero_dropped, best_form: null, ci_method: f.ci_method,
+              singular: f.singular, lrt_p: f.lrt_p },
+      r: { coef: { Intercept: f.intercept, logt: f.b }, ci: { logt: f.ci }, p: { logt: f.p_wald },
+           curve: f.curve, converged: !f.warnings },
+    };
+  }
+  const f = statsData.nested && statsData.nested.fits.find((x) => x.structure === model
+    && x.measure === measure && x.subject === subject && x.transform === transform
+    && x.completed_only === completed);
+  return f && f.coef ? { meta: { ...f, best_form: null }, r: f } : null;
+}
 
 function statsFit(measure, subject) {
   const completed = state.stats.attempts === "completed";
@@ -1894,9 +1955,10 @@ function renderStatsCoef() {
   const pts = [];
   subjects.forEach((s, i) => {
     STATS_SERIES.forEach((ser, j) => {
-      const f = statsFit(measure + ser.suffix, s);
-      const r = f && f.forms[form];
+      const fit = modelFit(measure + ser.suffix, s);
+      const r = fit && fit.r;
       if (!r || !r.coef) return;
+      const f = { ...fit.meta, measure: measure + ser.suffix };
       pts.push({ s, i, j, ser, f, r, b: r.coef[term], lo: r.ci[term][0], hi: r.ci[term][1] });
     });
   });
@@ -1919,7 +1981,8 @@ function renderStatsCoef() {
   }
   svgEl("line", { x1: px(0), x2: px(0), y1: pad.t - 4, y2: h - pad.b, class: "zero" }, svg);
   svgEl("text", { x: (pad.l + w - pad.r) / 2, y: h - 8, "text-anchor": "middle", class: "axis-label" }, svg)
-    .textContent = (form === "log" ? "log(attempt) coefficient" : "coefficient per 10 attempts") +
+    .textContent = (state.stats.model === "lme4_route" ? "log(nth use of route) coefficient"
+                    : form === "log" ? "log(attempt) coefficient" : "coefficient per 10 attempts") +
       `, ${state.stats.transform} units — left of 0 = closer to the prototypes with practice`;
   subjects.forEach((s, i) => {
     svgEl("text", { x: pad.l - 10, y: rowY(i) + 4, "text-anchor": "end", class: "row-label" }, svg)
@@ -1947,7 +2010,7 @@ function renderStatsCoef() {
       ["CI excludes 0", clear ? "yes" : "no"],
       ["attempts", p.f.n_obs.toLocaleString()],
       [measure === "d_own" ? "scene × cluster series" : "scenes", p.f.n_groups.toLocaleString()],
-      ["AIC-best form", p.f.best_form || "—"],
+      ["CI method", p.f.ci_method === "wald" ? "Wald (profile failed)" : p.f.ci_method ? "profile likelihood" : "Wald"],
       ["converged", p.r.converged ? "yes" : "no"],
     ];
     hit.addEventListener("mousemove", (ev) =>
@@ -1957,7 +2020,8 @@ function renderStatsCoef() {
 
   $("stats-coef-legend").innerHTML = legendHTML(STATS_SERIES.map((s) => [s.color, s.label]), true);
   $("stats-coef-cap").textContent =
-    `Each dot is one subject's practice coefficient b in the ${form} form, with its 95% ` +
+    `Each dot is one subject's practice coefficient b in the ${form} form under the ` +
+    `${STATS_MODELS[state.stats.model].label} model, with its 95% ` +
     "confidence interval. Left of the dashed zero line means attempts moved closer to the " +
     "cluster prototypes with practice; an interval that crosses it is no clear change. Blue " +
     "measures against medoids chosen from all five players, orange against medoids chosen " +
@@ -2064,8 +2128,8 @@ function renderStatsCurves() {
   const info = MEASURE_INFO[measure];
   const series = [];
   for (const s of statsData.subjects) {
-    const f = statsFit(`${measure}_loso`, s);
-    const r = f && f.forms[form];
+    const fit = modelFit(`${measure}_loso`, s);
+    const r = fit && fit.r;
     if (r && r.curve) series.push({ label: `sub-${s}`, color: subjColor(s), points: curvePoints(r) });
   }
   const host = $("stats-curves");
@@ -2073,61 +2137,27 @@ function renderStatsCurves() {
   drawLineChart(host, {
     series, height: 340, digits: info.digits,
     yDomain: paddedDomain(series.flatMap((s) => s.points.map((p) => p[1])), info.ref),
-    yLabel: `${info.name} (${info.unit})`, xLabel: "attempt at a scene (restarts at 1 for every scene)",
+    yLabel: `${info.name} (${info.unit})`,
+    xLabel: state.stats.model === "lme4_route"
+      ? "nth use of the route at that scene (each route's own count)"
+      : "attempt at a scene (restarts at 1 for every scene)",
     ref: info.ref, refLabel: info.ref != null ? "1.0 = typical cluster member" : null,
     aria: `${form}-form fitted curve per subject`,
   });
   $("stats-curve-legend").innerHTML = legendHTML(series.map((s) => [s.color, s.label]));
   $("stats-curve-cap").textContent =
-    `Each line is one subject's fitted ${form}-form line — the average scene, with every ` +
-    `scene's own adjustments set to zero — converted back from ${state.stats.transform} to ` +
+    `Each line is one subject's fitted ${form}-form line under the ${STATS_MODELS[state.stats.model].label} ` +
+    "model — the average scene" + (state.stats.model === "scene" ? "" : " and level") +
+    `, with their own adjustments set to zero — converted back from ${state.stats.transform} to ` +
     (measure === "d_nearest_norm"
       ? "the distance ratio (0 would be the medoid itself, 1 a typical member). "
       : "Fréchet distance in pixels. ") +
-    "Each stops at that subject's 95th-percentile attempt at a scene, past which few scenes " +
+    (state.stats.model === "lme4_route"
+      ? "Here practice is the nth use of a route, and the distance is always to that route's own " +
+        "prototype, so the origin never changes along a series: a fall is tighter execution of a route. "
+      : "") +
+    "Each stops at that subject's 95th percentile of practice, past which few scenes " +
     "still contribute. The y-axis is zoomed to the data, so drops look steeper than they are.";
-}
-
-function renderStatsForms() {
-  const { measure } = state.stats;
-  const info = MEASURE_INFO[measure];
-  const host = $("stats-forms");
-  host.innerHTML = "";
-  const panels = [];
-  for (const s of statsData.subjects) {
-    const f = statsFit(`${measure}_loso`, s);
-    if (!f) continue;
-    const series = ["linear", "log"].filter((k) => f.forms[k] && f.forms[k].curve).map((k) => ({
-      label: k, color: FORM_COLORS[k], points: curvePoints(f.forms[k]) }));
-    const d = f.forms.linear && f.forms.log && f.forms.linear.aic != null
-      ? f.forms.linear.aic - f.forms.log.aic : null;
-    panels.push({ s, f, series, d });
-  }
-  const yDomain = paddedDomain(panels.flatMap((p) => p.series.flatMap((s) => s.points.map((q) => q[1]))),
-                               info.ref);
-  // Every box goes into the grid before any is measured: a box drawn while it is
-  // still the grid's only child reads the full row as its width, and its viewBox is
-  // then squeezed into one column.
-  for (const p of panels) {
-    p.box = document.createElement("div");
-    p.box.className = "stats-chart";
-    host.appendChild(p.box);
-  }
-  for (const p of panels) {
-    const box = p.box;
-    const verdict = p.d == null ? "" : Math.abs(p.d) < 2 ? "tie" : p.d > 0 ? "log fits better" : "linear fits better";
-    drawLineChart(box, {
-      series: p.series, yDomain, height: 210, digits: info.digits, ref: info.ref,
-      title: `sub-${p.s} <span class="muted">· ΔAIC lin−log ${p.d == null ? "—" : signed(p.d, 0)} · ${verdict}</span>`,
-      aria: `sub-${p.s}: linear and log fitted curves`,
-    });
-  }
-  $("stats-forms-legend").innerHTML = legendHTML(["linear", "log"].map((k) => [FORM_COLORS[k], k]));
-  $("stats-forms-cap").textContent =
-    "The same subject's model in both forms, for the leave-subject-out measure, on one shared " +
-    "y-axis. ΔAIC is linear minus log: positive means log fits better, negative linear, and a " +
-    "difference under ~2 is a tie. AIC scores the whole model, scene-to-scene variation " +
-    "included, so a large ΔAIC can sit under two curves that look alike.";
 }
 
 function renderStatsTable() {
@@ -2135,18 +2165,20 @@ function renderStatsTable() {
   const info = MEASURE_INFO[measure];
   const term = SLOPE_TERM[form];
   const head = ["subject", "medoids", "coefficient", "95% CI", "p", "CI excludes 0",
-                `at attempt 1 (${info.unit})`, `at attempt ${STATS_AT} (${info.unit})`,
-                "AIC-best form", "ΔAIC lin−log", "attempts", "zeros dropped",
-                measure === "d_own" ? "series" : "scenes", "converged"];
+                `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} 1 (${info.unit})`,
+                `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} ${STATS_AT} (${info.unit})`,
+                "attempts", "zeros dropped",
+                state.stats.model === "lme4_route" ? "routes" : measure === "d_own" ? "series" : "scenes",
+                "converged"];
   const rows = [];
   for (const s of statsData.subjects) {
     for (const ser of [...STATS_SERIES].reverse()) {
-      const f = statsFit(measure + ser.suffix, s);
-      const r = f && f.forms[form];
+      const fit = modelFit(measure + ser.suffix, s);
+      const r = fit && fit.r;
       if (!r || !r.coef) continue;
+      const f = fit.meta;
       const [lo, hi] = r.ci[term];
       const clear = hi < 0 || lo > 0;
-      const d = f.forms.linear && f.forms.log ? f.forms.linear.aic - f.forms.log.aic : null;
       rows.push(`<tr class="${ser.suffix ? "loso" : ""}">` +
         `<td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
         `<td>${ser.suffix ? "leave-subject-out" : "all-subject"}</td>` +
@@ -2155,14 +2187,151 @@ function renderStatsTable() {
         `<td class="${clear ? "clear" : "unclear"}">${clear ? "yes" : "no"}</td>` +
         `<td>${statsPredict(r.coef, form, 1).toFixed(info.digits)}</td>` +
         `<td>${statsPredict(r.coef, form, STATS_AT).toFixed(info.digits)}</td>` +
-        `<td>${f.best_form || "—"}</td><td>${d == null ? "—" : signed(d, 1)}</td>` +
         `<td>${f.n_obs.toLocaleString()}</td><td>${(f.n_zero_dropped || 0).toLocaleString()}</td>` +
         `<td>${f.n_groups.toLocaleString()}</td>` +
-        `<td>${r.converged ? "yes" : "no"}</td></tr>`);
+        `<td>${r.converged ? (f.singular ? "yes (singular)" : "yes") : "no"}</td></tr>`);
     }
   }
   $("stats-table").innerHTML =
     `<thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody>`;
+}
+
+/* The summary view: every CI and p-value for the main result (primary measure, all
+ * attempts, log form), per transform — the dashboard twin of docs/practice_summary.png. */
+function renderStatsSummary() {
+  const sum = statsData.summary;
+  const block = $("stats-summary-block");
+  block.hidden = !sum;
+  if (!sum) return;
+  const host = $("stats-summary");
+  host.innerHTML = "";
+  const order = ["log", "log1p"].filter((t) => sum.by_transform[t]);
+  const methods = sum.methods.filter((m) => order.some((t) =>
+    Object.values(sum.by_transform[t]).some((x) => x[m])));
+  const boxes = order.map((t) => {
+    const box = document.createElement("div");
+    box.className = "stats-chart";
+    host.appendChild(box);
+    return [t, box];
+  });
+  for (const [t, box] of boxes) {
+    const bt = sum.by_transform[t];
+    const subjects = Object.keys(bt).sort();
+    const title = document.createElement("div");
+    title.className = "panel-title";
+    title.innerHTML = t === "log" ? "Main analysis: log(d)" : "Original analysis: log(1 + d)";
+    box.appendChild(title);
+    const w = box.clientWidth || 600, rowH = 22 * methods.length + 16;
+    const pad = { l: 58, r: 14, t: 8, b: 34 };
+    const h = pad.t + subjects.length * rowH + pad.b;
+    const all = subjects.flatMap((s) => methods.filter((m) => bt[s][m]).flatMap((m) => [bt[s][m].lo, bt[s][m].hi]));
+    let lo = Math.min(0, ...all), hi = Math.max(0, ...all);
+    const mg = (hi - lo) * 0.05; lo -= mg; hi += mg;
+    const px = (v) => pad.l + ((w - pad.l - pad.r) * (v - lo)) / (hi - lo);
+    const svg = svgEl("svg", { viewBox: `0 0 ${w} ${h}`, height: h, role: "img",
+                               "aria-label": `practice slope by method, ${t}` }, box);
+    for (const v of niceTicks(lo, hi, 5)) {
+      svgEl("line", { x1: px(v), x2: px(v), y1: pad.t, y2: h - pad.b, class: "grid" }, svg);
+      svgEl("text", { x: px(v), y: h - pad.b + 14, "text-anchor": "middle", class: "tick" }, svg)
+        .textContent = v === 0 ? "0" : signed(v, 3).replace("+", "");
+    }
+    svgEl("line", { x1: px(0), x2: px(0), y1: pad.t, y2: h - pad.b, class: "zero" }, svg);
+    svgEl("text", { x: (pad.l + w - pad.r) / 2, y: h - 6, "text-anchor": "middle", class: "axis-label" }, svg)
+      .textContent = `practice slope b (${t} units)`;
+    subjects.forEach((s, i) => {
+      const y0 = pad.t + i * rowH;
+      svgEl("text", { x: pad.l - 8, y: y0 + rowH / 2 + 4, "text-anchor": "end", class: "row-label" }, svg)
+        .textContent = `sub-${s}`;
+      if (i) svgEl("line", { x1: 0, x2: w, y1: y0, y2: y0, class: "grid" }, svg);
+      methods.forEach((m, k) => {
+        const v = bt[s][m];
+        if (!v) return;
+        const y = y0 + 8 + k * 22 + 4, col = SUMMARY_COLORS[m];
+        const clear = v.hi < 0 || v.lo > 0;
+        svgEl("line", { x1: px(v.lo), x2: px(v.hi), y1: y, y2: y, stroke: col, "stroke-width": 2.2,
+                        "stroke-linecap": "round" }, svg);
+        svgEl("circle", { cx: px(v.b), cy: y, r: 4.5, fill: clear ? col : "var(--surface-2)",
+                          stroke: col, "stroke-width": 1.8 }, svg);
+        const hit = svgEl("rect", { x: px(v.lo) - 6, y: y - 7, width: px(v.hi) - px(v.lo) + 12,
+                                    height: 14, class: "hit" }, svg);
+        const rows = [["slope b", signed(v.b)], ["95% CI", `${signed(v.lo)} to ${signed(v.hi)}`],
+                      ["p", v.p_floor ? `< ${v.p.toFixed(2)}` : fmtP(v.p)],
+                      ["clear effect", clear ? "yes" : "no"]];
+        if (v.p_holm != null) rows.push(["p, Holm-adjusted", fmtP(v.p_holm)]);
+        hit.addEventListener("mousemove", (ev) =>
+          showStatsTooltip(`sub-${s} · ${SUMMARY_LABELS[m]}`, col, rows, ev.clientX, ev.clientY));
+        hit.addEventListener("mouseleave", hideStatsTooltip);
+      });
+    });
+  }
+  $("stats-summary-legend").innerHTML =
+    legendHTML(methods.map((m) => [SUMMARY_COLORS[m], SUMMARY_LABELS[m]]));
+  $("stats-sum-cap").textContent =
+    `${sum.measure}, log practice form, all attempts. Every bar is a 95% confidence interval for ` +
+    "the practice slope b from one method; filled = it clears zero (a clear effect), hollow = it " +
+    "does not. The two panels are in different units: compare calls and widths, never positions.";
+
+  // p-value table: transforms side by side, methods as columns, Holm after the scene model.
+  const cols = [];
+  for (const t of order) {
+    for (const m of methods) {
+      cols.push([t, m, "p"]);
+      if (Object.values(sum.by_transform[t]).some((x) => x[m] && x[m].p_holm != null)) cols.push([t, m, "p_holm"]);
+    }
+  }
+  const subjects = Object.keys(sum.by_transform[order[0]]).sort();
+  const groupHead = order.map((t) => {
+    const n = cols.filter((c) => c[0] === t).length;
+    return `<th colspan="${n}" class="grp">${t === "log" ? "main: log(d)" : "original: log(1 + d)"}</th>`;
+  }).join("");
+  const colHead = cols.map(([, m, k]) =>
+    `<th>${k === "p_holm" ? `${m === "lme4" ? "full nested" : "scene only"},<br>Holm-adjusted`
+                          : SUMMARY_LABELS[m].replace(" (", "<br>(").replace(" — main", "")}</th>`).join("");
+  const body = subjects.map((s) => `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
+    cols.map(([t, m, k]) => {
+      const v = (sum.by_transform[t][s] || {})[m];
+      if (!v || v[k] == null) return "<td>—</td>";
+      const p = v[k];
+      const txt = v.p_floor && k === "p" ? `< ${p.toFixed(2)}` : fmtP(p);
+      return `<td class="${p < 0.05 ? "clear" : "unclear"}">${txt}</td>`;
+    }).join("") + "</tr>").join("");
+  $("stats-ptable").innerHTML =
+    `<thead><tr><th></th>${groupHead}</tr><tr><th>subject</th>${colHead}</tr></thead><tbody>${body}</tbody>`;
+  $("stats-p-note").innerHTML =
+    "<strong>How each p-value is computed</strong> — every one a two-sided test of no practice effect (b = 0). " +
+    "<em>Fitted models</em> (full nested lme4, scene only, nested statsmodels): Wald z test, z = b / SE with the SE " +
+    "from the model, p from a normal curve; lme4's bars above are profile-likelihood CIs. " +
+    "<em>Holm-adjusted</em>: the main (full nested) model's p-values corrected for testing five subjects. " +
+    "<em>Bootstraps</em>: the share of 200 resampled slopes on the far side of zero, doubled; no normality " +
+    "assumed, and with 200 replicates the smallest it can show is 0.01. Bold = p < 0.05, the same call as an " +
+    "interval clearing zero. The columns are different methods for the same question, not repeated tests.";
+}
+
+/* Disable what the selected model was not fitted for, and fall back off it. */
+function applyStatsAvailability() {
+  const hasLme4 = !!(statsData && statsData.lme4);
+  const hasNested = !!(statsData && statsData.nested);
+  const hasRoute = !!(statsData && statsData.lme4_route);
+  const avail = { lme4_nested: hasLme4, scene: true, level_scene: hasNested, lme4_route: hasRoute };
+  if (!avail[state.stats.model]) state.stats.model = "scene";
+  const route = state.stats.model === "lme4_route";
+  const nestedModel = state.stats.model !== "scene";
+  if (nestedModel && state.stats.form !== "log") state.stats.form = "log";
+  // The within-route model exists for the own-medoid distance only; the other nested
+  // models for nearest/spread only.
+  if (route) state.stats.measure = "d_own";
+  else if (nestedModel && state.stats.measure === "d_own") state.stats.measure = "d_nearest_norm";
+  const sync = (id, key, disabledFor) => {
+    for (const b of $(id).querySelectorAll("button")) {
+      b.disabled = disabledFor(b.dataset.value);
+      b.setAttribute("aria-pressed", String(b.dataset.value === state.stats[key]));
+    }
+  };
+  sync("stats-model-seg", "model", (v) => !avail[v]);
+  sync("stats-form-seg", "form", (v) => nestedModel && v !== "log");
+  sync("stats-measure-seg", "measure", (v) => (route ? v !== "d_own" : nestedModel && v === "d_own"));
+  sync("stats-transform-seg", "transform", () => false);
+  sync("stats-attempts-seg", "attempts", () => false);
 }
 
 function renderStats() {
@@ -2175,7 +2344,7 @@ function renderStats() {
     $("chart-sub").textContent = "loading practice models…";
     if (!statsLoading) {
       statsLoading = true;
-      fetch("data/practice.json")
+      fetch("data/practice.json", { cache: "no-cache" })
         .then((res) => (res.ok ? res.json() : false))
         .catch(() => false)
         .then((data) => {
@@ -2199,29 +2368,37 @@ function renderStats() {
     return;
   }
 
-  const isPrimary = `${measure}_loso` === statsData.primary && form === "log" && attempts === "all"
-                    && transform === statsData.primary_transform;
+  applyStatsAvailability();
+  const primaryModel = statsData.lme4 ? "lme4_nested" : "scene";
+  const isPrimary = `${measure}_loso` === statsData.primary && state.stats.form === "log"
+                    && attempts === "all" && transform === statsData.primary_transform
+                    && state.stats.model === primaryModel;
   $("chart-sub").innerHTML =
-    `${MEASURE_INFO[measure].name} · ${transform}(d) · ${form} form · ` +
+    `${STATS_MODELS[state.stats.model].short} · ${MEASURE_INFO[measure].name} · ${transform}(d) · ` +
+    `${state.stats.form} form · ` +
     `${attempts === "all" ? "all attempts" : "completed attempts only"}` +
     ` · ${statsData.n_scenes} scenes · ` +
     (isPrimary ? "the main result" : '<span class="filtered">a robustness check, not the main result</span>');
+  renderStatsSummary();
   renderStatsCoef();
   renderStatsCurves();
-  renderStatsForms();
   renderStatsTable();
   $("stats-note").innerHTML =
-    "Each subject is fitted separately: <code>transform(distance) ~ practice term</code>, with a " +
-    "random intercept and a random slope on the same time term per scene (per scene × cluster " +
-    "for the own-medoid measure), by maximum likelihood. Coefficients are in the transform's " +
+    "Each subject is fitted separately, by maximum likelihood. The <strong>main model</strong> is the full " +
+    "nested lme4 model: <code>log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | " +
+    "level:scene)</code> — a level's scenes are played back to back, so scenes are nested in levels. " +
+    `Selected here: <em>${STATS_MODELS[state.stats.model].formula}</em>. ` +
+    "The scene-only statsmodels model (random intercept and slope on the same time term per scene, per " +
+    "scene × cluster for the own-medoid measure) is the one fitted in every form and measure. Coefficients are in the transform's " +
     "units, so compare <code>log</code> and <code>log1p</code> through the curves, not the slopes; " +
     "curves and the <em>at attempt</em> columns are converted back. Leave-subject-out " +
     "measures each subject against medoids and spreads chosen from the other subjects only. " +
     `The main result is <code>${statsData.primary}</code> on <code>${statsData.primary_transform}(d)</code> ` +
     "(attempts at exactly 0 dropped), log form, all attempts; <code>log1p</code> is the original " +
     "analysis, kept because its residuals were heavily right-skewed and the switch should stay traceable; " +
-    "everything else here is a check on it. Source: <code>output_data/practice/mixed.json</code> " +
-    "(flattened in <code>mixed_summary.csv</code>).";
+    "everything else here is a check on it. Sources: <code>output_data/practice/lme4.json</code>, " +
+    "<code>mixed.json</code>, <code>nested.json</code> (all flattened in <code>mixed_summary.csv</code>) and the " +
+    "bootstraps under <code>docs/</code>.";
 }
 
 function bindStats() {
@@ -2239,13 +2416,14 @@ function bindStats() {
     hideStatsTooltip();
     render();
   });
-  for (const [id, key] of [["stats-measure-seg", "measure"], ["stats-transform-seg", "transform"],
+  for (const [id, key] of [["stats-model-seg", "model"],
+                           ["stats-measure-seg", "measure"], ["stats-transform-seg", "transform"],
                            ["stats-form-seg", "form"],
                            ["stats-attempts-seg", "attempts"]]) {
     const seg = $(id);
     seg.addEventListener("click", (ev) => {
       const btn = ev.target.closest("button");
-      if (!btn) return;
+      if (!btn || btn.disabled) return;
       for (const b of seg.querySelectorAll("button")) {
         b.setAttribute("aria-pressed", String(b === btn));
       }
@@ -2259,7 +2437,7 @@ function bindStats() {
 /* ---------- boot ---------- */
 
 async function init() {
-  const res = await fetch("data/index.json");
+  const res = await fetch("data/index.json", { cache: "no-cache" });
   state.index = await res.json();
   state.filters.subjects = new Set(state.index.subjects);
   state.subjectColors = new Map(

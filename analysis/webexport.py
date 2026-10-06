@@ -416,23 +416,102 @@ def _rounded(obj, nd=6):
     return obj
 
 
+# Bootstrap results are exploratory and live under docs/ (docs/practice_scene_bootstrap.py);
+# the export reads them when present so the dashboard's summary view can show them.
+DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
+SUMMARY_METHODS = ("lme4", "model", "nested", "scene_boot", "level_boot")
+
+
+def _holm(p: dict) -> dict:
+    """Holm step-down adjustment of {key: p}."""
+    adj, running = {}, 0.0
+    for rank, k in enumerate(sorted(p, key=p.get)):
+        running = max(running, min(1.0, (len(p) - rank) * p[k]))
+        adj[k] = running
+    return adj
+
+
+def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None:
+    """Every CI and p-value for the primary measure, all attempts, per transform x subject.
+
+    The table behind docs/practice_summary.png, for the dashboard's summary view:
+    ``lme4`` (the primary, full nested model: profile CI, Wald p, and ``p_holm`` across
+    subjects), ``model`` (statsmodels scene-only model), ``nested`` (statsmodels nested, no
+    scene correlation), and, when ``docs/practice_*_bootstrap*.csv`` exist, ``scene_boot``
+    and ``level_boot`` (percentile CI; p = 2 x min(share >= 0, share <= 0), floored at the
+    replicate resolution and flagged ``p_floor``). Only ``log`` practice form.
+    """
+    import pandas as pd
+
+    path = Path(output_dir) / "practice" / "mixed_summary.csv"
+    if not path.exists():
+        return None
+    s = pd.read_csv(path, dtype={"subject": str})
+    primary = s.loc[s["primary"].astype(bool), "measure"]
+    measure = primary.iloc[0] if len(primary) else None
+    if measure is None:
+        return None
+    s = s[(s["measure"] == measure) & ~s["completed_only"].astype(bool) & (s["form"] == "log")]
+    out: dict = {}
+    names = {"lme4_nested": "lme4", "scene": "model", "level_scene": "nested"}
+    for _, r in s.iterrows():
+        key = names.get(r["structure"])
+        if key:
+            out.setdefault(r["transform"], {}).setdefault(r["subject"], {})[key] = {
+                "b": r["slope"], "lo": r["slope_ci_low"], "hi": r["slope_ci_high"],
+                "p": r["slope_p"]}
+    # Holm across the five subjects, for the primary model (lme4; the scene-only model when
+    # lme4 has not been fitted).
+    for t, by_subject in out.items():
+        key = "lme4" if any("lme4" in m for m in by_subject.values()) else "model"
+        ps = {subj: m[key]["p"] for subj, m in by_subject.items() if key in m}
+        for subj, v in _holm(ps).items():
+            by_subject[subj][key]["p_holm"] = v
+    for unit in ("scene", "level"):
+        summ = docs_dir / f"practice_{unit}_bootstrap.csv"
+        draws = docs_dir / f"practice_{unit}_bootstrap_draws.csv"
+        if not (summ.exists() and draws.exists()):
+            continue
+        dr = pd.read_csv(draws, dtype={"subject": str}).dropna(subset=["b"])
+        for _, r in pd.read_csv(summ, dtype={"subject": str}).iterrows():
+            b = dr[(dr["transform"] == r["transform"]) & (dr["subject"] == r["subject"])]["b"].to_numpy()
+            if not len(b) or r["transform"] not in out:
+                continue
+            p = min(1.0, 2 * min((b >= 0).mean(), (b <= 0).mean()))
+            out[r["transform"]].setdefault(r["subject"], {})[f"{unit}_boot"] = {
+                "b": r["b"], "lo": r["boot_ci_low"], "hi": r["boot_ci_high"],
+                "p": max(p, 2 / len(b)), "p_floor": bool(p == 0), "n_boot": int(len(b))}
+    return {"measure": measure, "methods": list(SUMMARY_METHODS), "by_transform": out}
+
+
 def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
-    """Copy the per-subject practice models into the payload as ``practice.json``.
+    """Copy the practice models into the payload as ``practice.json``.
 
     The dashboard's stats section draws these; it may not read ``output_data/practice/``
-    directly, so the fits travel through the export like everything else. Only the
-    fitted record is copied — coefficients, CIs, p-values, random-effect variances,
-    AIC and the fixed-effect curves — never the attempts, and nothing is refitted.
-    The ``scenes`` list is reduced to a count. Returns ``None`` when the practice
-    models have not been run.
+    directly, so the fits travel through the export like everything else. Copied:
+    ``mixed.json`` (the statsmodels models), and when present ``lme4.json`` (the primary,
+    full nested model) as ``lme4``, ``lme4_route.json`` (the within-route model) as
+    ``lme4_route``, ``nested.json`` (statsmodels nested structures) as
+    ``nested``, and ``practice_summary()`` (every CI and p-value) as ``summary``. Only the
+    fitted records — coefficients, CIs, p-values, variances, AIC, fixed-effect curves —
+    never the attempts, and nothing is refitted. ``scenes`` lists are reduced to a count.
+    Returns ``None`` when the practice models have not been run.
     """
-    src = Path(output_dir) / "practice" / "mixed.json"
+    pdir = Path(output_dir) / "practice"
+    src = pdir / "mixed.json"
     if not src.exists():
         print("  no practice models (output_data/practice/mixed.json) — stats section empty")
         return None
     mixed = json.loads(src.read_text())
     payload = {k: v for k, v in mixed.items() if k != "scenes"}
     payload["n_scenes"] = len(mixed.get("scenes", []))
+    for name in ("lme4", "lme4_route", "nested"):
+        path = pdir / f"{name}.json"
+        if path.exists():
+            payload[name] = {k: v for k, v in json.loads(path.read_text()).items() if k != "scenes"}
+    summary = practice_summary(output_dir)
+    if summary:
+        payload["summary"] = summary
     out = Path(web_dir) / "practice.json"
     out.write_text(json.dumps(_rounded(payload), separators=(",", ":")))
     print(f"Wrote practice models -> {out}")

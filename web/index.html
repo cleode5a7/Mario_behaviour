@@ -22,6 +22,16 @@
     <section class="panel" data-section="stats" hidden>
       <h2>Practice models</h2>
       <div class="field">
+        <label for="stats-model-seg">Model</label>
+        <div class="seg seg--wrap seg--stack" id="stats-model-seg" role="group" aria-label="Model">
+          <button data-value="lme4_nested" aria-pressed="true">Full nested (lme4) &mdash; main</button>
+          <button data-value="scene" aria-pressed="false">Scene only (statsmodels)</button>
+          <button data-value="level_scene" aria-pressed="false">Nested, no scene corr. (statsmodels)</button>
+          <button data-value="lme4_route" aria-pressed="false">Within-route (lme4) &mdash; secondary</button>
+        </div>
+        <p class="hint">the nested models are log form and nearest/spread only; within-route is log form and own-medoid only (distance to the attempt's own route, against nth use of the route); the scene-only model has every form and measure</p>
+      </div>
+      <div class="field">
         <label for="stats-measure-seg">Measure</label>
         <div class="seg" id="stats-measure-seg" role="group" aria-label="Measure">
           <button data-value="d_nearest_norm" aria-pressed="true">Nearest / spread</button>
@@ -175,6 +185,14 @@
       <div id="stats-wrap" hidden>
         <p class="note" id="stats-missing" hidden></p>
         <div id="stats-body">
+          <section class="stats-block" id="stats-summary-block">
+            <h3>All methods, main result <span class="muted">&mdash; every CI and p-value</span></h3>
+            <p class="stats-cap" id="stats-sum-cap"></p>
+            <div class="stats-multiples stats-two" id="stats-summary"></div>
+            <div class="stats-legend" id="stats-summary-legend"></div>
+            <div class="stats-table-wrap"><table class="stats-table stats-ptable" id="stats-ptable"></table></div>
+            <p class="note" id="stats-p-note"></p>
+          </section>
           <section class="stats-block">
             <h3>Practice coefficient per subject</h3>
             <p class="stats-cap" id="stats-coef-cap"></p>
@@ -186,12 +204,6 @@
             <p class="stats-cap" id="stats-curve-cap"></p>
             <div class="stats-chart" id="stats-curves"></div>
             <div class="stats-legend" id="stats-curve-legend"></div>
-          </section>
-          <section class="stats-block">
-            <h3>Linear against log, per subject <span class="muted">&mdash; leave-subject-out</span></h3>
-            <p class="stats-cap" id="stats-forms-cap"></p>
-            <div class="stats-multiples" id="stats-forms"></div>
-            <div class="stats-legend" id="stats-forms-legend"></div>
           </section>
           <section class="stats-block">
             <h3>Results table</h3>

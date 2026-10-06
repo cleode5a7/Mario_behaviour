@@ -212,6 +212,26 @@ The practice effect, measured as distance to cluster medoids. Written by
   Top level: `design` (`per_subject_v2`), `primary` (`d_nearest_norm_loso`),
   `primary_transform` (`log`), `transforms`, `scenes`, `subjects`; the task refits when
   the scenes, measures or design change.
+- `lme4.json` — the **primary practice model**, written by `invoke run-practice-lme4`
+  (`analysis/practice_lme4.R`, needs R with lme4): per subject × measure
+  (`d_nearest_norm` and its `_loso` twin) × transform × all/completed attempts, the full
+  nested model `y ~ logt + (1 + logt | level) + (1 + logt | level:scene)` (`model`
+  `nested`) and its scene-only twin (`scene`, the statsmodels main model refitted as a
+  cross-check), by maximum likelihood. Each fit records `intercept`, slope `b`, `se`, the
+  Wald and profile-likelihood CIs, `ci` (profile, Wald where the profile failed —
+  `ci_method`), `p_wald`, AIC, log-likelihood, `resid_var`, scene and (nested) level
+  variances and correlations, `singular` (a variance estimated at zero), `warnings`, the
+  level likelihood-ratio test (`lrt_chisq`, `lrt_p`, 3 df), `n_zero_dropped` and `curve`
+  (the fixed-effect prediction on an attempt grid, transform units). Top level: `design`,
+  `formula`, `primary`, `primary_transform`, `scenes`, `subjects`, `measures`, `transforms`.
+- `lme4_route.json` — the **secondary, within-route model**, also from
+  `invoke run-practice-lme4` (`analysis/practice_lme4_route.R`): for `d_own` and `d_own_loso`
+  — the Fréchet distance in px to the attempt's **own** route (cluster) prototype, so the
+  origin never changes along a series — against the nth use of that route (`cluster_use`),
+  `y ~ log_use + (1 + log_use | level) + (1 + log_use | level:scene) + (1 + log_use |
+  level:scene:route)` per subject × transform × all/completed attempts. Same fields as
+  `lme4.json` (Wald CIs: `ci_method` `wald`), plus `n_routes` and route-level variances
+  (`route_var_*`); its `curve` is on the nth-use axis (`use`, mirrored in `attempt`).
 - `nested.json` — alternative random-effect structures for the `log` practice form, fitted
   beside the main model by `analysis.practice.fit_structure`, for `d_nearest_norm` and
   its `_loso` twin × transform × all/completed × subject (80 fits). `structure` is
@@ -225,9 +245,13 @@ The practice effect, measured as distance to cluster medoids. Written by
   `design` (`v2`), `scenes`, `structures`, `subjects`.
 - `mixed_summary.csv` — `mixed.json` flattened for reading: one row per subject ×
   measure × transform × all/completed × form (320 rows), plus the 80 `nested.json` fits,
-  told apart by `structure` (`scene` for the main model, `scene_uncorr`, `level_scene`;
-  the nested rows add `n_levels`, `var_level_intercept`, `var_level_slope`,
-  `corr_level`), with `transform` and `n_zero_dropped` columns. `primary` marks the five main results
+  plus the 80 `lme4.json` fits and the 40 `lme4_route.json` fits (`structure` `lme4_route`,
+  `clock` `route_use`, `n_groups` = routes), told apart by `structure` (`lme4_nested` — the primary model —
+  `scene` for the statsmodels main model, `scene_uncorr`, `level_scene`, `lme4_scene`;
+  nested rows add `n_levels`, `var_level_intercept`, `var_level_slope`, `corr_level`; lme4
+  rows add `ci_method`, `singular` and `lrt_p_levels`), with `transform` and
+  `n_zero_dropped` columns. `primary` marks the `lme4_nested` rows when `lme4.json` exists,
+  the statsmodels main model's otherwise. `primary` marks the five main results
   (`d_nearest_norm_loso` on `log(d)`, all attempts, `log` form) and sorts them first.
   Slopes are in each row's transform units, so compare transforms through the ratio
   columns, never the slopes. `slope` is
@@ -242,7 +266,8 @@ The practice effect, measured as distance to cluster medoids. Written by
 - `switching.json` — switch rate per subject per bin of attempts (`binned`) and a
   logistic GLM `switch ~ C(subject) + log(attempt)` with errors clustered by
   subject × scene (`trend`).
-- `figure_practice_*.png` — from `notebooks/figure_practice.ipynb`: one example
+- `figure_practice_*.png` — from `notebooks/figure_practice.ipynb`: the main analysis, the
+  full nested lme4 model's slopes with Holm-adjusted p and its fitted curves (`lme4`); one example
   participant (`example`), per-subject mixed-model slopes and curves, raw vs
   leave-subject-out in the log form (`mixed`) and the same in the linear form
   (`mixed_linear`), linear against log per subject for the primary
@@ -318,7 +343,11 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
 - `output_data/web/data/practice.json` — the per-subject practice models for the dashboard's **Stats
   analysis** section: `output_data/practice/mixed.json` copied by
   `analysis.webexport.export_practice`, floats rounded to 6 decimals and the `scenes`
-  list reduced to `n_scenes`. Nothing is refitted and no attempt rows are included.
+  list reduced to `n_scenes`, with `practice/lme4.json` as `lme4`, `practice/lme4_route.json` as
+  `lme4_route`, `practice/nested.json` as
+  `nested`, and `summary` — every CI and p-value for the primary measure (lme4, scene-only
+  model with Holm-adjusted p, statsmodels nested, and the scene and level bootstraps read
+  from `docs/practice_*_bootstrap*.csv` when present), per transform and subject. Nothing is refitted and no attempt rows are included.
   Rewritten by every `run-web-export`, `--backfill` included.
 - `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and

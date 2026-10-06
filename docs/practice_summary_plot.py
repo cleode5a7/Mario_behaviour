@@ -11,8 +11,8 @@ table of the p-value each method gives for the same slope, with how each is comp
 Wald z tests for the fitted models (Holm-adjusted across the five subjects for the main
 model) and percentile-bootstrap p-values for the two bootstraps.
 
-Reads ``output_data/practice/mixed_summary.csv`` (model and nested fits) and the bootstrap
-CSVs under ``docs/``; refits nothing. Writes ``docs/practice_summary.png``.
+Reads ``output_data/practice/mixed_summary.csv`` (the statsmodels fits and the primary lme4
+model, ``run-practice-lme4``) and the bootstrap CSVs under ``docs/``; refits nothing. Writes ``docs/practice_summary.png``.
 
     uv run python docs/practice_summary_plot.py
 """
@@ -56,18 +56,10 @@ def intervals():
     s = pd.read_csv(SUMMARY, dtype={"subject": str})
     s = s[(s["measure"] == PRIMARY) & ~s["completed_only"].astype(bool) & (s["form"] == "log")]
     for _, r in s.iterrows():
-        key = {"scene": "model", "level_scene": "nested"}.get(r["structure"])
+        # lme4_nested: the primary model; its CI is profile likelihood, Wald where that failed.
+        key = {"scene": "model", "level_scene": "nested", "lme4_nested": "lme4"}.get(r["structure"])
         if key:
             out[(r["transform"], key, r["subject"])] = (r["slope"], r["slope_ci_low"], r["slope_ci_high"])
-    # Full nested model from lme4: profile-likelihood CI, Wald where the profile failed.
-    lme = HERE / "practice_lme4.csv"
-    if lme.exists():
-        r4 = pd.read_csv(lme, dtype={"subject": str})
-        r4 = r4[(r4["model"] == "nested") & ~r4["completed_only"].astype(bool)]
-        for _, r in r4.iterrows():
-            lo = r["profile_low"] if pd.notna(r["profile_low"]) else r["wald_low"]
-            hi = r["profile_high"] if pd.notna(r["profile_high"]) else r["wald_high"]
-            out[(r["transform"], "lme4", r["subject"])] = (r["b"], lo, hi)
     for unit in ("scene", "level"):
         path = HERE / f"practice_{unit}_bootstrap.csv"
         if not path.exists():
@@ -93,18 +85,12 @@ def pvalues():
     s = pd.read_csv(SUMMARY, dtype={"subject": str})
     s = s[(s["measure"] == PRIMARY) & ~s["completed_only"].astype(bool) & (s["form"] == "log")]
     for _, r in s.iterrows():
-        key = {"scene": "model", "level_scene": "nested"}.get(r["structure"])
+        key = {"scene": "model", "level_scene": "nested", "lme4_nested": "lme4"}.get(r["structure"])
         if key:
             out[(r["transform"], key, r["subject"])] = r["slope_p"]
-    main_p = pd.Series({k[2]: v for k, v in out.items() if k[:2] == ("log", "model")})
+    main_p = pd.Series({k[2]: v for k, v in out.items() if k[:2] == ("log", "lme4")})
     for subj, v in holm(main_p).items():
         out[("log", "holm", subj)] = v
-    lme = HERE / "practice_lme4.csv"
-    if lme.exists():
-        r4 = pd.read_csv(lme, dtype={"subject": str})
-        r4 = r4[(r4["model"] == "nested") & ~r4["completed_only"].astype(bool)]
-        for _, r in r4.iterrows():
-            out[(r["transform"], "lme4", r["subject"])] = r["p_wald"]
     for unit in ("scene", "level"):
         path = HERE / f"practice_{unit}_bootstrap_draws.csv"
         if not path.exists():
@@ -129,15 +115,15 @@ def fmt_p(v):
 
 TABLE_COLS = [("log1p", "model", "model\n(formula)"), ("log1p", "lme4", "full nested\n(lme4)"),
               ("log1p", "scene_boot", "scene\nbootstrap"), ("log1p", "level_boot", "level\nbootstrap"),
-              ("log", "model", "model\n(formula)"), ("log", "holm", "model, Holm-\nadjusted"),
-              ("log", "nested", "nested, no scene\ncorr. (statsmodels)"), ("log", "lme4", "full nested\n(lme4)"),
+              ("log", "lme4", "full nested\n(lme4), main"), ("log", "holm", "full nested,\nHolm-adjusted"),
+              ("log", "model", "model\n(formula)"), ("log", "nested", "nested, no scene\ncorr. (statsmodels)"),
               ("log", "scene_boot", "scene\nbootstrap"), ("log", "level_boot", "level\nbootstrap")]
 P_NOTE = (
     "How each p-value is computed - every one is a two-sided test of 'no practice effect' (b = 0) for that subject.\n"
     "  -  Model (formula), statsmodels nested, full nested (lme4): Wald z test. The fitted model gives the slope b and its standard error SE "
     "(which assumes normal, equal-variance, independent noise); z = b / SE, and p = 2 x P(|Z| > |z|) on a normal curve.\n"
     "      lme4's intervals drawn above are profile-likelihood CIs; its p-value here is the Wald one, which gives the same call in all 18 fits with a profile CI (the 2 without one fall back to Wald CIs above too).\n"
-    "  -  Holm-adjusted: the main log(d) model's p-values corrected for testing five subjects (smallest p x 5, next x 4, ...; never decreasing).\n"
+    "  -  Holm-adjusted: the main analysis's (full nested lme4, log(d)) p-values corrected for testing five subjects (smallest p x 5, next x 4, ...; never decreasing).\n"
     "  -  Scene / level bootstrap: the share of the 200 resampled slopes on the far side of zero, doubled - p = 2 x min(share >= 0, share <= 0). "
     "No normality is assumed.\n"
     "      With 200 replicates the smallest p it can show is 2/200 = 0.01, so '< 0.01' means none of the 200 slopes crossed zero.\n"

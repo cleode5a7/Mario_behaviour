@@ -4,6 +4,49 @@ A record of how the practice-effect model was chosen, what was checked, and what
 open. Every number here comes from files in this repository, listed under each section, so
 it can be checked against them.
 
+## The main analysis
+
+**Primary model: the full nested linear mixed model, fitted in R's lme4**, one per participant:
+
+```
+log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)
+```
+
+a log-log (power-law-of-practice) model of the distance to the nearest cluster prototype,
+with a random intercept and practice slope per level and per scene within level, fitted
+by maximum likelihood (`invoke run-practice-lme4`, `output_data/practice/lme4.json`; its
+rows are marked `primary` in `mixed_summary.csv`).
+
+Chosen because it matches the design — a level's scenes are played back to back, so
+scenes are not independent and belong inside levels — and keeps the scene
+intercept-slope correlation the data need. Its residual checks match the simpler models',
+its own extra assumption (normal level effects) holds, and its CIs stand against the
+level bootstrap.
+
+**Result.** Under this model, each participant tested on its own:
+
+| subject | b [95% CI] | p | Holm-adjusted p (5 tests) | |
+|---|---|---|---|---|
+| 05 | −0.066 [−0.091, −0.043] | < 0.0001 | < 0.0001 | clear |
+| 06 | −0.062 [−0.086, −0.039] | < 0.0001 | < 0.0001 | clear |
+| 02 | −0.028 [−0.047, −0.008] | 0.0056 | 0.017 | clear |
+| 03 | −0.037 [−0.070, −0.003] | 0.026 | **0.051** | clear alone, **borderline after correction** |
+| 01 | −0.011 [−0.033, +0.011] | 0.32 | 0.32 | no clear effect |
+
+**Three participants improve clearly even after correcting for testing five; sub-03
+improves at p = 0.026 but sits just above 0.05 once corrected (0.051); sub-01 shows no
+clear effect.** Every uncorrected call is the same under every model, transform and
+bootstrap recorded here (4 of 5). The correction is what separates sub-03: the nested
+model gives it the widest CI of the five (its levels differ most), so its p-value is the
+largest of the four improvers. Under the earlier scene-only model it survived correction
+(Holm p = 0.0076) — that difference is the cost of the level-aware CI, and the reason to
+report it rather than the scene-only one. sub-03 is best described as **likely improving,
+not established at a 5% family-wise level**.
+
+The rest of this document is how it was reached: the scene-only model came first (next
+sections), the checks that led to `log(d)`, the bootstraps, and the nested models. Those
+earlier models are kept as robustness checks, not replaced.
+
 ## Question
 
 Do players' attempts at a scene get closer to the scene's typical routes with practice?
@@ -27,9 +70,10 @@ against LOSO medoids).
 Time is the **attempt number at a scene** (the nth time this player entered this scene),
 not time in the study, so the effect is "more practice on the same scene".
 
-## Model
+## Starting model: scenes only
 
-One **linear mixed model per subject**, fitted by maximum likelihood (statsmodels MixedLM):
+The first model — still fitted, now a robustness check — was one **linear mixed model per
+subject**, fitted by maximum likelihood (statsmodels MixedLM):
 
 ```
 transform(d) = (a + u_scene) + (b + v_scene) · log(attempt) + ε
@@ -262,7 +306,7 @@ model with both levels and that correlation needs R's `lme4` and has not been fi
 - **The main model still fits best overall** (AIC lower by 22-85 than the nested model):
   the scene intercept-slope correlation it carries is worth more than the level terms.
   So the nested model is not a replacement for it here, only a check.
-- **Conclusions unchanged**: 4 of 5 subjects improve clearly, sub-01 does not, under
+- **Uncorrected calls unchanged**: 4 of 5 subjects improve clearly, sub-01 does not, under
   every structure and both transforms.
 - **Fitting note.** Fitted from a cold start, 9 of 40 nested fits stopped in a worse
   solution than the simpler model they contain (impossible at the true optimum), so each
@@ -282,7 +326,7 @@ side.
 The statsmodels nested model above had to drop the scene intercept-slope correlation.
 R's `lme4` fits the model with both — `y ~ log(attempt) + (1 + log(attempt) | level) +
 (1 + log(attempt) | level:scene)` — by maximum likelihood, like every other fit here
-(`docs/practice_lme4.R`, run through `docs/practice_lme4.py`; needs R with lme4).
+(`analysis/practice_lme4.R`, run by `invoke run-practice-lme4`; needs R with lme4).
 
 **Cross-check first.** lme4 also refits the main scene-only model; it matches the
 statsmodels fit to within 1.4e-6 on the slope and 0.0002 on AIC, for every subject,
@@ -297,7 +341,9 @@ the same footing.
 | 05 | −0.064 | −0.066 | [−0.091, −0.043] | 1.14 | borderline (0.055) | yes |
 | 06 | −0.060 | −0.062 | [−0.086, −0.039] | 1.11 | no (0.44) | yes |
 
-- **Conclusions unchanged**, under both transforms and with completed attempts only.
+- **Uncorrected conclusions unchanged**, under both transforms and with completed attempts
+  only. Corrected for five tests (Holm), sub-03 becomes borderline (0.051) under this model
+  — see *The main analysis* at the top.
 - **The widening matches** the level bootstrap and the statsmodels nested model (sub-03:
   1.35 here, 1.34 level bootstrap, 1.37 statsmodels nested) — three methods agree.
 - **This resolves the earlier AIC puzzle.** The statsmodels nested model fit worse than
@@ -340,11 +386,55 @@ model (`uv run python docs/practice_residual_diagnostics.py lme4`, figures
   model itself was not run (it would take hours of refits); the level bootstrap of the
   scene-only model is the closest available check.
 
-**For the model choice** this is option C from the discussion: design-faithful (scenes
-within levels) and keeping the correlation the data need. It changes no conclusion and
-gives level-aware CIs from the model itself, so it is the natural primary model if R is
-acceptable in the analysis; the statsmodels main model with a level-bootstrap CI is the
-Python-only equivalent.
+**Decision: this is the main analysis.** Design-faithful (scenes within levels), keeping
+the correlation the data need, level-aware CIs from the model itself, and no conclusion
+changed. It is now part of the pipeline (`invoke run-practice-lme4`). Without R the
+pipeline falls back to the scene-only statsmodels model as primary; with a level-bootstrap
+CI that is the Python-only equivalent.
+
+## Secondary analysis: within-route refinement
+
+**Why.** The main model's distance is to the *nearest* prototype, and the nearest prototype
+changes from attempt to attempt: about half of consecutive attempts at a scene are
+measured against a different prototype (49-56% the same early on, 53-68% later — players
+increasingly stay with one route). So the main slope is a trend in a *typicality score*
+("how typical of some established route is this attempt?"), not one quantity evolving,
+and it cannot say whether players refine their routes or only settle on them.
+
+**Model** (`invoke run-practice-lme4`, `output_data/practice/lme4_route.json`): the distance
+in px to the attempt's **own** route (cluster) prototype — a fixed origin along each series —
+against the **nth use of that route** at the scene:
+
+```
+log(d_own) ~ log(use) + (1 + log(use) | level) + (1 + log(use) | level:scene)
+                      + (1 + log(use) | level:scene:route)
+```
+
+one model per participant, maximum likelihood, Wald CIs (a profile CI over three nested
+levels would take hours; on the two-level model it matched Wald to ~0.002).
+
+| subject (`log(d_own)`, LOSO) | b [95% CI] | p | Holm p | per doubling of uses |
+|---|---|---|---|---|
+| 01 | −0.008 [−0.025, +0.008] | 0.32 | 0.32 | no clear change |
+| 02 | −0.023 [−0.038, −0.008] | 0.0023 | 0.0069 | 1.6% tighter |
+| 03 | −0.034 [−0.062, −0.006] | 0.017 | 0.034 | 2.3% tighter |
+| 05 | −0.046 [−0.066, −0.026] | < 0.0001 | < 0.0001 | 3.1% tighter |
+| 06 | −0.043 [−0.062, −0.023] | < 0.0001 | 0.0001 | 2.9% tighter |
+
+- **Each further use of a route is executed closer to that route's prototype**, for the same
+  four participants, and all four survive the Holm correction here (sub-03 included).
+  So the main effect is not only settling on routes or fewer odd attempts: **players refine
+  the routes they use.** sub-01 again shows no clear change.
+- With all-player prototypes (`d_own`) every participant, sub-01 included, comes out clear —
+  but there a player's own later uses help define the prototype they are measured against.
+  The leave-subject-out version is the honest one, and it matches the main result.
+- **30 of 40 fits are singular**, mostly with the scene and level slope variances at zero:
+  once routes are separated, differences in learning rate sit at the route level. That is an
+  answer about where the variation is, not a fitting failure; no fit raised a warning.
+- Caveats: series are short (a route is used a median of ~4 times at a scene), so the
+  estimate rests on routes players kept using; routes come from clustering the same traces,
+  all attempts at once; and like the main effect, the trend is a small average drift,
+  not visible attempt by attempt.
 
 ## Where everything is
 
@@ -357,7 +447,8 @@ Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refit
 | what | file |
 |---|---|
 | summary of every CI | `docs/practice_summary.png`, script `docs/practice_summary_plot.py` |
-| full nested model (lme4) | `docs/practice_lme4.csv`; scripts `docs/practice_lme4.py` (entry point) and `docs/practice_lme4.R` |
+| **primary model: full nested (lme4)** | `output_data/practice/lme4.json` (and its `lme4_nested` rows in `mixed_summary.csv`); `invoke run-practice-lme4`, code `analysis/practice_lme4.R` |
+| within-route model (secondary) | `output_data/practice/lme4_route.json` (rows `lme4_route` in `mixed_summary.csv`); code `analysis/practice_lme4_route.R` |
 | its assumption checks | `docs/practice_residual_diagnostics_lme4_log.png` / `_lme4_log1p.png` (+ `.csv`); residuals from `docs/practice_lme4_resid.R` |
 | model code | `analysis/practice.py` (`fit_mixed`, `TRANSFORMS`, `PRIMARY_TRANSFORM`) |
 | all fits, both transforms | `output_data/practice/mixed.json` |

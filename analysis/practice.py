@@ -40,6 +40,14 @@ series (``d_own``), which gets a random intercept and a random slope on practice
 scenes, it does not condition on a strategy the player kept using, and its reference
 is set by the other players.
 
+**The primary model is the full nested lme4 model** (``run_practice_lme4``):
+``log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)``
+— a level's scenes are played back to back, so they are not independent, and only lme4
+can nest correlated scene effects inside levels. It is fitted in R by
+``analysis/practice_lme4.R`` into ``lme4.json``; ``mixed_summary.csv`` marks its rows as
+``primary``. The statsmodels models (``fit_mixed``, ``fit_structure``) stay beside it as
+the robustness checks they became, and as the primary when R is not available.
+
 **Two transforms, both kept.** Every model is fitted on ``log(d)`` — the primary
 (``PRIMARY_TRANSFORM``), with the ~0.6% of attempts at exactly ``d = 0`` dropped since
 the log is undefined there — and on ``log1p(d)``, the original analysis, kept so the
@@ -541,6 +549,18 @@ NESTED_MEASURES = ("d_nearest_norm", "d_nearest_norm_loso")
 NESTED_DESIGN = "v2"   # v2: level_scene warm-started from scene_uncorr, best of several optimisers
 SCENE_VC = {"scene": "0 + C(group)", "scene_slope": "0 + C(group):logt"}
 
+# The primary model, fitted in R (analysis/practice_lme4.R). d_own is not fitted: its unit
+# is scene x cluster, which would need a third nested level.
+LME4_MEASURES = ("d_nearest_norm", "d_nearest_norm_loso")
+LME4_DESIGN = "v1"
+LME4_SCRIPT = Path(__file__).with_name("practice_lme4.R")
+PRIMARY_STRUCTURE = "lme4_nested"     # which rows mixed_summary marks primary, when fitted
+# Secondary, within-route model: distance (px) to the attempt's own route prototype, against
+# the nth use of that route, routes nested in scenes nested in levels.
+ROUTE_MEASURES = ("d_own", "d_own_loso")
+ROUTE_DESIGN = "v1"
+ROUTE_SCRIPT = Path(__file__).with_name("practice_lme4_route.R")
+
 
 def level_of(scene: str) -> str:
     """``w1l1s3`` -> ``w1l1``."""
@@ -652,12 +672,20 @@ def _predict(coef, form, attempt):
     return float(y)
 
 
-def mixed_summary(mixed: dict, nested: dict | None = None) -> pd.DataFrame:
+def mixed_summary(mixed: dict, nested: dict | None = None, lme4: dict | None = None,
+                  lme4_route: dict | None = None) -> pd.DataFrame:
     """Flatten ``mixed.json`` into one row per subject × measure × transform × attempts × form.
 
     With ``nested`` (``nested.json``), the alternative random-effect structures are added
     as further rows, told apart by ``structure`` (``scene`` for the main model,
     ``scene_uncorr``, ``level_scene``), with their level variances in ``var_level_*``.
+    With ``lme4`` (``lme4.json``), the R fits are added as ``lme4_scene`` (the main model,
+    refitted as a cross-check) and ``lme4_nested`` (the primary model); their CI is the
+    profile-likelihood one, Wald where the profile failed (``ci_method``). When lme4 rows
+    exist they are the ones marked ``primary``; otherwise the statsmodels main model is.
+    With ``lme4_route`` (``lme4_route.json``), the within-route model is added as
+    ``lme4_route``: its ``slope`` is per log nth use of the route (``clock``), its distance
+    is in px, and ``n_groups`` counts routes.
 
     ``slope`` is the form's practice coefficient (``t``, per 10 attempts, for linear
     and quadratic; ``log(attempt)`` for the log forms), with its CI, p-value and
@@ -675,7 +703,7 @@ def mixed_summary(mixed: dict, nested: dict | None = None) -> pd.DataFrame:
             row = {"subject": f["subject"], "measure": f["measure"],
                    "transform": f["transform"], "structure": "scene",
                    "completed_only": f["completed_only"], "form": form,
-                   "primary": (f["measure"] == mixed.get("primary")
+                   "primary": (lme4 is None and f["measure"] == mixed.get("primary")
                                and f["transform"] == mixed.get("primary_transform")
                                and not f["completed_only"] and form == "log"),
                    "is_best_form": form == f["best_form"],
@@ -728,9 +756,52 @@ def mixed_summary(mixed: dict, nested: dict | None = None) -> pd.DataFrame:
             "aic": f["aic"], "converged": f["converged"],
         })
         rows.append(row)
+    for f in (lme4_route or {}).get("fits", []):
+        inverse = TRANSFORMS[f["transform"]][1]
+        coef = {"Intercept": f["intercept"], "logt": f["b"]}
+        lo, hi = f["ci"]
+        rows.append({
+            "subject": f["subject"], "measure": f["measure"], "transform": f["transform"],
+            "structure": "lme4_route", "clock": "route_use", "completed_only": f["completed_only"],
+            "form": "log", "primary": False, "n_obs": f["n_obs"], "n_groups": f["n_routes"],
+            "n_levels": f["n_levels"], "intercept": f["intercept"], "slope": f["b"],
+            "slope_ci_low": lo, "slope_ci_high": hi, "ci_method": f["ci_method"],
+            "slope_p": f["p_wald"], "ci_excludes_zero": bool(hi < 0 or lo > 0),
+            "ratio_first": float(inverse(_predict(coef, "log", 1))),
+            f"ratio_at_{SUMMARY_ATTEMPT}": float(inverse(_predict(coef, "log", SUMMARY_ATTEMPT))),
+            "var_intercept": f["route_var_intercept"], "var_slope": f["route_var_slope"],
+            "corr": f["route_corr"], "var_level_intercept": f["level_var_intercept"],
+            "var_level_slope": f["level_var_slope"], "corr_level": f["level_corr"],
+            "resid_var": f["resid_var"], "aic": f["aic"], "converged": not f["warnings"],
+            "singular": f["singular"],
+        })
+    for f in (lme4 or {}).get("fits", []):
+        structure = f"lme4_{f['model']}"
+        inverse = TRANSFORMS[f["transform"]][1]
+        coef = {"Intercept": f["intercept"], "logt": f["b"]}
+        lo, hi = f["ci"]
+        rows.append({
+            "subject": f["subject"], "measure": f["measure"], "transform": f["transform"],
+            "structure": structure, "completed_only": f["completed_only"], "form": "log",
+            "primary": (structure == PRIMARY_STRUCTURE and f["measure"] == lme4.get("primary")
+                        and f["transform"] == lme4.get("primary_transform")
+                        and not f["completed_only"]),
+            "n_obs": f["n_obs"], "n_groups": f["n_scenes"], "n_levels": f["n_levels"],
+            "intercept": f["intercept"], "slope": f["b"], "slope_ci_low": lo, "slope_ci_high": hi,
+            "ci_method": f["ci_method"], "slope_p": f["p_wald"],
+            "ci_excludes_zero": bool(hi < 0 or lo > 0),
+            "ratio_first": float(inverse(_predict(coef, "log", 1))),
+            f"ratio_at_{SUMMARY_ATTEMPT}": float(inverse(_predict(coef, "log", SUMMARY_ATTEMPT))),
+            "var_intercept": f["scene_var_intercept"], "var_slope": f["scene_var_slope"],
+            "corr": f["scene_corr"], "var_level_intercept": f.get("level_var_intercept"),
+            "var_level_slope": f.get("level_var_slope"), "corr_level": f.get("level_corr"),
+            "resid_var": f["resid_var"], "aic": f["aic"], "converged": not f["warnings"],
+            "singular": f["singular"], "lrt_p_levels": f.get("lrt_p"),
+        })
     order = {k: i for i, k in enumerate(MIXED_FORMS)}
     torder = {k: i for i, k in enumerate(TRANSFORMS)}
-    sorder = {k: i for i, k in enumerate(("scene",) + STRUCTURES)}
+    sorder = {k: i for i, k in enumerate(("lme4_nested", "lme4_route", "scene") + STRUCTURES
+                                         + ("lme4_scene",))}
     df = pd.DataFrame(rows)
     df["_form"] = df["form"].map(order)
     df["_tr"] = df["transform"].map(torder)
@@ -741,13 +812,162 @@ def mixed_summary(mixed: dict, nested: dict | None = None) -> pd.DataFrame:
 
 
 def write_mixed_summary(pdir: Path) -> None:
-    """Write ``mixed_summary.csv`` from ``mixed.json`` (and ``nested.json``) — no refitting."""
+    """Write ``mixed_summary.csv`` from ``mixed.json`` (with ``nested.json`` and ``lme4.json``
+    when present) — no refitting."""
     mixed = json.loads((pdir / "mixed.json").read_text())
     if mixed.get("design") != MIXED_DESIGN:
         return
-    nested_path = pdir / "nested.json"
-    nested = json.loads(nested_path.read_text()) if nested_path.exists() else None
-    mixed_summary(mixed, nested).to_csv(pdir / "mixed_summary.csv", index=False)
+    read = lambda name: json.loads((pdir / name).read_text()) if (pdir / name).exists() else None
+    mixed_summary(mixed, read("nested.json"), read("lme4.json"), read("lme4_route.json")).to_csv(
+        pdir / "mixed_summary.csv", index=False)
+
+
+def _nan_to_none(v):
+    return None if isinstance(v, float) and not np.isfinite(v) else v
+
+
+def _run_lme4_script(script: Path, frames: pd.DataFrame, n_cores: int, extra=()):
+    """Run one of the lme4 R scripts on ``frames``; returns (fits, curves) DataFrames."""
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        frames.to_csv(tmp / "frames.csv", index=False)
+        subprocess.run(["Rscript", str(script), str(tmp / "frames.csv"), str(tmp / "fits.csv"),
+                        str(tmp / "curves.csv"), str(n_cores), *extra], check=True)
+        return (pd.read_csv(tmp / "fits.csv", dtype={"subject": str}),
+                pd.read_csv(tmp / "curves.csv", dtype={"subject": str}))
+
+
+def _lme4_records(fits, curves, zeros, clock):
+    """lme4 output rows as JSON records: CI chosen, zeros counted, curve attached."""
+    keys = ["measure", "subject", "transform", "completed_only", "model"]
+    records = []
+    for _, r in fits.iterrows():
+        rec = {k: _nan_to_none(v.item() if hasattr(v, "item") else v) for k, v in r.items()}
+        rec["warnings"] = rec.get("warnings") or ""
+        profile_ok = rec["profile_low"] is not None and rec["profile_high"] is not None
+        rec["ci_method"] = "profile" if profile_ok else "wald"
+        rec["ci"] = ([rec["profile_low"], rec["profile_high"]] if profile_ok
+                     else [rec["wald_low"], rec["wald_high"]])
+        rec["n_zero_dropped"] = int(zeros[(rec["measure"], rec["subject"], rec["transform"],
+                                           rec["completed_only"])])
+        c = curves[(curves[keys] == pd.Series({k: rec[k] for k in keys})).all(axis=1)]
+        rec["curve"] = {clock: c[clock].astype(int).tolist(), "y": c["y"].tolist()}
+        if clock != "attempt":
+            rec["curve"]["attempt"] = rec["curve"][clock]   # drawn on the same x-axis code
+        records.append(rec)
+    return records
+
+
+def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> None:
+    """Fit the lme4 practice models: the primary model and the within-route model.
+
+    **Primary** (``lme4.json``): exports the exact model frames the statsmodels fits use
+    (``_mixed_frame``) for ``LME4_MEASURES`` x ``TRANSFORMS`` x all/completed attempts x
+    subject, runs ``analysis/practice_lme4.R`` on them (parallel over fits), and stores, per
+    fit, both the nested model and its scene-only twin: intercept, slope, Wald and profile
+    CIs, the CI used (``ci``: profile, Wald where the profile failed), Wald p, variances at
+    every level, AIC, singularity, the level likelihood-ratio test and the fitted curve.
+
+    **Within-route, secondary** (``lme4_route.json``): for ``ROUTE_MEASURES`` (``d_own``,
+    distance in px to the attempt's OWN route prototype, so the origin never changes along
+    a series), practice counted as the nth use of that route (``cluster_use``), routes
+    nested in scenes nested in levels (``analysis/practice_lme4_route.R``); Wald CIs.
+
+    Each file is checked separately and skipped when it already covers these scenes, so
+    adding one does not refit the other; a subset run (``scenes``) never replaces a full
+    fit. Then rewrites ``mixed_summary.csv`` (its ``primary`` rows are the nested model's).
+    Needs R with lme4; without ``Rscript`` it says so and returns, so the rest of the
+    pipeline still runs.
+    """
+    import os
+    import shutil
+
+    output_dir = Path(output_dir)
+    pdir = practice_dir(output_dir)
+    out_path = pdir / "lme4.json"
+    route_path = pdir / "lme4_route.json"
+    if shutil.which("Rscript") is None:
+        print("Rscript not found — skipping the lme4 models (the primary practice model). "
+              "Install R and lme4 (e.g. sudo apt install r-base r-cran-lme4) and rerun "
+              "invoke run-practice-lme4.")
+        return
+    df = load_attempts(output_dir, scenes)
+    used = sorted(df["scene"].unique())
+
+    def up_to_date(path, design):
+        if not path.exists() or force:
+            return False
+        if scenes is not None:
+            return True            # a subset run never replaces a fit on disk
+        prev = json.loads(path.read_text())
+        return prev.get("scenes") == used and prev.get("design") == design
+
+    main_ok, route_ok = up_to_date(out_path, LME4_DESIGN), up_to_date(route_path, ROUTE_DESIGN)
+    if main_ok and route_ok:
+        print("lme4 models already fitted on these scenes, skipping (use --force to refit).")
+        return
+    subjects = sorted(df["subject"].unique())
+    n_cores = n_cores or max(1, (os.cpu_count() or 2) - 1)
+    combos = [(t, c, s) for t in TRANSFORMS for c in (False, True) for s in subjects]
+
+    if not main_ok:
+        frames = []
+        for measure in LME4_MEASURES:
+            for transform, completed_only, s in combos:
+                d = _mixed_frame(df, measure, s, completed_only, transform)
+                frames.append(pd.DataFrame({
+                    "measure": measure, "subject": s, "transform": transform,
+                    "completed_only": completed_only, "y": d["y"].values,
+                    "logt": d["logt"].values, "attempt": d["attempt"].values,
+                    "scene": d["group"].values, "level": d["group"].map(level_of).values,
+                    "n_zero_dropped": d.attrs["n_zero_dropped"]}))
+        frames = pd.concat(frames, ignore_index=True)
+        zeros = (frames.groupby(["measure", "subject", "transform", "completed_only"])
+                       ["n_zero_dropped"].first())
+        print(f"Fitting the primary lme4 model: {zeros.size} fits x 2 structures on {n_cores} cores...")
+        fits, curves = _run_lme4_script(LME4_SCRIPT, frames.drop(columns="n_zero_dropped"), n_cores)
+        out_path.write_text(json.dumps({
+            "design": LME4_DESIGN, "primary": PRIMARY, "primary_transform": PRIMARY_TRANSFORM,
+            "formula": "y ~ logt + (1 + logt | level) + (1 + logt | level:scene)",
+            "scenes": used, "subjects": subjects, "measures": list(LME4_MEASURES),
+            "transforms": list(TRANSFORMS),
+            "fits": _lme4_records(fits, curves, zeros, "attempt")}, indent=2))
+        print(f"Wrote {out_path}")
+
+    if not route_ok:
+        frames = []
+        for measure in ROUTE_MEASURES:
+            for transform, completed_only, s in combos:
+                d = _mixed_frame(df, measure, s, completed_only, transform)
+                d = d[d["cluster"] >= 0]
+                frames.append(pd.DataFrame({
+                    "measure": measure, "subject": s, "transform": transform,
+                    "completed_only": completed_only, "y": d["y"].values,
+                    "use": d["cluster_use"].values, "log_use": np.log(d["cluster_use"].values),
+                    "scene": d["scene"].values, "route": d["cluster"].values,
+                    "level": d["scene"].map(level_of).values,
+                    "n_zero_dropped": d.attrs["n_zero_dropped"]}))
+        frames = pd.concat(frames, ignore_index=True)
+        zeros = (frames.groupby(["measure", "subject", "transform", "completed_only"])
+                       ["n_zero_dropped"].first())
+        print(f"Fitting the within-route lme4 model: {zeros.size} fits on {n_cores} cores...")
+        fits, curves = _run_lme4_script(ROUTE_SCRIPT, frames.drop(columns="n_zero_dropped"), n_cores)
+        route_path.write_text(json.dumps({
+            "design": ROUTE_DESIGN, "primary": "d_own_loso", "primary_transform": PRIMARY_TRANSFORM,
+            "clock": "nth use of the route (cluster_use)",
+            "formula": ("y ~ log_use + (1 + log_use | level) + (1 + log_use | level:scene)"
+                        " + (1 + log_use | level:scene:route)"),
+            "scenes": used, "subjects": subjects, "measures": list(ROUTE_MEASURES),
+            "transforms": list(TRANSFORMS),
+            "fits": _lme4_records(fits, curves, zeros, "use")}, indent=2))
+        print(f"Wrote {route_path}")
+
+    if (pdir / "mixed.json").exists():
+        write_mixed_summary(pdir)
+        print(f"Rewrote {pdir}/mixed_summary.csv with the lme4 rows.")
 
 
 # ---------------------------------------------------------------------------

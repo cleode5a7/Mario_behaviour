@@ -594,6 +594,29 @@ def run_practice_models(c, measures="d_nearest_norm,d_own", min_attempts=10,
 
 
 @task
+def run_practice_lme4(c, smoke=False, force=False, cores=None):
+    """Fit the primary practice model in R's lme4: scenes nested in levels.
+
+    log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene),
+    per subject, for d_nearest_norm and its leave-subject-out twin, both transforms, all
+    and completed attempts, with its scene-only twin as a cross-check against
+    statsmodels. Writes output_data/practice/lme4.json and marks these rows primary in
+    mixed_summary.csv. Needs R with lme4 (sudo apt install r-base r-cran-lme4); without
+    Rscript it says so and skips. --smoke fits the first five scenes with attempt files;
+    --cores sets R's parallel workers (default: all but one).
+    """
+    from analysis.practice import practice_dir, run_practice_lme4 as _run
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    files = sorted((practice_dir(output_dir) / "attempts").glob("*.csv"))
+    if not files:
+        print("No attempt distances — run invoke run-practice-distances first.")
+        return
+    scenes = [f.stem for f in files[:5]] if smoke else None
+    _run(output_dir, scenes=scenes, force=force, n_cores=int(cores) if cores else None)
+
+
+@task
 def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=False):
     """Export clustered traces to a static payload for the browser dashboard.
 
@@ -692,6 +715,7 @@ def dashboard(c, port=8000, open_browser=True):
     for asset in sorted(app_dir.iterdir()):
         if asset.is_file():
             shutil.copy2(asset, web_root / asset.name)
+    _version_web_assets(web_root)
 
     url = f"http://localhost:{port}/"
     print(f"Serving dashboard at {url}  (Ctrl-C to stop)")
@@ -702,6 +726,25 @@ def dashboard(c, port=8000, open_browser=True):
                         "--directory", str(web_root)])
     except KeyboardInterrupt:
         print("\nDashboard stopped.")
+
+
+def _version_web_assets(web_root: Path) -> None:
+    """Point index.html at app.js?v=<hash> and style.css?v=<hash>.
+
+    python -m http.server sends Last-Modified but no Cache-Control, so a browser may keep
+    serving a stale app.js for hours; an old script against a new page (or the reverse)
+    breaks on the first element one has and the other lacks. A content hash in the URL
+    makes every change a new URL. The data files are fetched with cache: "no-cache"
+    in app.js for the same reason.
+    """
+    import hashlib
+
+    index = web_root / "index.html"
+    html = index.read_text()
+    for name, attr in (("app.js", "src"), ("style.css", "href")):
+        digest = hashlib.md5((web_root / name).read_bytes()).hexdigest()[:10]
+        html = re.sub(rf'{attr}="{re.escape(name)}(\?v=[0-9a-f]+)?"', f'{attr}="{name}?v={digest}"', html)
+    index.write_text(html)
 
 
 @task
@@ -732,7 +775,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_web_export, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_practice_lme4, run_web_export, run_notebooks])
 def run(c):
     """Full pipeline.
 
@@ -744,7 +787,7 @@ def run(c):
 
     record_run(c, tasks="fetch,run-changepoints,run-changepoints-by-category,"
                         "run-clustering,run-clustering-by-category,run-practice-distances,"
-                        "run-practice-models,run-web-export,"
+                        "run-practice-models,run-practice-lme4,run-web-export,"
                         "run-notebooks")
     print("Pipeline complete.")
 
@@ -775,6 +818,7 @@ def run_smoke(c):
     run_clustering_by_category(c, smoke=True)    # first category only
     run_practice_distances(c, smoke=True)        # medoid distances, first scene
     run_practice_models(c, smoke=True)           # practice models on what exists
+    run_practice_lme4(c, smoke=True)             # primary lme4 model (skips without R)
     run_web_export(c, smoke=True)                # dashboard payload, first scene
     run_notebooks(c)
 

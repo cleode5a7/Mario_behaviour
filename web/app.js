@@ -93,7 +93,7 @@ const state = {
   pan: { x: 0, y: 0 },
   section: "clustering",   // or "stats": the practice-model section
   stats: { model: "lme4_nested", measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all",
-           spSubject: null },
+           spSubject: null, axisUnits: "units" },
   statsSubjectColors: new Map(),
 };
 
@@ -2573,7 +2573,10 @@ function renderStatsFitData() {
     "Hover a bin for its n and how many scenes it holds. The error bars treat attempts as independent, " +
     "which they are not within a scene, so read them as where the bin sits, not as a test. " +
     "Both axes are on a log scale, where the model's curve is a straight line, so a bend in the bins " +
-    "is what a wrong shape would look like. The y-axes are shared within each row.";
+    "is what a wrong shape would look like. The y-axes are shared within each row. " +
+    "<em>Axis labels</em> switches the ruler, not the picture: ordinary units, or the natural-log values " +
+    `the model is fitted on, where the line's slope is b` +
+    (transform === "log" ? "." : ` (under ${transform} the model's scale is ln(1 + d), so only approximately).`);
 }
 
 function drawFitPanel(host, { title, points, bins, curve, color, yDomain, ref, digits, route, within, subject, yLabel }) {
@@ -2596,21 +2599,8 @@ function drawFitPanel(host, { title, points, bins, curve, color, yDomain, ref, d
   const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (Math.log(y) - y0)) / (y1 - y0 || 1);
   const inside = (x, y) => y >= yDomain[0] && y <= yDomain[1] && fx(x) <= x1;
 
-  const yTicks = logTicks(yDomain[0], yDomain[1]);
-  for (const v of yTicks) {
-    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
-    svgEl("text", { x: pad.l - 5, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg)
-      .textContent = v >= 10 ? v.toFixed(0) : v.toFixed(v < 1 ? 2 : 1).replace(/\.?0+$/, "");
-  }
-  const xTicks = [1, 2, 5, 10, 20, 50, 100, 200].filter((v) => v <= xMax * 1.15);
-  for (const v of xTicks) {
-    svgEl("text", { x: px(v), y: height - pad.b + 13, "text-anchor": "middle", class: "tick" }, svg).textContent = v;
-  }
-  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 4, "text-anchor": "middle", class: "axis-label" }, svg)
-    .textContent = (route ? "nth use of the route" : "attempt at scene") + " (log scale)";
-  const cy = (pad.t + height - pad.b) / 2;
-  svgEl("text", { x: 11, y: cy, "text-anchor": "middle", class: "axis-label",
-                  transform: `rotate(-90 11 ${cy})` }, svg).textContent = `${yLabel} (log scale)`;
+  drawLogAxes(svg, { px, py, pad, w, height, xMax: xMax * 1.15, ylo: yDomain[0], yhi: yDomain[1],
+                    xName: route ? "nth use of the route" : "attempt at scene", yName: yLabel });
   if (ref != null && ref >= yDomain[0] && ref <= yDomain[1]) {
     svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(ref), y2: py(ref), class: "ref" }, svg);
   }
@@ -2756,20 +2746,9 @@ function drawSpaghettiPanel(host, { title, points, lines, fixed, route, digits, 
   const px = (x) => pad.l + ((w - pad.l - pad.r) * (Math.log(x) - x0)) / (x1 - x0);
   const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (Math.log(y) - y0)) / (y1 - y0 || 1);
   const clipY = (y) => Math.min(Math.max(y, Math.exp(y0)), Math.exp(y1));
-  for (const v of logTicks(Math.exp(y0), Math.exp(y1))) {
-    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
-    svgEl("text", { x: pad.l - 5, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg)
-      .textContent = v >= 10 ? v.toFixed(0) : String(Number(v.toPrecision(2)));
-  }
-  for (const v of [1, 2, 5, 10, 20, 50, 100, 200, 500].filter((v) => v <= xMax * 1.15)) {
-    svgEl("text", { x: px(v), y: height - pad.b + 13, "text-anchor": "middle", class: "tick" }, svg).textContent = v;
-  }
-  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 4, "text-anchor": "middle", class: "axis-label" }, svg)
-    .textContent = (route ? "nth use of the route" : "attempt at scene") + " (log scale)";
-  const cy = (pad.t + height - pad.b) / 2;
-  svgEl("text", { x: 11, y: cy, "text-anchor": "middle", class: "axis-label",
-                  transform: `rotate(-90 11 ${cy})` }, svg).textContent =
-    `${ref != null ? "distance / spread" : "distance (px)"} (log scale)`;
+  drawLogAxes(svg, { px, py, pad, w, height, xMax: xMax * 1.15, ylo: Math.exp(y0), yhi: Math.exp(y1),
+                    xName: route ? "nth use of the route" : "attempt at scene",
+                    yName: ref != null ? "distance / spread" : "distance (px)" });
   if (ref != null && ref >= Math.exp(y0) && ref <= Math.exp(y1)) {
     svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(ref), y2: py(ref), class: "ref" }, svg);
   }
@@ -2792,6 +2771,31 @@ function drawSpaghettiPanel(host, { title, points, lines, fixed, route, digits, 
        ["at its last x", l.pts[l.pts.length - 1][1].toFixed(digits + 1)]], ev.clientX, ev.clientY));
     hit.addEventListener("mouseleave", hideStatsTooltip);
   }
+}
+
+/* Ticks and axis titles for a log-log panel. Spacing is always logarithmic; the
+ * "axis labels" control only picks the ruler: ordinary units (attempt 1, 2, 5, 10; distance
+ * 10, 20, 50 px) or the natural-log values the model is fitted on, evenly spaced
+ * (ln attempt 0, 1, 2, 3), where the fixed line's slope reads directly as b. */
+function drawLogAxes(svg, { px, py, pad, w, height, xMax, ylo, yhi, xName, yName }) {
+  const ln = state.stats.axisUnits === "ln";
+  const fmt = (v) => (v >= 10 ? v.toFixed(0) : String(Number(v.toPrecision(2))));
+  const yTicks = ln ? niceTicks(Math.log(ylo), Math.log(yhi), 6).map((t) => [Math.exp(t), String(t)])
+                    : logTicks(ylo, yhi).map((v) => [v, fmt(v)]);
+  for (const [v, label] of yTicks) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
+    svgEl("text", { x: pad.l - 5, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg).textContent = label;
+  }
+  const xTicks = ln ? niceTicks(0, Math.log(xMax), 4).filter((t) => t >= 0).map((t) => [Math.exp(t), String(t)])
+                    : [1, 2, 5, 10, 20, 50, 100, 200, 500].filter((v) => v <= xMax).map((v) => [v, String(v)]);
+  for (const [v, label] of xTicks) {
+    svgEl("text", { x: px(v), y: height - pad.b + 13, "text-anchor": "middle", class: "tick" }, svg).textContent = label;
+  }
+  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 4, "text-anchor": "middle", class: "axis-label" }, svg)
+    .textContent = ln ? `ln(${xName})` : `${xName} (log scale)`;
+  const cy = (pad.t + height - pad.b) / 2;
+  svgEl("text", { x: 11, y: cy, "text-anchor": "middle", class: "axis-label",
+                  transform: `rotate(-90 11 ${cy})` }, svg).textContent = ln ? `ln(${yName})` : `${yName} (log scale)`;
 }
 
 /* Ticks for a log axis: 1-2-5 per decade, or the decades alone when that is too many. */
@@ -3188,6 +3192,19 @@ function bindStats() {
     hideStatsTooltip();
     render();
   });
+  for (const seg of document.querySelectorAll("[data-axis-units]")) {
+    seg.addEventListener("click", (ev) => {
+      const btn = ev.target.closest("button");
+      if (!btn) return;
+      state.stats.axisUnits = btn.dataset.units;
+      for (const b of document.querySelectorAll("[data-axis-units] button")) {
+        b.setAttribute("aria-pressed", String(b.dataset.units === state.stats.axisUnits));
+      }
+      hideStatsTooltip();
+      renderStatsFitData();
+      renderStatsSpaghetti();
+    });
+  }
   $("stats-spaghetti-subject").addEventListener("click", (ev) => {
     const btn = ev.target.closest("button");
     if (!btn) return;

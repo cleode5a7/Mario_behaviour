@@ -219,6 +219,10 @@
           <section class="stats-block" id="stats-fitdata-block">
             <h3>Fit against the data <span class="muted">&mdash; does the curve follow the attempts?</span></h3>
             <p class="stats-cap" id="stats-fitdata-cap"></p>
+            <div class="seg stats-inline-seg" data-axis-units role="group" aria-label="axis labels">
+              <button type="button" data-units="units" aria-pressed="true">axis labels: attempts &amp; distance</button>
+              <button type="button" data-units="ln" aria-pressed="false">axis labels: ln (model scale)</button>
+            </div>
             <div class="stats-fitdata-row-label">Pooled: every attempt, binned</div>
             <div class="stats-multiples stats-five" id="stats-fitdata-pooled"></div>
             <div class="stats-fitdata-row-label" id="stats-fitdata-partial-label">Partial residuals: each attempt with its own scene's (and route's) effect removed</div>
@@ -228,6 +232,10 @@
           <section class="stats-block" id="stats-spaghetti-block">
             <h3>One line per <span id="stats-spaghetti-unit">scene</span> <span class="muted">&mdash; the model scene by scene</span></h3>
             <p class="stats-cap" id="stats-spaghetti-cap"></p>
+            <div class="seg stats-inline-seg" data-axis-units role="group" aria-label="axis labels">
+              <button type="button" data-units="units" aria-pressed="true">axis labels: attempts &amp; distance</button>
+              <button type="button" data-units="ln" aria-pressed="false">axis labels: ln (model scale)</button>
+            </div>
             <div class="seg stats-inline-seg" id="stats-spaghetti-subject" role="group" aria-label="subject"></div>
             <div class="stats-multiples stats-six" id="stats-spaghetti"></div>
             <div class="stats-legend" id="stats-spaghetti-legend"></div>

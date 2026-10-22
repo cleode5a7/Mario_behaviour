@@ -491,6 +491,46 @@ full fits are singular. Refitting without the collapsed terms:
   sub-03 losing significance on completed attempts only (Holm p 0.17), **sub-03 is the
   least robust of the four route-scale results**; 02, 05 and 06 hold under every variant.
 
+## Level bootstrap of the scene-scale lme4 model (2026-10-22)
+
+The scene and level bootstraps above refit the scene-only model, the main model when they
+were made; the lme4 model that replaced it had only been *compared* with them. It is now
+bootstrapped itself: whole levels resampled per subject, the lme4 model refitted 200 times
+(`docs/practice_lme4_scene_bootstrap.py`, `docs/practice_lme4_scene_boot.R`, seed 0).
+
+| subject | lme4 95% CI | level bootstrap CI | width, bootstrap / model | clear? |
+|---|---|---|---|---|
+| 01 | [−0.033, +0.011] | [−0.028, +0.012] | 0.92 | no / no |
+| 02 | [−0.047, −0.008] | [−0.047, −0.012] | 0.90 | yes / yes |
+| 03 | [−0.070, −0.003] | [−0.069, −0.013] | 0.83 | yes / yes |
+| 05 | [−0.091, −0.043] | [−0.088, −0.049] | 0.84 | yes / yes |
+| 06 | [−0.086, −0.039] | [−0.084, −0.038] | 0.97 | yes / yes |
+
+(`log(d)`; `log1p` 0.81–0.99, same calls.) Every bootstrap CI is a little narrower than the
+model's, so the lme4 CI is if anything cautious. Unlike the scene-only model's level
+bootstrap (up to 1.34x for sub-03), nothing here is wider: the lme4 model's level effect
+already carries the correlation between a level's scenes. Both main models have now been
+bootstrapped directly.
+
+## Multiple-comparison correction: Benjamini-Hochberg replaces Holm (2026-10-22)
+
+**The correction across the five subjects is now Benjamini-Hochberg (BH-FDR), not Holm.**
+Holm controls the chance of *any* false positive among the five; BH controls the false
+discovery rate, the expected share of false positives among the subjects called. The
+switch was made on 2026-10-22, **after the Holm results above were known**, so it should be
+reported as a change of correction, not as the one chosen in advance. It changes exactly
+one call (`log(d)`, all attempts, leave-subject-out medoids):
+
+| model | subject | p | Holm (before) | BH-FDR (now) |
+|---|---|---|---|---|
+| scene scale (lme4) | 03 | 0.026 | 0.052 (borderline) | **0.032** |
+| route scale (lme4) | 03 | 0.017 | 0.034 | 0.021 |
+
+Every other subject's call is the same under both (sub-01 not significant, 02/05/06
+clear), so the scene-scale headline moves from "3 clear + sub-03 borderline" to **4 of 5
+clear after correction**. The Holm figures in the sections above are left as they were
+reported at the time. Code: `_bh_by_family()` in `analysis/practice.py` calls `statsmodels.stats.multitest.multipletests(method="fdr_bh")` and writes `slope_p_bh` to `mixed_summary.csv`; the dashboard, the summary figure and the notebook read that column (the notebook calls `multipletests` itself) rather than adjusting again.
+
 ## Where everything is
 
 **Start with `docs/practice_summary.png`**: every confidence interval for the scene-scale result in
@@ -514,7 +554,8 @@ Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refit
 | same figures, original `log1p` | `output_data/practice/figure_practice_*_log1p.png` |
 | residual diagnostics (9 checks: trend, independence, normality x2, spread, random-effect normality, scene variance, world variance) | `docs/practice_residual_diagnostics_log.png`, `docs/practice_residual_diagnostics_log1p.png` (numbers in the matching `.csv`) |
 | diagnostics script | `docs/practice_residual_diagnostics.py` |
-| bootstraps (CI check) | `docs/practice_scene_bootstrap.png` (figure, scene and level), `docs/practice_level_bootstrap.csv` and `_draws.csv` (level), `docs/practice_scene_bootstrap.csv` (summary), `docs/practice_scene_bootstrap_draws.csv` (all 2,000 slopes), script `docs/practice_scene_bootstrap.py` |
+| bootstrap of the scene-scale lme4 model | `docs/practice_lme4_level_bootstrap.csv` (+ `_draws.csv`), scripts `docs/practice_lme4_scene_bootstrap.py` / `docs/practice_lme4_scene_boot.R` |
+| bootstraps of the scene-only model (CI check) | `docs/practice_scene_bootstrap.png` (figure, scene and level), `docs/practice_level_bootstrap.csv` and `_draws.csv` (level), `docs/practice_scene_bootstrap.csv` (summary), `docs/practice_scene_bootstrap_draws.csv` (all 2,000 slopes), script `docs/practice_scene_bootstrap.py` |
 | interactive view | dashboard → Stats analysis (`invoke dashboard`, then `#stats`); the transform switch flips between the two |
 
 Reproduce: `uv run invoke run-practice-models --force`, then the notebook

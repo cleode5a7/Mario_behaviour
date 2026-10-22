@@ -470,26 +470,88 @@ def _rounded(obj, nd=6):
 # Bootstrap results are exploratory and live under docs/ (docs/practice_scene_bootstrap.py);
 # the export reads them when present so the dashboard's summary view can show them.
 DOCS_DIR = Path(__file__).resolve().parent.parent / "docs"
-SUMMARY_METHODS = ("lme4", "model", "nested", "scene_boot", "level_boot")
+SUMMARY_METHODS = ("lme4", "model", "nested", "lme4_level_boot", "scene_boot", "level_boot")
+# Bootstrap runs under docs/: method key -> file stem. scene_boot / level_boot refit the
+# scene-only model (the main model when they were made); lme4_level_boot refits the lme4
+# scene-scale model itself (docs/practice_lme4_scene_bootstrap.py).
+SUMMARY_BOOTSTRAPS = {"lme4_level_boot": "practice_lme4_level_bootstrap",
+                      "scene_boot": "practice_scene_bootstrap", "level_boot": "practice_level_bootstrap"}
 
 
-def _holm(p: dict) -> dict:
-    """Holm step-down adjustment of {key: p}."""
-    adj, running = {}, 0.0
-    for rank, k in enumerate(sorted(p, key=p.get)):
-        running = max(running, min(1.0, (len(p) - rank) * p[k]))
-        adj[k] = running
-    return adj
+def practice_bh(output_dir: Path) -> dict | None:
+    """Every Benjamini-Hochberg-adjusted slope p-value, keyed for the dashboard.
+
+    Read from ``mixed_summary.csv``'s ``slope_p_bh`` (statsmodels ``multipletests``, one
+    family per fit setting across the subjects; ``_bh_by_family`` in analysis/practice.py),
+    so the browser never adjusts p-values itself. Key: ``structure|measure|transform|
+    completed (0/1)|form|subject``, with ``structure`` as mixed_summary names it
+    (``lme4_nested``, ``lme4_route``, ``scene``, ``level_scene``, ...).
+    """
+    import pandas as pd
+
+    path = Path(output_dir) / "practice" / "mixed_summary.csv"
+    if not path.exists():
+        return None
+    s = pd.read_csv(path, dtype={"subject": str})
+    if "slope_p_bh" not in s.columns:
+        return None
+    s = s.dropna(subset=["slope_p_bh"])
+    return {f"{r.structure}|{r.measure}|{r.transform}|{int(r.completed_only)}|{r.form}|{r.subject}":
+            float(r.slope_p_bh) for r in s.itertuples()}
+
+
+# The bootstraps of each dashboard model's main result: (file stem under docs/, label). The
+# scene-scale model also carries the two bootstraps of the scene-only model, the main model
+# when they were made, as a second check.
+MODEL_BOOTSTRAPS = {
+    "lme4_nested": [("practice_lme4_level_bootstrap", "level bootstrap of this model")],
+    "lme4_route": [("practice_route_level_bootstrap", "level bootstrap of this model")],
+    "scene": [("practice_scene_bootstrap", "scene bootstrap"),
+              ("practice_level_bootstrap", "level bootstrap")],
+}
+
+
+def practice_bootstraps(docs_dir: Path = DOCS_DIR) -> dict | None:
+    """The CI-check bootstraps under ``docs/``, per dashboard model, for the Stats section.
+
+    Per model: the measure the bootstrap ran on and one entry per run (``label``,
+    ``rows``: subject x transform with b, model CI, bootstrap CI, width ratio, both calls,
+    the share of replicate slopes below zero, replicates, failures and, where recorded, the
+    share of singular refits). Copied from the summary CSVs; nothing is resampled here.
+    """
+    import pandas as pd
+
+    out = {}
+    cols = ["transform", "subject", "b", "model_ci_low", "model_ci_high", "boot_ci_low",
+            "boot_ci_high", "width_ratio", "model_excludes_zero", "boot_excludes_zero",
+            "share_boot_below_zero", "n_boot", "n_failed", "share_singular", "n_units", "unit"]
+    for model, runs in MODEL_BOOTSTRAPS.items():
+        entries = []
+        for stem, label in runs:
+            path = docs_dir / f"{stem}.csv"
+            if not path.exists():
+                continue
+            d = pd.read_csv(path, dtype={"subject": str})
+            if "unit" not in d.columns:
+                d["unit"] = "scene"
+            d = d[[c for c in cols if c in d.columns]]
+            entries.append({"label": label, "file": f"docs/{stem}.csv",
+                            "rows": json.loads(d.to_json(orient="records"))})
+        if entries:
+            out[model] = {"measure": "d_own_loso" if model == "lme4_route" else "d_nearest_norm_loso",
+                          "runs": entries}
+    return out or None
 
 
 def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None:
     """Every CI and p-value for the primary measure, all attempts, per transform x subject.
 
     The table behind docs/practice_summary.png, for the dashboard's summary view:
-    ``lme4`` (the scene-scale model: profile CI, Wald p, and ``p_holm`` across
-    subjects), ``model`` (statsmodels scene-only model), ``nested`` (statsmodels nested, no
-    scene correlation), and, when ``docs/practice_*_bootstrap*.csv`` exist, ``scene_boot``
-    and ``level_boot`` (percentile CI; p = 2 x min(share >= 0, share <= 0), floored at the
+    ``lme4`` (the scene-scale model: profile CI, Wald p, and ``p_bh``, Benjamini-Hochberg
+    FDR-adjusted across subjects, read from ``slope_p_bh``), ``model`` (statsmodels scene-only model), ``nested`` (statsmodels nested, no
+    scene correlation), and, when their CSVs exist under ``docs/`` (``SUMMARY_BOOTSTRAPS``),
+    ``lme4_level_boot`` (level bootstrap of the lme4 model itself), ``scene_boot`` and
+    ``level_boot`` (bootstraps of the scene-only model) — each a percentile CI; p = 2 x min(share >= 0, share <= 0), floored at the
     replicate resolution and flagged ``p_floor``). Only ``log`` practice form.
     """
     import pandas as pd
@@ -510,17 +572,19 @@ def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None
         if key:
             out.setdefault(r["transform"], {}).setdefault(r["subject"], {})[key] = {
                 "b": r["slope"], "lo": r["slope_ci_low"], "hi": r["slope_ci_high"],
-                "p": r["slope_p"]}
-    # Holm across the five subjects, for the scene-scale model (lme4; the scene-only model when
-    # lme4 has not been fitted).
+                "p": r["slope_p"], "_p_bh": r.get("slope_p_bh")}
+    # Benjamini-Hochberg across the five subjects (slope_p_bh, statsmodels), shown for the
+    # scene-scale model only (lme4; the scene-only model when lme4 has not been fitted).
     for t, by_subject in out.items():
         key = "lme4" if any("lme4" in m for m in by_subject.values()) else "model"
-        ps = {subj: m[key]["p"] for subj, m in by_subject.items() if key in m}
-        for subj, v in _holm(ps).items():
-            by_subject[subj][key]["p_holm"] = v
-    for unit in ("scene", "level"):
-        summ = docs_dir / f"practice_{unit}_bootstrap.csv"
-        draws = docs_dir / f"practice_{unit}_bootstrap_draws.csv"
+        for m in by_subject.values():
+            for k, v in m.items():
+                bh = v.pop("_p_bh", None)
+                if k == key and bh is not None and not pd.isna(bh):
+                    v["p_bh"] = float(bh)
+    for key, stem in SUMMARY_BOOTSTRAPS.items():
+        summ = docs_dir / f"{stem}.csv"
+        draws = docs_dir / f"{stem}_draws.csv"
         if not (summ.exists() and draws.exists()):
             continue
         dr = pd.read_csv(draws, dtype={"subject": str}).dropna(subset=["b"])
@@ -529,7 +593,7 @@ def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None
             if not len(b) or r["transform"] not in out:
                 continue
             p = min(1.0, 2 * min((b >= 0).mean(), (b <= 0).mean()))
-            out[r["transform"]].setdefault(r["subject"], {})[f"{unit}_boot"] = {
+            out[r["transform"]].setdefault(r["subject"], {})[key] = {
                 "b": r["b"], "lo": r["boot_ci_low"], "hi": r["boot_ci_high"],
                 "p": max(p, 2 / len(b)), "p_floor": bool(p == 0), "n_boot": int(len(b))}
     return {"measure": measure, "methods": list(SUMMARY_METHODS), "by_transform": out}
@@ -675,11 +739,13 @@ def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     ``mixed.json`` (the statsmodels models), and when present ``lme4.json`` (the primary,
     scene-scale model) as ``lme4``, ``lme4_route.json`` (the route-scale model) as
     ``lme4_route``, ``nested.json`` (statsmodels nested structures) as
-    ``nested``, ``practice_summary()`` (every CI and p-value) as ``summary``, and
-    ``assumption_checks()`` as ``diagnostics`` (the diagnostic figures are copied to
+    ``nested``, ``practice_summary()`` (every CI and p-value) as ``summary``,
+    ``practice_bh()`` (every BH-FDR adjusted p, from statsmodels via ``mixed_summary.csv``)
+    as ``bh``, ``practice_bootstraps()`` (the CI-check bootstraps per model) as
+    ``bootstraps``, and ``assumption_checks()`` as ``diagnostics`` (the diagnostic figures are copied to
     ``diagnostics/`` beside it). Only the
     fitted records — coefficients, CIs, p-values, variances, AIC, fixed-effect curves —
-    never the attempts, and nothing is refitted; the data under the lme4 curves goes to a
+    never the attempts, and nothing is refitted; the data under the lme4 curves goes to
     separate files, ``export_fit_data()``: bins plus a thinned point sample, and the
     per-scene fits for the spaghetti panel. ``scenes`` lists are reduced to a count.
     Returns ``None`` when the practice models have not been run.
@@ -699,6 +765,12 @@ def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     summary = practice_summary(output_dir)
     if summary:
         payload["summary"] = summary
+    bh = practice_bh(output_dir)
+    if bh:
+        payload["bh"] = bh
+    boots = practice_bootstraps()
+    if boots:
+        payload["bootstraps"] = boots
     checks = assumption_checks()
     if checks:
         payload["diagnostics"] = checks

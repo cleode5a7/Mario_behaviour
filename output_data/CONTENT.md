@@ -271,9 +271,10 @@ The practice effect, measured as distance to cluster medoids. Written by
   `scene` for the statsmodels main model, `scene_uncorr`, `level_scene`, `lme4_scene`;
   nested rows add `n_levels`, `var_level_intercept`, `var_level_slope`, `corr_level`; lme4
   rows add `ci_method`, `singular` and `lrt_p_levels`), with `transform` and
-  `n_zero_dropped` columns. `slope_p_holm` is `slope_p` Holm-adjusted across the subjects
-  of each fit setting (`structure` × `measure` × `transform` × `completed_only` × `form`),
-  so the route-scale rows carry their own correction, not the scene scale's. `primary` marks the `lme4_nested` rows when `lme4.json` exists,
+  `n_zero_dropped` columns. `slope_p_bh` is `slope_p` adjusted with the Benjamini-Hochberg
+  (FDR) procedure across the subjects of each fit setting (`structure` × `measure` ×
+  `transform` × `completed_only` × `form`), so the route-scale rows carry their own
+  correction, not the scene scale's. It replaced a Holm-adjusted `slope_p_holm` column. `primary` marks the `lme4_nested` rows when `lme4.json` exists,
   the statsmodels main model's otherwise. `primary` marks the five scene-scale main results
   (`d_nearest_norm_loso` on `log(d)`, all attempts, `log` form) and sorts them first; the
   route-scale main results are the `lme4_route` rows for `d_own_loso` on `log(d)`, all attempts.
@@ -291,7 +292,7 @@ The practice effect, measured as distance to cluster medoids. Written by
   logistic GLM `switch ~ C(subject) + log(attempt)` with errors clustered by
   subject × scene (`trend`).
 - `figure_practice_*.png` — from `notebooks/figure_practice.ipynb`: the main analysis, the
-  scene-scale lme4 model's slopes with Holm-adjusted p and its fitted curves (`lme4`); both lme4
+  scene-scale lme4 model's slopes with BH-FDR adjusted p and its fitted curves (`lme4`); both lme4
   models' curves drawn over the attempts they were fitted on, pooled and as binned partial
   residuals (`lme4_data`); each subject's six most-played scenes with each scene's own fitted
   line (`lme4_spaghetti_scene`) and each route's (`lme4_spaghetti_route`); one example
@@ -402,9 +403,13 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   `analysis.webexport.export_practice`, floats rounded to 6 decimals and the `scenes`
   list reduced to `n_scenes`, with `practice/lme4.json` as `lme4`, `practice/lme4_route.json` as
   `lme4_route`, `practice/nested.json` as
-  `nested`, and `summary` — every CI and p-value for the primary measure (lme4, scene-only
-  model with Holm-adjusted p, statsmodels nested, and the scene and level bootstraps read
-  from `docs/practice_*_bootstrap*.csv` when present), per transform and subject, and
+  `nested`, and `summary` — every CI and p-value for the primary measure (lme4 with
+  BH-FDR adjusted p, scene-only model, statsmodels nested, and the scene and level bootstraps read
+  from `docs/practice_*_bootstrap*.csv` when present), per transform and subject, `bh` —
+  every BH-FDR adjusted slope p from `mixed_summary.csv`'s `slope_p_bh`, keyed
+  `structure|measure|transform|completed (0/1)|form|subject`, so the browser never adjusts —
+  `bootstraps` — per dashboard model (`lme4_nested`, `lme4_route`, `scene`), the measure and
+  each CI-check bootstrap's per-subject rows copied from its summary CSV under `docs/` — and
   `diagnostics` — the assumption checks for the scene-scale lme4, route-scale lme4 and
   scene-only statsmodels models, per transform, each on its own main measure (`measure`): each check's question, what a violation affects, and the verdict,
   graded by `docs/practice_residual_diagnostics.py`'s own `verdicts()` from its

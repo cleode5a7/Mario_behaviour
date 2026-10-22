@@ -2160,10 +2160,13 @@ const STATS_MODELS = {
                          "(1 + log(use) | level:scene:route), fitted in R's lme4; Wald CIs" },
 };
 const SUMMARY_COLORS = { lme4: CLUSTER_COLORS[4], model: CLUSTER_COLORS[0], nested: CLUSTER_COLORS[6],
-                         scene_boot: CLUSTER_COLORS[1], level_boot: CLUSTER_COLORS[2] };
+                         lme4_level_boot: CLUSTER_COLORS[3], scene_boot: CLUSTER_COLORS[1],
+                         level_boot: CLUSTER_COLORS[2] };
 const SUMMARY_LABELS = { lme4: "scene scale (lme4) — main", model: "scene only (statsmodels)",
-                         nested: "nested, no scene corr. (statsmodels)", scene_boot: "scene bootstrap",
-                         level_boot: "level bootstrap" };
+                         nested: "nested, no scene corr. (statsmodels)",
+                         lme4_level_boot: "level bootstrap of the lme4 model",
+                         scene_boot: "scene bootstrap (scene-only model)",
+                         level_boot: "level bootstrap (scene-only model)" };
 
 /* One fit of the selected model as {meta, r}: r carries coef / ci / p (keyed by the
  * form's slope term), curve and converged, whatever model it came from. */
@@ -2812,15 +2815,74 @@ function logTicks(lo, hi) {
   return fine.length > 6 && decades.length >= 2 ? decades : fine;
 }
 
-/* Holm step-down over [[key, p], ...]: smallest p times m, next times m - 1, ...,
- * never decreasing, capped at 1. Twin of _holm_by_family in analysis/practice.py. */
-function holmAdjust(pairs) {
-  const sorted = [...pairs].sort((a, b) => a[1] - b[1]);
-  let running = 0;
-  return sorted.map(([k, p], i) => {
-    running = Math.max(running, Math.min(1, (sorted.length - i) * p));
-    return [k, running];
-  });
+/* The Benjamini-Hochberg adjusted p of one fit, as exported (statsData.bh, from mixed_summary.csv's
+ * slope_p_bh, computed by statsmodels' multipletests). The browser never adjusts p-values itself:
+ * one family is one fit setting across the five subjects, as in _bh_by_family. */
+const BH_STRUCTURE = { lme4_nested: "lme4_nested", lme4_route: "lme4_route", scene: "scene",
+                       level_scene: "level_scene" };
+function statsBh(measure, subject) {
+  const { model, transform, form } = state.stats;
+  const completed = state.stats.attempts === "completed" ? 1 : 0;
+  const key = `${BH_STRUCTURE[model]}|${measure}|${transform}|${completed}|${model === "scene" ? form : "log"}|${subject}`;
+  return statsData.bh ? statsData.bh[key] : undefined;
+}
+
+/* CI check by bootstrap: for the selected model, each subject's model CI against the percentile
+ * CI of 200 refits on resampled levels (or scenes), from statsData.bootstraps — copied from the
+ * summary CSVs under docs/ by practice_bootstraps(); nothing is resampled in the browser. */
+function renderStatsBootstrap() {
+  const block = $("stats-boot-block");
+  const model = state.stats.model;
+  const data = statsData.bootstraps && statsData.bootstraps[model];
+  const t = state.stats.transform;
+  const host = $("stats-boot-table");
+  if (!data) {
+    host.innerHTML = "";
+    $("stats-boot-cap").textContent = statsData.bootstraps
+      ? `No bootstrap was run for the ${STATS_MODELS[model].label} model. The two main models ` +
+        "(scene-scale lme4 and route-scale lme4) and the scene-only model have one."
+      : "No bootstrap results in this export: run the scripts under docs/ (see the decisions log), " +
+        "then invoke run-web-export --backfill.";
+    return;
+  }
+  block.hidden = false;
+  const ci = (lo, hi) => `${signed(lo)} to ${signed(hi)}`;
+  const yesNo = (v) => (v ? "<strong>yes</strong>" : "no");
+  const rows = [];
+  for (const run of data.runs) {
+    for (const r of run.rows.filter((x) => x.transform === t).sort((a, b) => a.subject.localeCompare(b.subject))) {
+      const same = r.model_excludes_zero === r.boot_excludes_zero;
+      rows.push(`<tr><td class="subj"><i style="background:${subjColor(r.subject)}"></i>sub-${r.subject}</td>` +
+        `<td>${run.label}</td><td>${signed(r.b)}</td><td>${ci(r.model_ci_low, r.model_ci_high)}</td>` +
+        `<td>${ci(r.boot_ci_low, r.boot_ci_high)}</td><td>${r.width_ratio.toFixed(2)}</td>` +
+        `<td>${yesNo(r.model_excludes_zero)} / ${yesNo(r.boot_excludes_zero)}${same ? "" : " — differs"}</td>` +
+        `<td>${Math.round(100 * r.share_boot_below_zero)}%</td>` +
+        `<td>${r.share_singular != null ? Math.round(100 * r.share_singular) + "%" : "—"}</td>` +
+        `<td>${r.n_boot}${r.n_failed ? ` (${r.n_failed} failed)` : ""}</td></tr>`);
+    }
+  }
+  host.innerHTML =
+    "<thead><tr><th>subject</th><th>bootstrap</th><th>slope b</th><th>model 95% CI</th>" +
+    "<th>bootstrap 95% CI</th><th>width, bootstrap / model</th><th>excludes 0? model / bootstrap</th>" +
+    "<th>replicate slopes &lt; 0</th><th>singular refits</th><th>replicates</th></tr></thead>" +
+    `<tbody>${rows.join("")}</tbody>`;
+  const ratios = data.runs.flatMap((run) => run.rows.filter((x) => x.transform === t).map((x) => x.width_ratio));
+  const changed = data.runs.flatMap((run) => run.rows.filter((x) => x.transform === t &&
+    x.model_excludes_zero !== x.boot_excludes_zero));
+  const notMain = `${state.stats.measure}_loso` !== data.measure || state.stats.attempts !== "all";
+  $("stats-boot-cap").innerHTML =
+    "Is the model's confidence interval right? For each subject, whole " +
+    (model === "scene" ? "scenes (or whole levels)" : "levels") + " were redrawn with replacement, the model " +
+    "refitted 200 times (seed 0), and the 2.5th–97.5th percentile of the refitted slopes taken as the bootstrap CI. " +
+    "Resampling whole units keeps each one's own noise, so the bootstrap does not assume the normal, " +
+    "equal-variance residuals the model's CI formula does. " +
+    `Here (${t}(d)) the bootstrap CIs are ${Math.min(...ratios).toFixed(2)}–${Math.max(...ratios).toFixed(2)} ` +
+    "times the model's width, and " + (changed.length ? `${changed.length} call(s) change.` : "no subject's call changes.") +
+    " Width ratios between about 0.9 and 1.1 mean the same, given 200 replicates" +
+    (model === "scene" ? "; these two runs were made when the scene-only model was the main model." : ".") +
+    ` Run on ${data.measure}, all attempts, log form` +
+    (notMain ? ', <span class="filtered">not the setting chosen above</span>.' : ".") +
+    ` Source: ${data.runs.map((r) => `<code>${r.file}</code>`).join(", ")}.`;
 }
 
 function renderStatsTable() {
@@ -2832,21 +2894,12 @@ function renderStatsTable() {
   const doubling = form === "log" && state.stats.transform === "log";
   const pctDoubling = (b) => `${b < 0 ? "−" : "+"}${Math.abs((2 ** b - 1) * 100).toFixed(1)}%`;
   const head = ["subject", "medoids", "coefficient", "95% CI",
-                ...(doubling ? ["per doubling (95% CI)"] : []), "p", "p, Holm (5 subjects)", "CI excludes 0",
+                ...(doubling ? ["per doubling (95% CI)"] : []), "p", "p, BH-FDR (5 subjects)", "CI excludes 0",
                 `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} 1 (${info.unit})`,
                 `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} ${STATS_AT} (${info.unit})`,
                 "attempts", "zeros dropped",
                 state.stats.model === "lme4_route" ? "routes" : measure === "d_own" ? "series" : "scenes",
                 "converged"];
-  // Holm across the subjects shown, separately for each medoid series: each series is one
-  // family of tests, run once per subject (as slope_p_holm in mixed_summary.csv).
-  const holm = new Map();
-  for (const ser of STATS_SERIES) {
-    const ps = statsData.subjects
-      .map((s) => { const f = modelFit(measure + ser.suffix, s); return [s, f && f.r && f.r.p[term]]; })
-      .filter(([, p]) => p != null);
-    for (const [s, p] of holmAdjust(ps)) holm.set(`${ser.suffix}|${s}`, p);
-  }
   const rows = [];
   for (const s of statsData.subjects) {
     for (const ser of [...STATS_SERIES].reverse()) {
@@ -2861,7 +2914,7 @@ function renderStatsTable() {
         `<td>${ser.suffix ? "leave-subject-out" : "all-subject"}</td>` +
         `<td>${signed(r.coef[term])}</td><td>${signed(lo)} to ${signed(hi)}</td>` +
         (doubling ? `<td>${pctDoubling(r.coef[term])} (${pctDoubling(lo)} to ${pctDoubling(hi)})</td>` : "") +
-        `<td>${fmtP(r.p[term])}</td><td>${fmtP(holm.get(`${ser.suffix}|${s}`))}</td>` +
+        `<td>${fmtP(r.p[term])}</td><td>${fmtP(statsBh(measure + ser.suffix, s))}</td>` +
         `<td class="${clear ? "clear" : "unclear"}">${clear ? "yes" : "no"}</td>` +
         `<td>${statsPredict(r.coef, form, 1).toFixed(info.digits)}</td>` +
         `<td>${statsPredict(r.coef, form, STATS_AT).toFixed(info.digits)}</td>` +
@@ -2873,8 +2926,11 @@ function renderStatsTable() {
   $("stats-table").innerHTML =
     `<thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody>`;
   $("stats-table-cap").textContent =
-    "p, Holm: the p-value corrected for testing the same model on five subjects, separately " +
-    "for all-subject and leave-subject-out medoids; significant after correction when below 0.05. " +
+    "p, BH-FDR: the p-value corrected with the Benjamini-Hochberg procedure for testing the same model " +
+    "on five subjects, separately for all-subject and leave-subject-out medoids; significant after " +
+    "correction when below 0.05. It controls the false discovery rate, the expected share of false " +
+    "positives among the subjects called significant. Computed by statsmodels' multipletests " +
+    "(method fdr_bh) in the analysis, not in the browser. " +
     (doubling
     ? `Per doubling: the change in distance each time the number of ` +
       `${state.stats.model === "lme4_route" ? "uses of a route" : "attempts at a scene"} doubles, ` +
@@ -3016,7 +3072,7 @@ function renderStatsSummary() {
         const rows = [["slope b", signed(v.b)], ["95% CI", `${signed(v.lo)} to ${signed(v.hi)}`],
                       ["p", v.p_floor ? `< ${v.p.toFixed(2)}` : fmtP(v.p)],
                       ["clear effect", clear ? "yes" : "no"]];
-        if (v.p_holm != null) rows.push(["p, Holm-adjusted", fmtP(v.p_holm)]);
+        if (v.p_bh != null) rows.push(["p, BH-FDR adjusted", fmtP(v.p_bh)]);
         hit.addEventListener("mousemove", (ev) =>
           showStatsTooltip(`sub-${s} · ${SUMMARY_LABELS[m]}`, col, rows, ev.clientX, ev.clientY));
         hit.addEventListener("mouseleave", hideStatsTooltip);
@@ -3030,12 +3086,12 @@ function renderStatsSummary() {
     "the practice slope b from one method; filled = it clears zero (a clear effect), hollow = it " +
     "does not. The two panels are in different units: compare calls and widths, never positions.";
 
-  // p-value table: transforms side by side, methods as columns, Holm after the scene model.
+  // p-value table: transforms side by side, methods as columns, BH-FDR after the scene model.
   const cols = [];
   for (const t of order) {
     for (const m of methods) {
       cols.push([t, m, "p"]);
-      if (Object.values(sum.by_transform[t]).some((x) => x[m] && x[m].p_holm != null)) cols.push([t, m, "p_holm"]);
+      if (Object.values(sum.by_transform[t]).some((x) => x[m] && x[m].p_bh != null)) cols.push([t, m, "p_bh"]);
     }
   }
   const subjects = Object.keys(sum.by_transform[order[0]]).sort();
@@ -3044,7 +3100,7 @@ function renderStatsSummary() {
     return `<th colspan="${n}" class="grp">${t === "log" ? "main: log(d)" : "original: log(1 + d)"}</th>`;
   }).join("");
   const colHead = cols.map(([, m, k]) =>
-    `<th>${k === "p_holm" ? `${m === "lme4" ? "scene scale" : "scene only"},<br>Holm-adjusted`
+    `<th>${k === "p_bh" ? `${m === "lme4" ? "scene scale" : "scene only"},<br>BH-FDR adjusted`
                           : SUMMARY_LABELS[m].replace(" (", "<br>(").replace(" — main", "")}</th>`).join("");
   const body = subjects.map((s) => `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
     cols.map(([t, m, k]) => {
@@ -3060,9 +3116,13 @@ function renderStatsSummary() {
     "<strong>How each p-value is computed</strong> — every one a two-sided test of no practice effect (b = 0). " +
     "<em>Fitted models</em> (scene-scale lme4, scene only, nested statsmodels): Wald z test, z = b / SE with the SE " +
     "from the model, p from a normal curve; lme4's bars above are profile-likelihood CIs. " +
-    "<em>Holm-adjusted</em>: the scene-scale model's p-values corrected for testing five subjects. " +
+    "<em>BH-FDR adjusted</em>: the scene-scale model's p-values corrected for testing five subjects with " +
+    "the Benjamini-Hochberg procedure, which controls the expected share of false positives among the " +
+    "subjects called significant. " +
     "<em>Bootstraps</em>: the share of 200 resampled slopes on the far side of zero, doubled; no normality " +
-    "assumed, and with 200 replicates the smallest it can show is 0.01. Bold = p < 0.05, the same call as an " +
+    "assumed, and with 200 replicates the smallest it can show is 0.01. The lme4 level bootstrap refits the " +
+    "main scene-scale model itself; the scene and level bootstraps of the scene-only model were made when that " +
+    "was the main model, and are kept as a second check. Bold = p < 0.05, the same call as an " +
     "interval clearing zero. The columns are different methods for the same question, not repeated tests.";
 }
 
@@ -3148,6 +3208,7 @@ function renderStats() {
   renderStatsFitData();
   renderStatsSpaghetti();
   renderStatsTable();
+  renderStatsBootstrap();
   renderStatsChecks();
   $("stats-note").innerHTML =
     "Each subject is fitted separately, by maximum likelihood. There are <strong>two main models</strong>, " +

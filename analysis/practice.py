@@ -806,7 +806,7 @@ def mixed_summary(mixed: dict, nested: dict | None = None, lme4: dict | None = N
     sorder = {k: i for i, k in enumerate(("lme4_nested", "lme4_route", "scene") + STRUCTURES
                                          + ("lme4_scene",))}
     df = pd.DataFrame(rows)
-    df["slope_p_holm"] = _holm_by_family(df)
+    df["slope_p_bh"] = _bh_by_family(df)
     df["_form"] = df["form"].map(order)
     df["_tr"] = df["transform"].map(torder)
     df["_st"] = df["structure"].map(sorder)
@@ -815,24 +815,27 @@ def mixed_summary(mixed: dict, nested: dict | None = None, lme4: dict | None = N
               .drop(columns=["_form", "_tr", "_st"]).reset_index(drop=True))
 
 
-# One family of tests = one fit setting run once per subject; Holm corrects across the
-# subjects in it, as the headline does ("tested on five subjects").
-HOLM_FAMILY = ["structure", "measure", "transform", "completed_only", "form"]
+# One family of tests = one fit setting run once per subject; the Benjamini-Hochberg
+# correction runs across the subjects in it, as the headline does ("tested on five subjects").
+TEST_FAMILY = ["structure", "measure", "transform", "completed_only", "form"]
 
 
-def _holm_by_family(df: pd.DataFrame) -> pd.Series:
-    """Holm-adjusted ``slope_p`` across the subjects of each ``HOLM_FAMILY`` group.
+def _bh_by_family(df: pd.DataFrame) -> pd.Series:
+    """Benjamini-Hochberg FDR-adjusted ``slope_p`` across the subjects of each ``TEST_FAMILY``.
 
-    Step-down: the smallest p times m, the next times m - 1, ..., never decreasing and
-    capped at 1. A missing p stays missing and does not count towards m.
+    Computed by ``statsmodels.stats.multitest.multipletests(method="fdr_bh")``. It controls
+    the false discovery rate, the expected share of false positives among the subjects
+    called significant. A missing p stays missing and does not count towards m. This column
+    is the one source of BH values: the dashboard and the summary figure read it rather than
+    adjusting again.
     """
+    from statsmodels.stats.multitest import multipletests
+
     out = pd.Series(np.nan, index=df.index)
-    for _, g in df.groupby(HOLM_FAMILY, dropna=False):
-        p = g["slope_p"].dropna().sort_values()
-        running = 0.0
-        for rank, (i, v) in enumerate(p.items()):
-            running = max(running, min(1.0, (len(p) - rank) * v))
-            out[i] = running
+    for _, g in df.groupby(TEST_FAMILY, dropna=False):
+        p = g["slope_p"].dropna()
+        if len(p):
+            out[p.index] = multipletests(p.to_numpy(), method="fdr_bh")[1]
     return out
 
 

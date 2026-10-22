@@ -4,12 +4,13 @@ For the primary measure (``d_nearest_norm_loso``, ``log`` practice form, all att
 per subject: the original ``log1p(d)`` model, the scene-scale lme4 model and the
 bootstraps (left), and the ``log(d)`` model, the statsmodels nested model (no scene
 correlation), the scene-scale lme4 model (profile CI, Wald where the profile failed) and
-the scene and level bootstraps (right). The two
+the bootstraps (right): a level bootstrap of the lme4 model itself, and the scene and level
+bootstraps of the scene-only model, made when that was the main model. The two
 transforms' slopes are in different units, so they get separate panels, never one axis.
 A filled marker means the CI clears zero, hollow means it does not. Below the panels, a
 table of the p-value each method gives for the same slope, with how each is computed:
-Wald z tests for the fitted models (Holm-adjusted across the five subjects for the main
-model) and percentile-bootstrap p-values for the two bootstraps.
+Wald z tests for the fitted models (Benjamini-Hochberg FDR-adjusted across the five subjects for the main
+model) and percentile-bootstrap p-values for the bootstraps.
 
 Reads ``output_data/practice/mixed_summary.csv`` (the statsmodels fits and the primary lme4
 model, ``run-practice-lme4``) and the bootstrap CSVs under ``docs/``; refits nothing. Writes ``docs/practice_summary.png``.
@@ -39,14 +40,21 @@ SUMMARY = HERE.parent / "output_data" / "practice" / "mixed_summary.csv"
 METHODS = {
     "log1p": [("model", "model CI (formula)", CLUSTER_COLORS[0]),
               ("lme4", "scene scale, lme4", CLUSTER_COLORS[4]),
-              ("scene_boot", "scene bootstrap", CLUSTER_COLORS[1]),
-              ("level_boot", "level bootstrap", CLUSTER_COLORS[2])],
+              ("lme4_level_boot", "level bootstrap of the lme4 model", CLUSTER_COLORS[3]),
+              ("scene_boot", "scene bootstrap (scene-only model)", CLUSTER_COLORS[1]),
+              ("level_boot", "level bootstrap (scene-only model)", CLUSTER_COLORS[2])],
     "log": [("model", "model CI (formula)", CLUSTER_COLORS[0]),
             ("nested", "nested, no scene corr. (statsmodels)", CLUSTER_COLORS[6]),
             ("lme4", "scene scale, lme4", CLUSTER_COLORS[4]),
-            ("scene_boot", "scene bootstrap", CLUSTER_COLORS[1]),
-            ("level_boot", "level bootstrap", CLUSTER_COLORS[2])],
+            ("lme4_level_boot", "level bootstrap of the lme4 model", CLUSTER_COLORS[3]),
+            ("scene_boot", "scene bootstrap (scene-only model)", CLUSTER_COLORS[1]),
+            ("level_boot", "level bootstrap (scene-only model)", CLUSTER_COLORS[2])],
 }
+# Bootstrap runs: method key -> file stem under docs/. scene_boot and level_boot refit the
+# scene-only model (the main model when they were made); lme4_level_boot refits the lme4
+# scene-scale model itself (docs/practice_lme4_scene_bootstrap.py).
+BOOTSTRAPS = {"scene_boot": "practice_scene_bootstrap", "level_boot": "practice_level_bootstrap",
+              "lme4_level_boot": "practice_lme4_level_bootstrap"}
 TITLES = {"log1p": "Original analysis: log(1 + d)", "log": "Main analysis: log(d)"}
 
 
@@ -60,27 +68,18 @@ def intervals():
         key = {"scene": "model", "level_scene": "nested", "lme4_nested": "lme4"}.get(r["structure"])
         if key:
             out[(r["transform"], key, r["subject"])] = (r["slope"], r["slope_ci_low"], r["slope_ci_high"])
-    for unit in ("scene", "level"):
-        path = HERE / f"practice_{unit}_bootstrap.csv"
+    for key, stem in BOOTSTRAPS.items():
+        path = HERE / f"{stem}.csv"
         if not path.exists():
             continue
         for _, r in pd.read_csv(path, dtype={"subject": str}).iterrows():
-            out[(r["transform"], f"{unit}_boot", r["subject"])] = (r["b"], r["boot_ci_low"], r["boot_ci_high"])
+            out[(r["transform"], key, r["subject"])] = (r["b"], r["boot_ci_low"], r["boot_ci_high"])
     return out
 
 
-def holm(p):
-    """Holm step-down adjustment of a Series of p-values."""
-    order = p.sort_values().index
-    adj, running = {}, 0.0
-    for rank, k in enumerate(order):
-        running = max(running, min(1.0, (len(p) - rank) * p[k]))
-        adj[k] = running
-    return pd.Series(adj)[p.index]
-
-
 def pvalues():
-    """{(transform, method, subject): p} for every interval drawn, plus ("log", "holm", s)."""
+    """{(transform, method, subject): p} for every interval drawn, plus ("log", "bh", s): the
+    main model's p-values Benjamini-Hochberg FDR-adjusted across the five subjects."""
     out = {}
     s = pd.read_csv(SUMMARY, dtype={"subject": str})
     s = s[(s["measure"] == PRIMARY) & ~s["completed_only"].astype(bool) & (s["form"] == "log")]
@@ -88,17 +87,17 @@ def pvalues():
         key = {"scene": "model", "level_scene": "nested", "lme4_nested": "lme4"}.get(r["structure"])
         if key:
             out[(r["transform"], key, r["subject"])] = r["slope_p"]
-    main_p = pd.Series({k[2]: v for k, v in out.items() if k[:2] == ("log", "lme4")})
-    for subj, v in holm(main_p).items():
-        out[("log", "holm", subj)] = v
-    for unit in ("scene", "level"):
-        path = HERE / f"practice_{unit}_bootstrap_draws.csv"
+        if key == "lme4" and r["transform"] == "log":
+            # slope_p_bh: statsmodels' multipletests (fdr_bh) across the five subjects.
+            out[("log", "bh", r["subject"])] = r["slope_p_bh"]
+    for key, stem in BOOTSTRAPS.items():
+        path = HERE / f"{stem}_draws.csv"
         if not path.exists():
             continue
         d = pd.read_csv(path, dtype={"subject": str}).dropna(subset=["b"])
         for (t, subj), g in d.groupby(["transform", "subject"]):
             b = g["b"].to_numpy()
-            out[(t, f"{unit}_boot", subj)] = (min(1.0, 2 * min((b >= 0).mean(), (b <= 0).mean())),
+            out[(t, key, subj)] = (min(1.0, 2 * min((b >= 0).mean(), (b <= 0).mean())),
                                               len(b))
     return out
 
@@ -114,16 +113,19 @@ def fmt_p(v):
 
 
 TABLE_COLS = [("log1p", "model", "model\n(formula)"), ("log1p", "lme4", "scene scale\n(lme4)"),
-              ("log1p", "scene_boot", "scene\nbootstrap"), ("log1p", "level_boot", "level\nbootstrap"),
-              ("log", "lme4", "scene scale\n(lme4), main"), ("log", "holm", "scene scale,\nHolm-adjusted"),
+              ("log1p", "lme4_level_boot", "level bootstrap\n(lme4)"),
+              ("log1p", "scene_boot", "scene bootstrap\n(scene-only)"), ("log1p", "level_boot", "level bootstrap\n(scene-only)"),
+              ("log", "lme4", "scene scale\n(lme4), main"), ("log", "bh", "scene scale,\nBH-FDR adjusted"),
               ("log", "model", "model\n(formula)"), ("log", "nested", "nested, no scene\ncorr. (statsmodels)"),
-              ("log", "scene_boot", "scene\nbootstrap"), ("log", "level_boot", "level\nbootstrap")]
+              ("log", "lme4_level_boot", "level bootstrap\n(lme4)"),
+              ("log", "scene_boot", "scene bootstrap\n(scene-only)"), ("log", "level_boot", "level bootstrap\n(scene-only)")]
 P_NOTE = (
     "How each p-value is computed - every one is a two-sided test of 'no practice effect' (b = 0) for that subject.\n"
     "  -  Model (formula), statsmodels nested, scene scale (lme4): Wald z test. The fitted model gives the slope b and its standard error SE "
     "(which assumes normal, equal-variance, independent noise); z = b / SE, and p = 2 x P(|Z| > |z|) on a normal curve.\n"
     "      lme4's intervals drawn above are profile-likelihood CIs; its p-value here is the Wald one, which gives the same call in all 18 fits with a profile CI (the 2 without one fall back to Wald CIs above too).\n"
-    "  -  Holm-adjusted: the main analysis's (scene-scale lme4, log(d)) p-values corrected for testing five subjects (smallest p x 5, next x 4, ...; never decreasing).\n"
+    "  -  BH-FDR adjusted: the main analysis's (scene-scale lme4, log(d)) p-values corrected for testing five subjects with the Benjamini-Hochberg procedure "
+    "(k-th smallest p x 5 / k, then never decreasing from the largest down); it controls the expected share of false positives among the subjects called.\n"
     "  -  Scene / level bootstrap: the share of the 200 resampled slopes on the far side of zero, doubled - p = 2 x min(share >= 0, share <= 0). "
     "No normality is assumed.\n"
     "      With 200 replicates the smallest p it can show is 2/200 = 0.01, so '< 0.01' means none of the 200 slopes crossed zero.\n"

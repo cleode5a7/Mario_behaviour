@@ -1,4 +1,5 @@
-# Full nested practice model in lme4 — the primary practice-effect model.
+# Scene-scale practice model in lme4 — one of the two main practice-effect models
+# (the other is the route-scale model, analysis/practice_lme4_route.R).
 #
 # Called by analysis.practice.run_practice_lme4 with the exact model frames the
 # statsmodels fits use (same transforms, same dropped zeros, same distances). Per
@@ -7,7 +8,7 @@
 #   scene  : y ~ logt + (1 + logt | scene)
 #            the statsmodels main model, refitted here as a cross-check between programs
 #   nested : y ~ logt + (1 + logt | level) + (1 + logt | level:scene)
-#            the primary model: levels AND correlated scene effects, which statsmodels
+#            the scene-scale model: levels AND correlated scene effects, which statsmodels
 #            cannot nest
 # For each: intercept and slope, Wald CI (b +/- 1.96 SE, as statsmodels reports) and
 # profile-likelihood CI, Wald p, variance components at every level, AIC, singularity,

@@ -1,6 +1,7 @@
-# Within-route practice model in lme4 — the secondary (mechanism) analysis.
+# Route-scale (within-route) practice model in lme4 — one of the two main practice-effect
+# models, beside the scene-scale model (analysis/practice_lme4.R).
 #
-# The primary model asks whether attempts become more typical of *some* route; its
+# The scene-scale model asks whether attempts become more typical of *some* route; its
 # distance is measured against the nearest prototype, which changes from attempt to
 # attempt. This model fixes the origin: each attempt's Fréchet distance (px) to its OWN
 # route's prototype, with practice counted as the nth use of that route, and routes

@@ -4,9 +4,23 @@ A record of how the practice-effect model was chosen, what was checked, and what
 open. Every number here comes from files in this repository, listed under each section, so
 it can be checked against them.
 
-## The main analysis
+## The main analysis: two scales
 
-**Primary model: the full nested linear mixed model, fitted in R's lme4**, one per participant:
+The practice effect is read at two scales, both main results, each a log-log linear mixed
+model fitted in R's lme4 with one model per participant:
+
+- **Scene scale** (this section): does behaviour become prototypical of *some* route?
+  Distance to the nearest route prototype against attempt number, scenes nested in levels.
+- **Route scale** (below, "Route-scale model"): is each route executed more precisely as it
+  is reused? Distance to the attempt's own route prototype against the nth use of that
+  route, routes nested in scenes in levels.
+
+Naming: these were first called the "full nested" model ("full" against the statsmodels
+nested model, which could not keep the scene correlation) and the "within-route
+(secondary)" model, added later as a mechanism check. They were renamed once the two were
+being reported together, since the route-scale model is in fact the more deeply nested one.
+
+**Scene-scale model**, one per participant:
 
 ```
 log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)
@@ -321,7 +335,7 @@ conservative choice for the CIs; the main model remains the best-fitting descrip
 `output_data/practice/figure_practice_structures.png` shows the slopes and AIC side by
 side.
 
-## Full nested model in lme4: levels and the scene correlation together
+## Scene-scale model in lme4: levels and the scene correlation together (formerly "full nested")
 
 The statsmodels nested model above had to drop the scene intercept-slope correlation.
 R's `lme4` fits the model with both — `y ~ log(attempt) + (1 + log(attempt) | level) +
@@ -333,7 +347,7 @@ statsmodels fit to within 1.4e-6 on the slope and 0.0002 on AIC, for every subje
 transform and attempt set. The two programs agree, so the new model can be trusted on
 the same footing.
 
-| subject (`log(d)`) | main b | full nested b | nested 95% CI (profile) | CI width vs main | levels add anything? (LRT p) | clear? |
+| subject (`log(d)`) | main b | scene-scale b | nested 95% CI (profile) | CI width vs main | levels add anything? (LRT p) | clear? |
 |---|---|---|---|---|---|---|
 | 01 | −0.011 | −0.011 | [−0.033, +0.011] | 1.02 | yes (0.0002) | no |
 | 02 | −0.028 | −0.028 | [−0.047, −0.008] | 1.00 | no (1.0; level variance 0) | yes |
@@ -347,7 +361,7 @@ the same footing.
 - **The widening matches** the level bootstrap and the statsmodels nested model (sub-03:
   1.35 here, 1.34 level bootstrap, 1.37 statsmodels nested) — three methods agree.
 - **This resolves the earlier AIC puzzle.** The statsmodels nested model fit worse than
-  the main model only because it lacked the scene correlation; with it, the full nested
+  the main model only because it lacked the scene correlation; with it, the scene-scale
   model is as good or better (AIC lower for sub-01, 03, 05; within ~6 for 02, 06).
 - **Singular fits** (sub-02 throughout, and some `log1p` / completed-only fits): lme4
   estimates the level variances at zero, i.e. levels do not differ for that subject.
@@ -357,11 +371,11 @@ the same footing.
 - Profile-likelihood CIs are reported because they do not rely on the slope's estimate
   being normally distributed; they agree with the Wald CIs to within ~0.002.
 
-**Assumption checks for this model.** The same nine checks were run on the full nested
+**Assumption checks for this model.** The same nine checks were run on the scene-scale
 model (`uv run python docs/practice_residual_diagnostics.py lme4`, figures
 `docs/practice_residual_diagnostics_lme4_log.png` / `_log1p.png`):
 
-| check | main model (`log(d)`) | full nested lme4 (`log(d)`) |
+| check | main model (`log(d)`) | scene-scale lme4 (`log(d)`) |
 |---|---|---|
 | trend shape (largest bin bias) | 0.035 | 0.035 |
 | independence (largest lag-1 r) | 0.04 | 0.04 |
@@ -392,12 +406,12 @@ changed. It is now part of the pipeline (`invoke run-practice-lme4`). Without R 
 pipeline falls back to the scene-only statsmodels model as primary; with a level-bootstrap
 CI that is the Python-only equivalent.
 
-## Secondary analysis: within-route refinement
+## Route-scale model: within-route refinement
 
-**Why.** The main model's distance is to the *nearest* prototype, and the nearest prototype
+**Why.** The scene-scale model's distance is to the *nearest* prototype, and the nearest prototype
 changes from attempt to attempt: about half of consecutive attempts at a scene are
 measured against a different prototype (49-56% the same early on, 53-68% later — players
-increasingly stay with one route). So the main slope is a trend in a *typicality score*
+increasingly stay with one route). So the scene-scale slope is a trend in a *typicality score*
 ("how typical of some established route is this attempt?"), not one quantity evolving,
 and it cannot say whether players refine their routes or only settle on them.
 
@@ -423,23 +437,64 @@ levels would take hours; on the two-level model it matched Wald to ~0.002).
 
 - **Each further use of a route is executed closer to that route's prototype**, for the same
   four participants, and all four survive the Holm correction here (sub-03 included).
-  So the main effect is not only settling on routes or fewer odd attempts: **players refine
+  So the scene-scale effect is not only settling on routes or fewer odd attempts: **players refine
   the routes they use.** sub-01 again shows no clear change.
 - With all-player prototypes (`d_own`) every participant, sub-01 included, comes out clear —
   but there a player's own later uses help define the prototype they are measured against.
-  The leave-subject-out version is the honest one, and it matches the main result.
+  The leave-subject-out version is the honest one, and it matches the scene-scale result.
 - **30 of 40 fits are singular**, mostly with the scene and level slope variances at zero:
   once routes are separated, differences in learning rate sit at the route level. That is an
   answer about where the variation is, not a fitting failure; no fit raised a warning.
 - Caveats: series are short (a route is used a median of ~4 times at a scene), so the
   estimate rests on routes players kept using; routes come from clustering the same traces,
-  all attempts at once; and like the main effect, the trend is a small average drift,
+  all attempts at once; and like the scene-scale effect, the trend is a small average drift,
   not visible attempt by attempt.
+
+**Assumption checks for the route-scale model** (`uv run python
+docs/practice_residual_diagnostics.py route`; level bootstrap from
+`uv run python docs/practice_route_bootstrap.py`, B=200, ~50 min on 11 cores — a resampled
+fit takes 13-22 s against 3-6 s on the real data). The same ten checks, with the route as
+the unit and the nth use as the clock (`docs/practice_residual_diagnostics_route_log.png`):
+
+| check | `log(d_own_loso)` |
+|---|---|
+| shape of the trend (protects the slope) | OK — largest bin bias 0.04 |
+| independence (consecutive uses of a route) | OK — largest \|r\| 0.06 |
+| normality | violated by heavy tails (kurtosis 4-7), not skew (−0.2 to 0.2) |
+| constant spread | violated — residual SD up to ×2.7, larger at *low* predicted distances |
+| route random effects | one extreme route per subject (up to 17.9 SD) |
+| equal variance across routes | violated (×1.9 the shuffled chance level) |
+| equal random-effect variance by world | 2 of 5 subjects beyond chance |
+| **level bootstrap vs Wald CI** | **widths ×0.76-1.19, every clear/not-clear call unchanged** (`log1p`: ×0.80-1.22) |
+
+So the residuals violate more than the scene-scale model's do, but the two checks that
+protect the slope pass, and the bootstrap — which assumes neither normal noise nor
+independent scenes — reproduces the model's calls for all five subjects. The Wald CI is
+narrower than the bootstrap's only for sub-06 (×1.19), and sub-06 stays clear either way.
+
+**Singular fits** (`docs/practice_route_simplified.csv`, from the same run). Four of five
+full fits are singular. Refitting without the collapsed terms:
+
+| subject | full b (SE) | no level/scene slopes | all correlations dropped |
+|---|---|---|---|
+| 01 | −0.008 (0.008) | −0.009 (0.008) | −0.002 (0.008) |
+| 02 | −0.023 (0.008) | −0.024 (0.008) | −0.018 (0.008) |
+| 03 | −0.034 (0.014) | −0.029 (0.010) | −0.027 (0.014) — **CI crosses 0** |
+| 05 | −0.046 (0.010) | −0.039 (0.008) | −0.040 (0.010) |
+| 06 | −0.043 (0.010) | −0.039 (0.008) | −0.037 (0.010) |
+
+- **No level/scene slopes** — `(1 | level) + (1 | level:scene) + (1 + log(use) | level:scene:route)`
+  — is never singular, has the lower AIC for four of five subjects (by 1-7; sub-03 +2.6),
+  and gives the same four clear subjects with slopes 0-15% smaller. The singularity did
+  not shape the conclusion, and this simpler model is a defensible alternative.
+- **Dropping every correlation** loses sub-03 (b −0.027, CI just crossing 0). Together with
+  sub-03 losing significance on completed attempts only (Holm p 0.17), **sub-03 is the
+  least robust of the four route-scale results**; 02, 05 and 06 hold under every variant.
 
 ## Where everything is
 
-**Start with `docs/practice_summary.png`**: every confidence interval for the main result in
-one figure — the original `log1p` model, the full nested lme4 model and the bootstraps,
+**Start with `docs/practice_summary.png`**: every confidence interval for the scene-scale result in
+one figure — the original `log1p` model, the scene-scale lme4 model and the bootstraps,
 then the same for `log(d)` plus the statsmodels nested model — with each interval's
 clear/not-clear call marked.
 Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refitting).
@@ -447,8 +502,9 @@ Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refit
 | what | file |
 |---|---|
 | summary of every CI | `docs/practice_summary.png`, script `docs/practice_summary_plot.py` |
-| **primary model: full nested (lme4)** | `output_data/practice/lme4.json` (and its `lme4_nested` rows in `mixed_summary.csv`); `invoke run-practice-lme4`, code `analysis/practice_lme4.R` |
-| within-route model (secondary) | `output_data/practice/lme4_route.json` (rows `lme4_route` in `mixed_summary.csv`); code `analysis/practice_lme4_route.R` |
+| **scene-scale model (lme4)** | `output_data/practice/lme4.json` (and its `lme4_nested` rows in `mixed_summary.csv`); `invoke run-practice-lme4`, code `analysis/practice_lme4.R` |
+| **route-scale model (lme4)** | `output_data/practice/lme4_route.json` (rows `lme4_route` in `mixed_summary.csv`); code `analysis/practice_lme4_route.R` |
+| its assumption checks | `docs/practice_residual_diagnostics_route_log.png` / `_route_log1p.png` (+ `.csv`); residuals and simplified refits from `docs/practice_lme4_route_resid.R` into `docs/practice_route_simplified.csv`; level bootstrap `docs/practice_route_level_bootstrap.csv` (+ `_draws.csv`) from `docs/practice_route_bootstrap.py` / `docs/practice_lme4_route_boot.R` |
 | its assumption checks | `docs/practice_residual_diagnostics_lme4_log.png` / `_lme4_log1p.png` (+ `.csv`); residuals from `docs/practice_lme4_resid.R` |
 | model code | `analysis/practice.py` (`fit_mixed`, `TRANSFORMS`, `PRIMARY_TRANSFORM`) |
 | all fits, both transforms | `output_data/practice/mixed.json` |

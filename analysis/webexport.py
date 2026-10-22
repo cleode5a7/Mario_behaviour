@@ -202,6 +202,42 @@ def leaf_order(scene_id, output_dir, out_traces, consensus) -> list[int] | None:
         return None
 
 
+def add_candidate_cuts(scene_id, output_dir, report) -> None:
+    """Give every candidate in the curve its ``bounds``, rebuilding them if needed.
+
+    ``bounds`` is a cut expressed as ``k - 1`` split positions in the dendrogram leaf
+    order (see ``stability.cut_bounds``), which is what lets the payload carry *every*
+    candidate partition for a few hundred bytes and the dashboard offer a cut other
+    than the one that was selected. Without it the browser could only draw the chosen k.
+
+    Files written before the bounds were recorded get them rebuilt here from the stored
+    co-association matrix, exactly as ``leaf_order`` rebuilds the leaf order and for the
+    same reason: ``_consensus_tree`` and ``_candidate_cuts`` are pure functions of ``C``
+    and the settings the file records, so this is the same candidate list, not a second
+    one. A scene with no stored matrix keeps its curve and simply offers no alternative
+    cuts — the dashboard falls back to the chosen labels.
+    """
+    from analysis.stability import consensus_cut_bounds
+
+    rows = report.get("k_candidates") or []
+    if not rows or all("bounds" in r for r in rows):
+        return
+    src = coassociation_path(scene_id, output_dir)
+    if not src.exists():
+        return
+    C = np.load(src).astype(float) / 65535.0
+    bounds = consensus_cut_bounds(
+        C,
+        input=report.get("input", "features"),
+        linkage_method=report.get("linkage", "ward"),
+        k_max=report.get("k_max", 15),
+        min_cluster_size=report.get("min_cluster_size", 1),
+    )
+    for row in rows:
+        if "bounds" not in row and row["k"] in bounds:
+            row["bounds"] = bounds[row["k"]]
+
+
 def selection_report(scene_id, output_dir, out_traces=None) -> dict | None:
     """The k-selection record for one scene, read back from its cluster file.
 
@@ -239,8 +275,23 @@ def selection_report(scene_id, output_dir, out_traces=None) -> dict | None:
     # matrix it was served without knowing anything about cluster-file ordering.
     if out_traces is not None and report.get("consensus_cluster") == "ward":
         report["leaves"] = leaf_order(scene_id, output_dir, out_traces, report)
+        add_candidate_cuts(scene_id, output_dir, report)
+        # The elbow is a pure function of the stored curve, so a file written before the
+        # rule existed still gets one — the same reconstruction the leaf order gets, and
+        # unlike the leaf order it needs nothing but the curve itself. It is a reading,
+        # not a re-analysis: `selection` still says which rule made these labels.
+        if report.get("elbow") is None and report.get("k_candidates"):
+            from analysis.stability import elbow_k
+            report["elbow"] = elbow_k(report["k_candidates"])
     else:
         report.pop("leaves", None)
+
+    # The bounds are only usable alongside the leaf order they index into. Shipping
+    # them without it would let the browser decode positions against payload order and
+    # paint a partition that never existed.
+    if not report.get("leaves"):
+        for row in report.get("k_candidates") or []:
+            row.pop("bounds", None)
     return report
 
 
@@ -435,7 +486,7 @@ def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None
     """Every CI and p-value for the primary measure, all attempts, per transform x subject.
 
     The table behind docs/practice_summary.png, for the dashboard's summary view:
-    ``lme4`` (the primary, full nested model: profile CI, Wald p, and ``p_holm`` across
+    ``lme4`` (the scene-scale model: profile CI, Wald p, and ``p_holm`` across
     subjects), ``model`` (statsmodels scene-only model), ``nested`` (statsmodels nested, no
     scene correlation), and, when ``docs/practice_*_bootstrap*.csv`` exist, ``scene_boot``
     and ``level_boot`` (percentile CI; p = 2 x min(share >= 0, share <= 0), floored at the
@@ -460,7 +511,7 @@ def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None
             out.setdefault(r["transform"], {}).setdefault(r["subject"], {})[key] = {
                 "b": r["slope"], "lo": r["slope_ci_low"], "hi": r["slope_ci_high"],
                 "p": r["slope_p"]}
-    # Holm across the five subjects, for the primary model (lme4; the scene-only model when
+    # Holm across the five subjects, for the scene-scale model (lme4; the scene-only model when
     # lme4 has not been fitted).
     for t, by_subject in out.items():
         key = "lme4" if any("lme4" in m for m in by_subject.values()) else "model"
@@ -484,17 +535,153 @@ def practice_summary(output_dir: Path, docs_dir: Path = DOCS_DIR) -> dict | None
     return {"measure": measure, "methods": list(SUMMARY_METHODS), "by_transform": out}
 
 
+DIAGNOSTICS_SCRIPT = DOCS_DIR / "practice_residual_diagnostics.py"
+# Diagnostic runs the dashboard can show: (key, model label, file stem under docs/).
+DIAGNOSTIC_RUNS = [("lme4", "scene scale (lme4)", "practice_residual_diagnostics_lme4_{t}"),
+                   ("route", "route scale (lme4)", "practice_residual_diagnostics_route_{t}"),
+                   ("scene", "scene only (statsmodels)", "practice_residual_diagnostics_{t}")]
+# The measure each run was checked on (the main result of that model).
+DIAGNOSTIC_MEASURE = {"lme4": "d_nearest_norm_loso", "route": "d_own_loso",
+                      "scene": "d_nearest_norm_loso"}
+_STATUS = {"OK": "ok", "MILD": "mild", "MIXED": "mild", "CONCERN": "mild",
+           "NOT RUN": "mild", "VIOLATED": "bad", "CHANGES": "bad"}
+
+
+def assumption_checks(docs_dir: Path = DOCS_DIR) -> dict | None:
+    """The residual and random-effect checks, as stored by docs/practice_residual_diagnostics.py.
+
+    Reads the per-subject numbers in ``docs/practice_residual_diagnostics*.csv`` and grades
+    them with that script's own ``verdicts()`` (imported, not copied), so the dashboard and
+    the diagnostic figures can never disagree. Row 9 uses the same bootstrap comparison the
+    figure does: the level bootstrap against the lme4 CI, or the scene (+ level) bootstrap
+    against the statsmodels CI. Nothing is refitted. ``None`` when no run is on disk.
+    """
+    import importlib.util
+
+    import pandas as pd
+
+    if not DIAGNOSTICS_SCRIPT.exists():
+        return None
+    spec = importlib.util.spec_from_file_location("practice_residual_diagnostics",
+                                                  DIAGNOSTICS_SCRIPT)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    def row(t):
+        title, question, look, affects = t
+        return {"title": title, "question": question, "look_for": look, "affects": affects}
+
+    runs = {}
+    for key, label, stem in DIAGNOSTIC_RUNS:
+        for t in ("log", "log1p"):
+            csv = Path(docs_dir) / f"{stem.format(t=t)}.csv"
+            if not csv.exists():
+                continue
+            m = pd.read_csv(csv, dtype={"subject": str})
+            boot, _ = (mod.load_route_vs_level(t) if key == "route" else
+                       mod.load_lme4_vs_level(t) if key == "lme4" else mod.load_boot(t))
+            rows = (mod.ROUTE_ROWS if key == "route" else
+                    mod.ROWS[:-1] + [mod.LME4_ROW9 if key == "lme4" else mod.ROWS[-1]])
+            unit = "route" if key == "route" else "scene"
+            checks = []
+            for spec_row, (text, _colour) in zip(rows, mod.verdicts(m, boot, unit)):
+                word, _, detail = text.partition(" - ")
+                checks.append({**row(spec_row), "verdict": word, "status": _STATUS.get(word, "mild"),
+                               "detail": detail})
+            png = Path(docs_dir) / f"{stem.format(t=t)}.png"
+            runs.setdefault(key, {"label": label, "measure": DIAGNOSTIC_MEASURE[key]})[t] = {
+                "checks": checks,
+                "subjects": m.drop(columns=["transform"]).to_dict(orient="records"),
+                "figure": f"diagnostics/{png.name}" if png.exists() else None,
+            }
+    return runs or None
+
+
+FIT_DATA_POINTS = 800      # cloud points per panel; the bins are computed on every row
+SPAGHETTI_SCENES = 12      # most-played scenes per subject in the dashboard's spaghetti panel
+
+
+def export_fit_data(output_dir: Path, web_dir: Path) -> Path | None:
+    """Write the data under the lme4 fits: ``practice_points.json`` and ``practice_spaghetti.json``.
+
+    ``practice_points.json``: one entry per fit in ``lme4.json`` (scene scale, ``nested``
+    model) and ``lme4_route.json``, keyed ``model|measure|transform|completed|subject`` with
+    model ``lme4_nested`` / ``lme4_route`` as the dashboard names them, each holding
+    ``fit_check_data()`` — pooled bins, and partial-residual bins when
+    ``run-practice-lme4-effects`` has run — over every fitted row, plus a seeded thinning
+    to ``FIT_DATA_POINTS`` points.
+
+    ``practice_spaghetti.json``: for the primary setting of each model only (its primary
+    measure, primary transform, all attempts), per subject, ``spaghetti_data()`` for their
+    ``SPAGHETTI_SCENES`` most-played scenes — every attempt and each scene's (or route's)
+    own fitted line — plus each scene's whole-scene route ranking (``rank``), so routes
+    keep the colour slot they have everywhere else. Needs the effects; skipped without.
+
+    Separate files, fetched only when their panel is drawn, so ``practice.json`` stays
+    small. For drawing only — the cloud is a sample.
+    """
+    from analysis.practice import (fit_check_data, fit_id, load_attempts, load_effects,
+                                   spaghetti_data)
+    pdir = Path(output_dir) / "practice"
+    sources = [("lme4_nested", "nested", pdir / "lme4.json"), ("lme4_route", "route", pdir / "lme4_route.json")]
+    sources = [s for s in sources if s[2].exists()]
+    if not sources or not (pdir / "attempts").is_dir():
+        return None
+    attempts = load_attempts(output_dir)
+    effects = load_effects(output_dir)
+    if effects is None:
+        print("  no lme4 effects (invoke run-practice-lme4-effects) — fit check without partial "
+              "residuals, no spaghetti panel")
+    partial = effects[0].groupby("fid") if effects is not None else None
+    out, spaghetti = {}, {}
+    for key, model, path in sources:
+        stored = json.loads(path.read_text())
+        for f in stored["fits"]:
+            if f["model"] != model:
+                continue
+            fid = fit_id(model, f["measure"], f["transform"], f["completed_only"], f["subject"])
+            eff = partial.get_group(fid) if partial is not None and fid in partial.groups else None
+            out[f"{key}|{fid.split('|', 1)[1]}"] = fit_check_data(
+                attempts, model, f["measure"], f["subject"], f["transform"], f["completed_only"],
+                effects=eff, n_points=FIT_DATA_POINTS)
+        if effects is None:
+            continue
+        spaghetti[key] = {"measure": stored["primary"], "transform": stored["primary_transform"],
+                          "subjects": {}}
+        for s in stored["subjects"]:
+            fid = fit_id(model, stored["primary"], stored["primary_transform"], False, s)
+            if fid not in effects[2]:
+                continue
+            sp = spaghetti_data(*effects, fid, top=SPAGHETTI_SCENES)
+            for scene, v in sp["scenes"].items():
+                counts = attempts.loc[(attempts["scene"] == scene) & (attempts["cluster"] >= 0), "cluster"]
+                v["rank"] = [int(c) for c in counts.value_counts().index]
+            spaghetti[key]["subjects"][s] = sp
+    dest = Path(web_dir) / "practice_points.json"
+    dest.write_text(json.dumps(_rounded(out, 3), separators=(",", ":")))
+    print(f"Wrote {len(out)} fit-check panels -> {dest}")
+    if spaghetti:
+        sdest = Path(web_dir) / "practice_spaghetti.json"
+        sdest.write_text(json.dumps(_rounded(spaghetti, 4), separators=(",", ":")))
+        print(f"Wrote per-scene fits -> {sdest}")
+    return dest
+
+
 def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     """Copy the practice models into the payload as ``practice.json``.
 
     The dashboard's stats section draws these; it may not read ``output_data/practice/``
     directly, so the fits travel through the export like everything else. Copied:
     ``mixed.json`` (the statsmodels models), and when present ``lme4.json`` (the primary,
-    full nested model) as ``lme4``, ``lme4_route.json`` (the within-route model) as
+    scene-scale model) as ``lme4``, ``lme4_route.json`` (the route-scale model) as
     ``lme4_route``, ``nested.json`` (statsmodels nested structures) as
-    ``nested``, and ``practice_summary()`` (every CI and p-value) as ``summary``. Only the
+    ``nested``, ``practice_summary()`` (every CI and p-value) as ``summary``, and
+    ``assumption_checks()`` as ``diagnostics`` (the diagnostic figures are copied to
+    ``diagnostics/`` beside it). Only the
     fitted records — coefficients, CIs, p-values, variances, AIC, fixed-effect curves —
-    never the attempts, and nothing is refitted. ``scenes`` lists are reduced to a count.
+    never the attempts, and nothing is refitted; the data under the lme4 curves goes to a
+    separate files, ``export_fit_data()``: bins plus a thinned point sample, and the
+    per-scene fits for the spaghetti panel. ``scenes`` lists are reduced to a count.
     Returns ``None`` when the practice models have not been run.
     """
     pdir = Path(output_dir) / "practice"
@@ -512,9 +699,19 @@ def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     summary = practice_summary(output_dir)
     if summary:
         payload["summary"] = summary
+    checks = assumption_checks()
+    if checks:
+        payload["diagnostics"] = checks
+        fig_dir = Path(web_dir) / "diagnostics"
+        fig_dir.mkdir(parents=True, exist_ok=True)
+        for run in checks.values():
+            for t in ("log", "log1p"):
+                if t in run and run[t]["figure"]:
+                    shutil.copy2(DOCS_DIR / Path(run[t]["figure"]).name, Path(web_dir) / run[t]["figure"])
     out = Path(web_dir) / "practice.json"
     out.write_text(json.dumps(_rounded(payload), separators=(",", ":")))
     print(f"Wrote practice models -> {out}")
+    export_fit_data(output_dir, web_dir)
     return out
 
 
@@ -586,4 +783,61 @@ def backfill_selection(web_dir: Path, output_dir: Path) -> int:
         updated += 1
     note = f", {skipped} without a consensus record" if skipped else ""
     print(f"Refreshed the selection record in {updated} scene payloads{note}")
+    return updated
+
+
+def backfill_labels(web_dir: Path, output_dir: Path) -> int:
+    """Re-join the stored cluster labels (and per-trace confidence) to existing payloads.
+
+    A fourth migration path, and it exists because of what a re-cluster actually
+    changes. Cutting the same ensemble at a different k changes ``c`` and ``sb`` and
+    **nothing else** — the geometry, the axis limits, the background, the derived time
+    fields and the co-association matrix are all identical, since the traces and the
+    replicate fits are untouched. A ``--force`` re-export would re-read tens of GB from
+    ``mario.scenes`` to rebuild polylines byte-for-byte identical to the ones already on
+    disk, so it is the wrong tool for a change of cut.
+
+    The rule this follows is the one ``backfill_selection`` documents: ``c`` and ``sb``
+    are not derivable from the payload, but they *are* derivable from ``output_data/``
+    alone. The join is by **clip key**, never by position — the same key
+    ``load_labeled_traces`` and ``export_coassociation`` use — so a payload whose keys
+    do not line up with the cluster file is skipped rather than silently relabelled
+    against the wrong rows.
+
+    A re-export is still required when the traces themselves change (new source data,
+    a different ``step``, a new y coordinate). This is only for a new partition over
+    the same traces.
+    """
+    scenes_dir = Path(web_dir) / "scenes"
+    paths = sorted(scenes_dir.glob("*.json"))
+    updated = skipped = 0
+    for path in paths:
+        payload = json.loads(path.read_text())
+        scene_id = payload["scene"]
+        clusters = Path(output_dir) / "clusters" / f"{scene_id}_clusters.json"
+        if not clusters.exists():
+            skipped += 1
+            continue
+        stored = json.loads(clusters.read_text())
+        labels = stored["labels"]
+        per_trace = ((stored.get("stability") or {}).get("per_trace")) or None
+
+        row_of = _clip_row_map(scene_id, output_dir)
+        rows = [row_of.get((t["s"], t["ses"], t["run"], t["clip"])) for t in payload["traces"]]
+        if any(r is None for r in rows) or len(labels) != len(payload["traces"]):
+            print(f"  {scene_id}: clip keys do not line up with the cluster file, skipping.")
+            skipped += 1
+            continue
+
+        for trace, row in zip(payload["traces"], rows):
+            trace["c"] = int(labels[row])
+            if per_trace is not None:
+                trace["sb"] = round(float(per_trace[row]), 2)
+            else:
+                trace.pop("sb", None)
+        payload["method"] = stored.get("method", payload.get("method", ""))
+        path.write_text(json.dumps(payload, separators=(",", ":")))
+        updated += 1
+    note = f", {skipped} skipped" if skipped else ""
+    print(f"Re-joined cluster labels in {updated} scene payloads{note}")
     return updated

@@ -44,11 +44,13 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `run-coassociation`           | Store each scene's co-association (consensus) matrix; feeds the dashboard's Co-association view |
 | `run-practice-distances`      | Measure each attempt's Fréchet distance to its cluster's medoid and to the nearest medoid (plus leave-subject-out), per scene |
 | `run-practice-models`         | Model the practice effect on those distances: per-series curve comparison (linear/quadratic/power/exponential), one mixed model per subject, strategy-switch trend |
-| `run-practice-lme4`           | Fit the practice models in R's lme4 — the primary model (scenes nested in levels) and the within-route model (needs R with lme4; skips without it) |
+| `run-practice-lme4`           | Fit the two main practice models in R's lme4 — scene scale (nearest prototype, scenes nested in levels) and route scale (own route's prototype, routes nested in scenes and levels); needs R with lme4, skips without it |
+| `run-practice-lme4-effects`   | Refit the stored lme4 models for their partial residuals (via `ggeffects`) and each level's, scene's and route's own line — the data behind the fit-check and per-scene (spaghetti) plots; needs R with lme4 and ggeffects, skips without them |
+| `run-route-usage`             | Model route usage per subject: does route choice concentrate across early/late discovery and practice? (unbiased Simpson index + rarefied Shannon check, in R's lme4; skips the fits without R) |
 | `run-web-export`              | Export clustered traces to a static payload for the interactive dashboard |
 | `dashboard`                   | Serve the interactive clustering and stats dashboard on `localhost` (needs `run-web-export`) |
 | `run-notebooks`               | Execute notebooks and save figures to `output_data/`                     |
-| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → practice-distances → practice-models → practice-lme4 → web-export → notebooks |
+| `run`                         | Full pipeline in order: fetch → changepoints → changepoints-by-category → clustering → clustering-by-category → practice-distances → practice-models → practice-lme4 → route-usage → web-export → notebooks |
 | `run-smoke`                   | Minimal end-to-end pass (first subject/scene/category only) to verify pipeline wiring |
 | `verify`                      | Check that the code, config, data and docs still agree (run before committing) |
 | `list-scenes-task`            | Print all scene IDs, one per line (used to build SLURM array inputs)     |
@@ -61,6 +63,8 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `clean-stability`             | Remove `output_data/stability/` (audit, sweeps, selected parameters)     |
 | `clean-coassociation`         | Remove `output_data/coassociation/`                                      |
 | `clean-practice`              | Remove `output_data/practice/`                                           |
+| `clean-practice-lme4-effects` | Remove `output_data/practice/lme4_effects/`                              |
+| `clean-route-usage`           | Remove `output_data/route_usage/`                                        |
 | `clean-frechet`               | Remove cached Fréchet distance matrices (kept separate so re-clustering reuses them) |
 | `clean`                       | Remove all computed outputs                                              |
 | `clean-mario-scenes`          | Remove the cloned `source_data/mario.scenes/` dataset                    |
@@ -104,9 +108,9 @@ stage or an outcome, hover a trajectory for its clip details, and click to isola
 shows the practice-effect models from `run-practice-models` — one mixed model per
 subject: the practice coefficient with its 95% CI (raw medoids against
 leave-subject-out), each subject's fitted curve, and a results table. Measure, practice form and attempts (all / completed) pick which stored
-fit is drawn; nothing is refitted. A **Model** switch picks the full nested lme4 model (the
-main analysis, default), the scene-only statsmodels model or the statsmodels nested model,
-and a summary view at the top shows every CI and p-value for the main result — models and
+fit is drawn; nothing is refitted. A **Model** switch picks one of the two main lme4 models — scene
+scale (default) or route scale — or the scene-only and nested statsmodels models kept as
+checks, and a summary view at the top shows every CI and p-value for the scene-scale result — models and
 bootstraps side by side. It reads `output_data/web/data/practice.json`, which
 `run-web-export` (or `run-web-export --backfill`) copies in.
 
@@ -132,7 +136,20 @@ Fréchet distance as a dashed second series, recorded but never used to select. 
 whose smallest cluster is two traces or fewer are drawn hollow: the silhouette scores a
 singleton at 0 and a never-co-clustered trace already scored ~0 inside its parent, so
 splitting one off is free and the curve cannot fall — the marker is the only thing in
-the figure that flags it. Below the chart are the settings that produced the cut.
+the figure that flags it. The **elbow** is marked too, in orange: the last k before the
+curve falls off a cliff, which is a reading of the curve's shape rather than its
+maximum. It is what selects k by default; pass `--consensus-k-rule silhouette` and it
+stays on the chart as the rule that did not select, there to disagree with the chosen
+cut in plain sight. Below the chart are the settings that produced the cut.
+
+**Clusters (k)**, in the sidebar, draws any of those candidate cuts instead of the one
+that was taken — drag the slider, or click a k on the selection chart. This is the one
+control that changes cluster labels rather than just what is drawn, so it says so: the
+header reads "cut at k=N, not the chosen k=M" and the stability colouring is greyed out,
+because the per-trace confidence was measured against the chosen partition. Nothing is
+re-clustered — every candidate cut of the same Ward tree was scored during the run and
+ships with the payload, so the browser is still only drawing a stored result. Press
+*chosen* to go back.
 
 The **co-association** view shows both halves of that step side by side: on the left the
 matrix Ward was given, on the right the partition it returned (`adj[i,j] = 1` where two
@@ -145,7 +162,8 @@ A block that is solid on the right and mottled on the left is a cluster the cut 
 over weak agreement; hovering either panel reports what the cut says and what the
 ensemble says for that pair.
 
-Filters only change which traces are **drawn**. Clustering is never re-run, and cluster
+Filters only change which traces are **drawn**. Clustering is never re-run (not even by
+the k control above, which picks between cuts the run already made), and cluster
 colors are pinned to the whole-scene ordering, so narrowing to one subject cannot
 repaint the clusters that remain. Counts and composition percentages do update, and the
 header reads "N of M traces shown" whenever a filter is active.
@@ -217,6 +235,12 @@ category) — see `slurm_clustering.sh` (per scene) and `slurm_clustering_by_cat
 
 ---
 
+## Code guides
+
+- **Per-scene clustering call flow:** see [`docs/clustering_pipeline.md`](docs/clustering_pipeline.md) — which function calls which, from the Fréchet matrix to the elbow cut
+
+---
+
 ## Design principles
 
 - **Analysis in code, visualization in notebooks.** Heavy computation lives in `analysis/` and is run by `invoke` tasks. Notebooks only read results and produce figures. Trace-figure rendering lives in `analysis/trace_plots.py` (imported by `notebooks/figure_clustering.ipynb`): it plots each scene's trajectories with a screen-corrected vertical coordinate and can color traces by cluster (default) or by outcome (green = completed, red = death), set via `COLOR_BY` in the notebook. A `plot_scene_cluster_panels()` view splits a scene into one subplot per cluster (shared axes) in a single figure for reading individual cluster shapes.
@@ -226,7 +250,7 @@ category) — see `slurm_clustering.sh` (per scene) and `slurm_clustering_by_cat
 - **Gathering assets is a separate job from reproducing results.** `fetch` retrieves; `run` reads what is already on disk and never pulls. A step that finds its input missing says so and points at `invoke fetch` rather than fixing it silently.
 - **Idempotent steps.** Each task checks whether its outputs already exist and skips if they do. Call `invoke clean` then `invoke run` to force a full rerun.
 - **Chunked for reruns.** `run-changepoints` and `run-changepoints-by-category` process one subject at a time (`--subjects`); `run-clustering` chunks by scene (`--scenes`), `run-clustering-by-category` by category (`--categories`), `run-practice-distances` and `run-web-export` by scene (`--scenes`). Any piece can be restricted or retried in isolation.
-- **Clustering is bagged, and it records its own settings.** `run-clustering` defaults to `method=consensus`: HDBSCAN is refit on 200 random 80% subsamples, a co-association matrix records how often each pair of traces landed together, and the final labels come from clustering that matrix — Ward linkage over the matrix, cut at a k chosen by silhouette. Ward is given the matrix as a **feature matrix** (each row is a trace's co-occurrence profile), following the BASC reference, which is what makes its Euclidean criterion well posed even though the underlying Fréchet distance is not Euclidean. Ward returns a tree and no k, so every cut from k=2 to 15 is scored on the co-association distance `1 - C` and the **highest silhouette wins** — the plain rule. Two guards on it ship off (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`); turn them on to get the earlier, more conservative cut. The plain rule leaves the bulk partition alone (median ARI 0.996 against the guarded one) but raises k in 172 of 300 scenes and puts one or two traces in the smallest cluster of 42% of them — the silhouette scores a singleton at 0 and so cannot penalise a cut for peeling one off, which is why the dashboard and the silhouette figure both report the smallest cluster size separately. `invoke run-consensus-comparison` scores the aggregation against the alternatives over the whole corpus, and the switch to Ward was not free: Ward on the feature matrix reaches 79.1% trace-weighted stability at a median of 6 clusters per scene, against 81.6% at 4 clusters for the older HDBSCAN aggregation, on identical ensembles and with the three partitions agreeing closely (median ARI 0.94-0.99). It buys resolution — and a partition for the 11 scenes the old method left entirely as noise — for about two points of stability. The resampling defaults to **subagging** (subsample without replacement) rather than a Breiman bootstrap. Both are implemented — `--scheme bootstrap` gives classical bagging — and `invoke run-scheme-comparison` runs the corpus under each. Over 308 scenes the two **agree about the clustering** (median ARI 0.97) but not about how much to trust it: a bootstrap replicate holds only ~63% unique points, so its replicates are roughly twice as variable (mean sd of k 1.10 vs 0.61) and it reports a lower stability for the same partition (trace-weighted 70.6% vs 79.1%). That is a property of the estimator, not of the data. A cluster therefore has to survive resampling to exist at all. Each output carries a `params` block and a `stability` report (per-cluster bootstrap Jaccard, per-trace confidence). Earlier files recorded no parameters, and an audit of 308 scenes recovered **14 different settings** in use — `run-cluster-audit` is what reconstructs them for any file predating `params`.
+- **Clustering is bagged, and it records its own settings.** `run-clustering` defaults to `method=consensus`: HDBSCAN is refit on 200 random 80% subsamples, a co-association matrix records how often each pair of traces landed together, and the final labels come from clustering that matrix — Ward linkage over the matrix, cut at a k chosen by silhouette. Ward is given the matrix as a **feature matrix** (each row is a trace's co-occurrence profile), following the BASC reference, which is what makes its Euclidean criterion well posed even though the underlying Fréchet distance is not Euclidean. Ward returns a tree and no k, so every cut from k=2 to 15 is scored on the co-association distance `1 - C` and the **highest silhouette wins** — the plain rule. Two guards on it ship off (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`); turn them on to get the earlier, more conservative cut. `--consensus-k-rule` decides how that curve is read, and the **default is `elbow`**: the last k before the curve drops off a cliff, found by locating the steepest drop and taking the k before the first drop at least half as deep. `silhouette` gives the plain argmax back; `elbow_capped` uses the cliff as a ceiling on the argmax instead. Every reading is computed and recorded whichever one selects, so a stored file always says where the others would have cut. Measured over the corpus, the elbow rule moves k in 154 of 308 scenes — 114 finer, 40 coarser, median k 6 to 7 — while leaving the partitions themselves largely intact (median ARI 1.000 against the argmax corpus, 266/308 above 0.9). It costs 2.2 points of trace-weighted stability (79.1% to 76.9%) and puts one or two traces in the smallest cluster of 152 scenes against 126. `elbow_capped` is the variant that trades the other way: it only ever moves k down and cuts that dust count to 99. The plain rule leaves the bulk partition alone (median ARI 0.996 against the guarded one) but raises k in 172 of 300 scenes and puts one or two traces in the smallest cluster of 42% of them — the silhouette scores a singleton at 0 and so cannot penalise a cut for peeling one off, which is why the dashboard and the silhouette figure both report the smallest cluster size separately. `invoke run-consensus-comparison` scores the aggregation against the alternatives over the whole corpus, and the switch to Ward was not free: Ward on the feature matrix reaches 79.1% trace-weighted stability at a median of 6 clusters per scene, against 81.6% at 4 clusters for the older HDBSCAN aggregation, on identical ensembles and with the three partitions agreeing closely (median ARI 0.94-0.99). It buys resolution — and a partition for the 11 scenes the old method left entirely as noise — for about two points of stability. The resampling defaults to **subagging** (subsample without replacement) rather than a Breiman bootstrap. Both are implemented — `--scheme bootstrap` gives classical bagging — and `invoke run-scheme-comparison` runs the corpus under each. Over 308 scenes the two **agree about the clustering** (median ARI 0.97) but not about how much to trust it: a bootstrap replicate holds only ~63% unique points, so its replicates are roughly twice as variable (mean sd of k 1.10 vs 0.61) and it reports a lower stability for the same partition (trace-weighted 70.6% vs 79.1%). That is a property of the estimator, not of the data. A cluster therefore has to survive resampling to exist at all. Each output carries a `params` block and a `stability` report (per-cluster bootstrap Jaccard, per-trace confidence). Earlier files recorded no parameters, and an audit of 308 scenes recovered **14 different settings** in use — `run-cluster-audit` is what reconstructs them for any file predating `params`.
 - **Parameters are chosen on evidence, not by hand.** `run-cluster-sweep` scores a 12-point grid per scene by what share of its traces sit in a cluster that reproduces; `select-cluster-params` aggregates trace-weighted and takes the **largest k that still clears an 80% stability floor**. Maximising stability alone would pick the degenerate two-cluster collapse, so resolution is preferred and only traded away when the finer partition genuinely does not survive.
 - **Export once, serve statically.** The dashboard reads only `output_data/web/` — trace geometry and background images are baked there by `run-web-export`, so nothing at view time touches the 23 GB `mario.scenes` dataset. Re-export after re-clustering; `--force` overwrites existing payloads, and `--backfill` adds fields derivable from what the payload already holds without reading the source dataset at all.
 - **Background-ready trace plots.** Scene trajectory figures overlay a scene background image when one is present at `source_data/mario.scenes/sourcedata/scene_backgrounds/<scene_id>.png` (set `BACKGROUND_DIR` in the notebook, or `None` to disable). These images are **not** part of the dataset and must be regenerated separately (see `source_data/mario.scenes/code/deprecated/make_images/make_scene_img.py`, which needs `stable_retro` + the source `mario` `.bk2` dataset). Until they exist, plots fall back automatically to a plain y-flipped axis.

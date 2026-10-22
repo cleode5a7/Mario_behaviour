@@ -1,4 +1,4 @@
-# Residuals and random effects of the full nested practice model, for the diagnostics.
+# Residuals and random effects of the scene-scale practice model, for the diagnostics.
 #
 # Called by docs/practice_residual_diagnostics.py (``lme4`` mode) with the exact model
 # frames it would fit itself. Refits, per subject, the same model as docs/practice_lme4.R

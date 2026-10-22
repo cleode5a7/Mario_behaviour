@@ -161,7 +161,7 @@ def run_changepoints_by_category(c, subjects=None, smoke=False, beta=1.0, n_bkps
 
 
 @task
-def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=20.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1):
+def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=20.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1, consensus_k_rule="elbow", consensus_elbow_frac=0.5, consensus_elbow_min_drop=0.005):
     """Cluster behavioural traces within each scene using Fréchet distance.
 
     Defaults to `consensus` — bagged HDBSCAN, where the ensemble produces the
@@ -170,9 +170,11 @@ def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5
     hand-swept merge threshold; `--consensus-cluster hdbscan` restores the older fit
     on 1 - C that `--consensus-epsilon` belongs to.
 
-    The k rule is the plain one: cut the Ward tree at every k from 2 to
-    `--consensus-k-max`, score each on 1 - C, take the highest silhouette. Two guards
-    on that rule ship **off** (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`)
+    Every k from 2 to `--consensus-k-max` is cut and scored on 1 - C, and
+    `--consensus-k-rule` decides how that curve is read. The default is **elbow**: the
+    last k before the curve falls off a cliff. `silhouette` takes the plain argmax
+    instead, and `elbow_capped` uses the cliff as a ceiling on that argmax. Two further
+    guards ship **off** (`--consensus-tol 0.0`, `--consensus-min-cluster-size 1`)
     and are documented on those flags; turn them on to compare. min_cluster_size=5 and
     epsilon=20 are not arbitrary: they are what `select-cluster-params` chose from
     a 12-point sweep over 288 scenes (82% of all traces land in a cluster that
@@ -210,6 +212,20 @@ def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5
                                     a test on the full-data cut. Raise it to keep Ward
                                     from cutting off singletons — it has no noise class,
                                     and the silhouette cannot penalise one
+        consensus_k_rule:           which reading of the silhouette-vs-k curve picks k:
+                                    elbow (default, the last k before the curve drops
+                                    off a cliff), silhouette (the plain argmax) or
+                                    elbow_capped (the argmax at or below that cliff —
+                                    coarser than the argmax or equal, never finer).
+                                    Every reading is recorded whichever is in force, so
+                                    a file always says where the others would have cut,
+                                    and the dashboard's k selection view draws them
+        consensus_elbow_frac:       what counts as a cliff: a drop at least this share
+                                    of the steepest drop in the curve (1.0 = literally
+                                    the k before the steepest drop)
+        consensus_elbow_min_drop:   absolute floor on a cliff, so a curve flat to
+                                    within rounding reports no elbow at all and the
+                                    elbow rules fall back to the argmax
         consensus_epsilon:          merge threshold for the *hdbscan* consensus fit
                                     only, in co-association distance (NOT Fréchet
                                     units); 0.4 = "co-clustered in >60% of shared
@@ -251,11 +267,11 @@ def run_clustering(c, scenes=None, smoke=False, method="consensus", n_clusters=5
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size))
+        _run_clustering(scene, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size), consensus_k_rule=consensus_k_rule, consensus_elbow_frac=float(consensus_elbow_frac), consensus_elbow_min_drop=float(consensus_elbow_min_drop))
 
 
 @task
-def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1):
+def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan", n_clusters=5, min_cluster_size=5, min_samples=None, cluster_selection_epsilon=0.0, recompute_frechet=False, n_jobs=None, bootstraps=200, frac=0.8, seed=0, consensus_epsilon=0.4, scheme="subagging", consensus_cluster="ward", consensus_input="features", consensus_linkage="ward", consensus_k_max=15, consensus_tol=0.0, consensus_min_cluster_size=1, consensus_k_rule="elbow", consensus_elbow_frac=0.5, consensus_elbow_min_drop=0.005):
     """Cluster behavioural traces pooled across scenes sharing a design-pattern category.
 
     Traces are pooled across every scene tagged with the category (from
@@ -309,7 +325,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
             continue
         _n_jobs = int(n_jobs) if n_jobs is not None else int(os.environ.get("SLURM_CPUS_PER_TASK", 1))
         _min_samples = int(min_samples) if min_samples is not None else None
-        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size))
+        _run_clustering_by_category(category, source_dir, output_dir, method=method, n_clusters=int(n_clusters), min_cluster_size=int(min_cluster_size), min_samples=_min_samples, cluster_selection_epsilon=float(cluster_selection_epsilon), recompute_frechet=recompute_frechet, n_jobs=_n_jobs, bootstraps=int(bootstraps), frac=float(frac), seed=int(seed), consensus_epsilon=float(consensus_epsilon), scheme=scheme, consensus_cluster=consensus_cluster, consensus_input=consensus_input, consensus_linkage=consensus_linkage, consensus_k_max=int(consensus_k_max), consensus_tol=float(consensus_tol), consensus_min_cluster_size=int(consensus_min_cluster_size), consensus_k_rule=consensus_k_rule, consensus_elbow_frac=float(consensus_elbow_frac), consensus_elbow_min_drop=float(consensus_elbow_min_drop))
 
 
 @task
@@ -595,13 +611,14 @@ def run_practice_models(c, measures="d_nearest_norm,d_own", min_attempts=10,
 
 @task
 def run_practice_lme4(c, smoke=False, force=False, cores=None):
-    """Fit the primary practice model in R's lme4: scenes nested in levels.
+    """Fit the two main practice models in R's lme4: scene scale and route scale.
 
     log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene),
     per subject, for d_nearest_norm and its leave-subject-out twin, both transforms, all
     and completed attempts, with its scene-only twin as a cross-check against
     statsmodels. Writes output_data/practice/lme4.json and marks these rows primary in
-    mixed_summary.csv. Needs R with lme4 (sudo apt install r-base r-cran-lme4); without
+    mixed_summary.csv. Route scale: log(d_own) ~ log(nth use of the route), routes nested
+    in scenes in levels, into output_data/practice/lme4_route.json. Needs R with lme4 (sudo apt install r-base r-cran-lme4); without
     Rscript it says so and skips. --smoke fits the first five scenes with attempt files;
     --cores sets R's parallel workers (default: all but one).
     """
@@ -614,6 +631,59 @@ def run_practice_lme4(c, smoke=False, force=False, cores=None):
         return
     scenes = [f.stem for f in files[:5]] if smoke else None
     _run(output_dir, scenes=scenes, force=force, n_cores=int(cores) if cores else None)
+
+
+
+@task
+def run_practice_lme4_effects(c, smoke=False, force=False, cores=None):
+    """Partial residuals and per-unit random effects of every stored lme4 fit.
+
+    Refits each fit in lme4.json (nested model) and lme4_route.json in R and checks it
+    reproduces the stored coefficients, then writes output_data/practice/lme4_effects/:
+    ggeffects partial residuals per attempt (partial.csv.gz), every level's, scene's and
+    route's random intercept and slope (ranef.csv.gz) and fixef.json. Drawn as the
+    partial-residual rows and the spaghetti plots in figure_practice.ipynb and the
+    dashboard. Needs R with lme4 and ggeffects (sudo apt install r-cran-ggeffects); without
+    them it says so and skips. --smoke refits the first subject's two primary fits into
+    lme4_effects/smoke/; --cores sets R's parallel workers (default: all but one).
+    """
+    from analysis.practice import run_practice_lme4_effects as _run
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    _run(output_dir, smoke=smoke, force=force, n_cores=int(cores) if cores else None)
+
+@task
+def run_route_usage(c, subjects=None, smoke=False, null_reps=200, bootstraps=200, seed=0,
+                    force=False, cores=None):
+    """Model route usage: does route choice concentrate across the stages of play?
+
+    Per subject x scene x stage (early/late discovery, early/late practice: halves of
+    each phase by attempt order), the unbiased Simpson index of route use (chance two
+    different attempts share a route; 1/D = effective number of routes) and, as a
+    check, Shannon entropy rarefied to 4 attempts. Per subject, in R's lme4:
+    y ~ stage + (1 | level) + (1 | level:scene), weighted by cell size and unweighted,
+    with a chance-level shuffle (--null-reps) and a level bootstrap (--bootstraps).
+    Writes output_data/route_usage/{cells.csv,models.json}. Reads only
+    output_data/practice/attempts/, so it needs run-practice-distances; needs R with
+    lme4 for the models (without Rscript it writes cells.csv and skips the fits).
+    --subjects refits just those (comma-separated, e.g. 01,02) and merges them in;
+    --smoke uses two scenes from each of the first three levels (the model needs
+    more than one level), with 5 null reps and 5 bootstraps.
+    """
+    from analysis.practice import practice_dir
+    from analysis.route_usage import run_route_usage as _run, smoke_scenes
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    files = sorted((practice_dir(output_dir) / "attempts").glob("*.csv"))
+    if not files:
+        print("No attempt distances — run invoke run-practice-distances first.")
+        return
+    scenes = smoke_scenes([f.stem for f in files]) if smoke else None
+    if smoke:
+        null_reps, bootstraps = 5, 5
+    _run(output_dir, subjects=subjects.split(",") if subjects else None, scenes=scenes,
+         null_reps=int(null_reps), bootstraps=int(bootstraps), seed=int(seed), force=force,
+         n_cores=int(cores) if cores else None)
 
 
 @task
@@ -634,17 +704,19 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
                lower it for more fidelity at the cost of payload size.
         force: re-export scenes whose payload already exists
         backfill: update payloads that already exist, then rewrite the index,
-               without reading mario.scenes — seconds, where --force re-reads the
-               source dataset. Two things are refreshed: the derived attempt/stage
-               fields (computed from what the payload already carries) and the `cons`
-               selection record (re-read from the cluster file, with the dendrogram
-               leaf order rebuilt from the stored co-association matrix). Use it after
-               a change to either; a change to trace geometry or labels is a real
-               re-export.
+               without reading mario.scenes — a minute, where --force re-reads the
+               source dataset. Three things are refreshed: the derived attempt/stage
+               fields (computed from what the payload already carries), the `cons`
+               selection record, and the cluster labels + per-trace confidence
+               (both re-joined from the cluster file by clip key, with the dendrogram
+               leaf order rebuilt from the stored co-association matrix where needed).
+               So a re-cluster that cuts the same ensemble at a different k is a
+               backfill, not a re-export — only a change to the *traces* (new source
+               data, a different --step) needs --force.
     """
-    from analysis.webexport import (backfill_derived, backfill_selection, export_practice,
-                                    export_scene, list_clustered_scenes, sync_backgrounds,
-                                    write_index)
+    from analysis.webexport import (backfill_derived, backfill_labels, backfill_selection,
+                                    export_practice, export_scene, list_clustered_scenes,
+                                    sync_backgrounds, write_index)
     from analysis.trace_plots import default_background_dir, scene_entry_map
 
     source_dir = Path(c.config.get("source_data_dir"))
@@ -657,6 +729,7 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
             print("Nothing to backfill — no payload at output_data/web/data/scenes.")
             return
         backfill_derived(web_dir)
+        backfill_labels(web_dir, output_dir)
         backfill_selection(web_dir, output_dir)
         export_practice(output_dir, web_dir)
         write_index(web_dir, source_dir)
@@ -688,6 +761,25 @@ def run_web_export(c, scenes=None, smoke=False, step=3, force=False, backfill=Fa
         print(f"Copied {copied} scene background(s)")
     export_practice(output_dir, web_dir)
     write_index(web_dir, source_dir)
+
+
+def _version_web_assets(web_root: Path) -> None:
+    """Point index.html at app.js?v=<hash> and style.css?v=<hash>.
+
+    python -m http.server sends Last-Modified but no Cache-Control, so a browser may keep
+    serving a stale app.js for hours; an old script against a new page (or the reverse)
+    breaks on the first element one has and the other lacks. A content hash in the URL
+    makes every change a new URL. The data files are fetched with cache: "no-cache"
+    in app.js for the same reason.
+    """
+    import hashlib
+
+    index = web_root / "index.html"
+    html = index.read_text()
+    for name, attr in (("app.js", "src"), ("style.css", "href")):
+        digest = hashlib.md5((web_root / name).read_bytes()).hexdigest()[:10]
+        html = re.sub(rf'{attr}="{re.escape(name)}(\?v=[0-9a-f]+)?"', f'{attr}="{name}?v={digest}"', html)
+    index.write_text(html)
 
 
 @task
@@ -728,25 +820,6 @@ def dashboard(c, port=8000, open_browser=True):
         print("\nDashboard stopped.")
 
 
-def _version_web_assets(web_root: Path) -> None:
-    """Point index.html at app.js?v=<hash> and style.css?v=<hash>.
-
-    python -m http.server sends Last-Modified but no Cache-Control, so a browser may keep
-    serving a stale app.js for hours; an old script against a new page (or the reverse)
-    breaks on the first element one has and the other lacks. A content hash in the URL
-    makes every change a new URL. The data files are fetched with cache: "no-cache"
-    in app.js for the same reason.
-    """
-    import hashlib
-
-    index = web_root / "index.html"
-    html = index.read_text()
-    for name, attr in (("app.js", "src"), ("style.css", "href")):
-        digest = hashlib.md5((web_root / name).read_bytes()).hexdigest()[:10]
-        html = re.sub(rf'{attr}="{re.escape(name)}(\?v=[0-9a-f]+)?"', f'{attr}="{name}?v={digest}"', html)
-    index.write_text(html)
-
-
 @task
 def list_scenes_task(c):
     """Print all scene IDs, one per line. Used to build SLURM array inputs."""
@@ -775,7 +848,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_practice_lme4, run_web_export, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_practice_lme4, run_practice_lme4_effects, run_route_usage, run_web_export, run_notebooks])
 def run(c):
     """Full pipeline.
 
@@ -787,8 +860,8 @@ def run(c):
 
     record_run(c, tasks="fetch,run-changepoints,run-changepoints-by-category,"
                         "run-clustering,run-clustering-by-category,run-practice-distances,"
-                        "run-practice-models,run-practice-lme4,run-web-export,"
-                        "run-notebooks")
+                        "run-practice-models,run-practice-lme4,run-practice-lme4-effects,run-route-usage,"
+                        "run-web-export,run-notebooks")
     print("Pipeline complete.")
 
 
@@ -819,6 +892,8 @@ def run_smoke(c):
     run_practice_distances(c, smoke=True)        # medoid distances, first scene
     run_practice_models(c, smoke=True)           # practice models on what exists
     run_practice_lme4(c, smoke=True)             # primary lme4 model (skips without R)
+    run_practice_lme4_effects(c, smoke=True)     # partial residuals (skips without ggeffects)
+    run_route_usage(c, smoke=True)               # route-usage model (skips fits without R)
     run_web_export(c, smoke=True)                # dashboard payload, first scene
     run_notebooks(c)
 
@@ -904,6 +979,30 @@ def clean_practice(c):
         print("No practice output to clean.")
 
 
+
+@task
+def clean_practice_lme4_effects(c):
+    """Remove the lme4 partial residuals and random effects (practice/lme4_effects/)."""
+    from analysis.practice import effects_dir
+
+    output_dir = effects_dir(Path(c.config.get("output_data_dir")))
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No lme4 effects to clean.")
+
+@task
+def clean_route_usage(c):
+    """Remove route-usage outputs (cells, models and figures)."""
+    output_dir = Path(c.config.get("output_data_dir")) / "route_usage"
+    if output_dir.exists():
+        shutil.rmtree(output_dir)
+        print(f"Removed {output_dir}")
+    else:
+        print("No route-usage output to clean.")
+
+
 @task
 def clean_frechet(c):
     """Remove cached Fréchet distance matrices.
@@ -920,7 +1019,7 @@ def clean_frechet(c):
         print("No cached Fréchet matrices to clean.")
 
 
-@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_practice, clean_frechet])
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_practice_lme4_effects, clean_practice, clean_route_usage, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass

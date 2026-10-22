@@ -38,10 +38,12 @@ One JSON file per scene produced by `invoke run-clustering`:
   `min_samples`, `cluster_selection_epsilon`, and for the consensus method `bootstraps`,
   `frac`, `seed`, `scheme` and `consensus_cluster` (how the ensemble itself was turned
   into labels). On `consensus_cluster: "ward"` — the default — it also carries
-  `consensus_input`, `consensus_linkage`, `consensus_k_max`, `consensus_tol` and
+  `consensus_input`, `consensus_linkage`, `consensus_k_max`, `consensus_tol`,
   `consensus_min_cluster_size` (the eligibility floor on a Ward cut — a different knob
   from `min_cluster_size`, which is the HDBSCAN density parameter for the replicate
-  fits; both ship at their off values, `0.0` and `1`). On
+  fits; both ship at their off values, `0.0` and `1`), and `consensus_k_rule` with its
+  two shape parameters `consensus_elbow_frac` / `consensus_elbow_min_drop` (which
+  reading of the silhouette-vs-k curve picked k, and what counts as a cliff in it). On
   `consensus_cluster: "hdbscan"` it carries `consensus_epsilon` instead (the merge
   threshold for that fit, in co-association distance rather than Fréchet units — see
   CLAUDE.md). The two sets are mutually exclusive on purpose, so a file says which
@@ -59,14 +61,22 @@ One JSON file per scene produced by `invoke run-clustering`:
   whether `bootstraps` was large enough.
 
   `stability.consensus` records how the ensemble was cut. For Ward: the selected `k`,
-  `selection` — `"silhouette"` normally, meaning the cut with the highest silhouette on
-  `1 - C` was taken; `"fallback_k2"` when no cut cleared the minimum cluster size (only
+  `selection` — `"elbow"` normally, meaning the cut taken was the last one before the
+  silhouette curve drops off a cliff; `"elbow_no_drop"` when that curve had no cliff to
+  find, so the rule fell back to the argmax; `"silhouette"` when `consensus_k_rule`
+  asked for the plain argmax, or `"elbow_capped"` for the argmax at or below the cliff;
+  `"fallback_k2"` when no cut cleared the minimum cluster size (only
   reachable when `consensus_min_cluster_size` is raised above its default of 1); `"no_ensemble_signal"` when no pair of traces ever co-clustered in any
   replicate, in which case every trace is labelled `-1` and `k` is 0, because cutting an
   informationless matrix would invent structure the resampling did not find — the chosen
-  `silhouette` and `silhouette_frechet`, and
+  `silhouette` and `silhouette_frechet`, `rule` (which reading was in force),
+  `elbow` — where the cliff is (`k`, the `drop` there, the `steepest` drop in the curve
+  and the `threshold` a drop had to clear), recorded on **every** run whichever rule
+  selected, exactly as `silhouette_frechet` is recorded without selecting —
   `k_candidates` — the whole silhouette-vs-k curve, so the cut can be second-guessed
-  without re-running the ensemble — and `leaves`, the dendrogram leaf order
+  without re-running the ensemble, each candidate carrying `bounds`, its cut expressed
+  as `k - 1` split positions in the leaf order below (which is what lets the dashboard
+  draw a cut other than the one taken without re-deriving it) — and `leaves`, the dendrogram leaf order
   (`scipy.cluster.hierarchy.leaves_list`, i.e. `dendrogram(..., no_plot=True)["leaves"]`)
   in this file's own row order. The tree carries structure the labels discard, and the
   matrix only shows it when permuted into this order. Note `noise_frac` is 0 on any Ward run that produced
@@ -212,10 +222,10 @@ The practice effect, measured as distance to cluster medoids. Written by
   Top level: `design` (`per_subject_v2`), `primary` (`d_nearest_norm_loso`),
   `primary_transform` (`log`), `transforms`, `scenes`, `subjects`; the task refits when
   the scenes, measures or design change.
-- `lme4.json` — the **primary practice model**, written by `invoke run-practice-lme4`
+- `lme4.json` — the **scene-scale practice model**, one of the two main models, written by `invoke run-practice-lme4`
   (`analysis/practice_lme4.R`, needs R with lme4): per subject × measure
-  (`d_nearest_norm` and its `_loso` twin) × transform × all/completed attempts, the full
-  nested model `y ~ logt + (1 + logt | level) + (1 + logt | level:scene)` (`model`
+  (`d_nearest_norm` and its `_loso` twin) × transform × all/completed attempts, the
+  scene-scale model `y ~ logt + (1 + logt | level) + (1 + logt | level:scene)` (`model`
   `nested`) and its scene-only twin (`scene`, the statsmodels main model refitted as a
   cross-check), by maximum likelihood. Each fit records `intercept`, slope `b`, `se`, the
   Wald and profile-likelihood CIs, `ci` (profile, Wald where the profile failed —
@@ -224,7 +234,7 @@ The practice effect, measured as distance to cluster medoids. Written by
   level likelihood-ratio test (`lrt_chisq`, `lrt_p`, 3 df), `n_zero_dropped` and `curve`
   (the fixed-effect prediction on an attempt grid, transform units). Top level: `design`,
   `formula`, `primary`, `primary_transform`, `scenes`, `subjects`, `measures`, `transforms`.
-- `lme4_route.json` — the **secondary, within-route model**, also from
+- `lme4_route.json` — the **route-scale (within-route) practice model**, the other main model, also from
   `invoke run-practice-lme4` (`analysis/practice_lme4_route.R`): for `d_own` and `d_own_loso`
   — the Fréchet distance in px to the attempt's **own** route (cluster) prototype, so the
   origin never changes along a series — against the nth use of that route (`cluster_use`),
@@ -232,6 +242,17 @@ The practice effect, measured as distance to cluster medoids. Written by
   level:scene:route)` per subject × transform × all/completed attempts. Same fields as
   `lme4.json` (Wald CIs: `ci_method` `wald`), plus `n_routes` and route-level variances
   (`route_var_*`); its `curve` is on the nth-use axis (`use`, mirrored in `attempt`).
+- `lme4_effects/` — from `invoke run-practice-lme4-effects` (`analysis/practice_lme4_effects.R`),
+  which refits every fit in `lme4.json` (nested model) and `lme4_route.json` and checks the
+  refit reproduces the stored coefficients. Not tracked in git (~18 MB, regenerated).
+  `partial.csv.gz`: one row per fitted attempt — `fid` (`model|measure|transform|completed
+  (0/1)|subject`), `subject`, `scene`, `route` (-1 for the scene model), `x` (log attempt or
+  log nth use), `y` (the transformed distance) and `partial`, the ggeffects partial residual
+  (fixed prediction + conditional residual). `ranef.csv.gz`: every level's, scene's and
+  route's random intercept `u` and slope `v` per fit (`kind`, `id` as lme4 names it:
+  `w1l1`, `w1l1:w1l1s0`, `w1l1:w1l1s0:3`). `fixef.json`: the refit fixed effects per fit and
+  the largest gaps to the stored fits and between ggeffects and lme4. `smoke/` holds a
+  `--smoke` run (first subject's two primary fits), never replacing the full one.
 - `nested.json` — alternative random-effect structures for the `log` practice form, fitted
   beside the main model by `analysis.practice.fit_structure`, for `d_nearest_norm` and
   its `_loso` twin × transform × all/completed × subject (80 fits). `structure` is
@@ -246,13 +267,16 @@ The practice effect, measured as distance to cluster medoids. Written by
 - `mixed_summary.csv` — `mixed.json` flattened for reading: one row per subject ×
   measure × transform × all/completed × form (320 rows), plus the 80 `nested.json` fits,
   plus the 80 `lme4.json` fits and the 40 `lme4_route.json` fits (`structure` `lme4_route`,
-  `clock` `route_use`, `n_groups` = routes), told apart by `structure` (`lme4_nested` — the primary model —
+  `clock` `route_use`, `n_groups` = routes), told apart by `structure` (`lme4_nested` — the scene-scale model —
   `scene` for the statsmodels main model, `scene_uncorr`, `level_scene`, `lme4_scene`;
   nested rows add `n_levels`, `var_level_intercept`, `var_level_slope`, `corr_level`; lme4
   rows add `ci_method`, `singular` and `lrt_p_levels`), with `transform` and
-  `n_zero_dropped` columns. `primary` marks the `lme4_nested` rows when `lme4.json` exists,
-  the statsmodels main model's otherwise. `primary` marks the five main results
-  (`d_nearest_norm_loso` on `log(d)`, all attempts, `log` form) and sorts them first.
+  `n_zero_dropped` columns. `slope_p_holm` is `slope_p` Holm-adjusted across the subjects
+  of each fit setting (`structure` × `measure` × `transform` × `completed_only` × `form`),
+  so the route-scale rows carry their own correction, not the scene scale's. `primary` marks the `lme4_nested` rows when `lme4.json` exists,
+  the statsmodels main model's otherwise. `primary` marks the five scene-scale main results
+  (`d_nearest_norm_loso` on `log(d)`, all attempts, `log` form) and sorts them first; the
+  route-scale main results are the `lme4_route` rows for `d_own_loso` on `log(d)`, all attempts.
   Slopes are in each row's transform units, so compare transforms through the ratio
   columns, never the slopes. `slope` is
   the form's practice coefficient (`t`, per 10 attempts, for linear/quadratic;
@@ -267,7 +291,10 @@ The practice effect, measured as distance to cluster medoids. Written by
   logistic GLM `switch ~ C(subject) + log(attempt)` with errors clustered by
   subject × scene (`trend`).
 - `figure_practice_*.png` — from `notebooks/figure_practice.ipynb`: the main analysis, the
-  full nested lme4 model's slopes with Holm-adjusted p and its fitted curves (`lme4`); one example
+  scene-scale lme4 model's slopes with Holm-adjusted p and its fitted curves (`lme4`); both lme4
+  models' curves drawn over the attempts they were fitted on, pooled and as binned partial
+  residuals (`lme4_data`); each subject's six most-played scenes with each scene's own fitted
+  line (`lme4_spaghetti_scene`) and each route's (`lme4_spaghetti_route`); one example
   participant (`example`), per-subject mixed-model slopes and curves, raw vs
   leave-subject-out in the log form (`mixed`) and the same in the linear form
   (`mixed_linear`), linear against log per subject for the primary
@@ -275,6 +302,36 @@ The practice effect, measured as distance to cluster medoids. Written by
   (`switching`), and the practice slope and AIC under each random-effect structure
   (`structures`, both transforms). These are drawn on the primary `log(d)`; the `mixed`, `mixed_linear` and
   `forms` figures are drawn again on `log1p(d)` with a `_log1p` suffix.
+
+## `route_usage/`
+
+Route usage: does a player concentrate on fewer routes across the stages of play?
+Written by `invoke run-route-usage` (`analysis/route_usage.py`, models in
+`analysis/route_usage_lme4.R`) from `practice/attempts/` alone. A cell is one
+subject × scene × stage; the stages are the halves of each phase by attempt order
+(`early_discovery`, `late_discovery`, `early_practice`, `late_practice`; an odd count puts
+the extra attempt in the early half). Routes are the scene's cluster labels.
+
+- `cells.csv` — one row per cell with at least 2 attempts: `subject`, `scene`, `level`,
+  `stage`, `n` (attempts), `routes_used`, `simpson` (the unbiased Simpson index,
+  `sum n_i (n_i - 1) / (N (N - 1))`: the chance two different attempts share a route) and
+  `shannon_rarefied` (expected Shannon entropy in bits of 4 attempts drawn without
+  replacement, computed exactly; empty below 4 attempts).
+- `models.json` — per subject × measure (`simpson`, `shannon_rarefied`) × weighting (`n`:
+  weighted by attempts per cell, the primary; `none`: unweighted), the lme4 fit
+  `y ~ stage + (1 | level) + (1 | level:scene)`: cell counts, singularity and warnings,
+  `stage_means` (estimate, Wald SE and CI for the average scene; for `simpson` also
+  `effective_routes` = `1 / D` and its CI), and three `contrasts`
+  (`late_vs_early_discovery`, `late_vs_early_practice`, `practice_vs_discovery`), each
+  with Wald CI and p, a chance level from route labels shuffled across stages within a
+  scene (`null`: mean, sd, permutation `p_perm`) and a level bootstrap (`boot`: percentile
+  CI and its width relative to the Wald CI). Top-level keys record the scenes, design and
+  resampling settings the fit was made with; a failed fit is stored as `null` with the
+  reason in `warnings`.
+- `figure_route_usage_*.png` — from `notebooks/figure_route_usage.ipynb`: stage means per
+  subject as effective routes and rarefied entropy (`stages`), and the three contrasts
+  against the chance level with the bootstrap and unweighted fits beside them
+  (`contrasts`).
 
 ## `frechet/`
 
@@ -347,8 +404,32 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   `lme4_route`, `practice/nested.json` as
   `nested`, and `summary` — every CI and p-value for the primary measure (lme4, scene-only
   model with Holm-adjusted p, statsmodels nested, and the scene and level bootstraps read
-  from `docs/practice_*_bootstrap*.csv` when present), per transform and subject. Nothing is refitted and no attempt rows are included.
+  from `docs/practice_*_bootstrap*.csv` when present), per transform and subject, and
+  `diagnostics` — the assumption checks for the scene-scale lme4, route-scale lme4 and
+  scene-only statsmodels models, per transform, each on its own main measure (`measure`): each check's question, what a violation affects, and the verdict,
+  graded by `docs/practice_residual_diagnostics.py`'s own `verdicts()` from its
+  `docs/practice_residual_diagnostics*.csv`, plus the per-subject numbers behind them.
+  Nothing is refitted and no attempt rows are included.
+- `output_data/web/data/diagnostics/` — the full diagnostic figures
+  (`docs/practice_residual_diagnostics*.png`), copied by `export_practice` so the Stats
+  section can show them; ~1 MB each, fetched only when the reader opens them.
   Rewritten by every `run-web-export`, `--backfill` included.
+- `output_data/web/data/practice_points.json` — the data under each lme4 fit, for the Stats
+  section's *Fit against the data* panel: `analysis.practice.fit_check_data()` per fit in
+  `lme4.json` (`nested` model) and `lme4_route.json`, keyed
+  `lme4_nested|lme4_route` `|measure|transform|completed (0/1)|subject`. Each holds `n_obs`
+  (equal to the fit's), `bins` (geometric means with 95% CI, `n_obs`, `n_scenes`),
+  `partial_bins` (the same over the partial residuals, when `lme4_effects/` exists), and
+  `points` — a seeded sample of 800 `[x, d, partial d]` rows, for drawing only. Written by
+  `export_fit_data` from `export_practice`, `--backfill` included; ~1.4 MB, fetched only when
+  the panel is drawn.
+- `output_data/web/data/practice_spaghetti.json` — the dashboard's *One line per scene* panel:
+  for each lme4 model's primary setting (`lme4_nested`: `d_nearest_norm_loso`; `lme4_route`:
+  `d_own_loso`; `log`, all attempts), per subject, `analysis.practice.spaghetti_data()` for
+  their 12 most-played scenes — `points` (`[x, d, route]`, every attempt), `lines` (each
+  scene's, or route's, own intercept `a` and slope `b` on the log scale, drawn to `x1`),
+  `fixed`, and each scene's whole-scene route ranking `rank` for colour slots. Written with
+  `practice_points.json`; only when `lme4_effects/` exists. ~0.2 MB.
 - `data/scenes/<scene_id>.json` — the drawable scene: `method`, `entry` (the applied
   x-offset), `bg` + `bg_size`, `xlim`/`ylim` (precomputed from `_shared_xlim` and
   `playfield_ylim`), `step`, `cons` (below), and a `traces` array. Each trace carries its cluster label
@@ -367,15 +448,21 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   to an existing payload with `invoke run-web-export --backfill`.
 - `cons` — the **k-selection record**, lifted verbatim out of the scene's cluster file
   by `analysis.webexport.selection_report`: the aggregation used, the chosen `k` and its
-  `silhouette`, the `selection` route, the whole `k_candidates` curve (one row per
-  candidate cut: `k`, `silhouette`, `silhouette_frechet`, `min_size`), plus the ensemble
+  `silhouette`, the `selection` route and the `rule` that produced it, the `elbow`
+  block (where the curve falls off a cliff, recorded whether or not it selected), the
+  whole `k_candidates` curve (one row per
+  candidate cut: `k`, `silhouette`, `silhouette_frechet`, `min_size`, `bounds`), plus the ensemble
   numbers the curve should be read against (`stable_share`, `k_replicates`,
   `bootstraps`, `frac`, `scheme`), and `leaves` — the dendrogram leaf order,
   re-expressed in **payload** indices so the browser can apply it directly to the
-  matrix it was served. It is what the dashboard's **k selection** view draws
-  — a few hundred bytes a scene, and `null` for a single-fit run, which has no ensemble
-  and therefore no k to choose. Not derivable from the payload, so it arrives by
-  re-export rather than by `--backfill`.
+  matrix it was served. It is what the dashboard's **k selection** view draws, and
+  `bounds` + `leaves` together are what its **Clusters (k)** control decodes to draw a
+  candidate cut other than the one that was taken — a few kilobytes a scene, and `null`
+  for a single-fit run, which has no ensemble and therefore no k to choose. Not
+  derivable from the payload, but derivable from `output_data/` alone, so
+  `invoke run-web-export --backfill` refreshes it without re-reading `mario.scenes`
+  (`bounds` for files predating the field are rebuilt from the stored co-association
+  matrix, which reproduces the same tree exactly).
 - `sb` — **consensus confidence**, 0-1: how often this trace's cluster-mates agreed with
   it across the bootstrap replicates. Present only for scenes clustered with the
   consensus method. Unlike `a` and `st` it is **not** derivable from what the payload

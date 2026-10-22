@@ -9,7 +9,8 @@ import hdbscan
 from joblib import Parallel, delayed
 
 from analysis.changepoints import _SCENE_PATTERN
-from analysis.stability import (CONSENSUS_K_MAX, CONSENSUS_K_TOL,
+from analysis.stability import (CONSENSUS_ELBOW_FRAC, CONSENSUS_ELBOW_MIN_DROP,
+                                CONSENSUS_K_MAX, CONSENSUS_K_RULE, CONSENSUS_K_TOL,
                                 CONSENSUS_MIN_CLUSTER_SIZE)
 
 # Binary scene-design-pattern columns in scenes_mastersheet.csv (Zenodo 15586709).
@@ -248,7 +249,10 @@ def _params_record(method, n_clusters, min_cluster_size, min_samples,
                    consensus_linkage=CONSENSUS_LINKAGE,
                    consensus_k_max=CONSENSUS_K_MAX,
                    consensus_tol=CONSENSUS_K_TOL,
-                   consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE) -> dict:
+                   consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE,
+                   consensus_k_rule=CONSENSUS_K_RULE,
+                   consensus_elbow_frac=CONSENSUS_ELBOW_FRAC,
+                   consensus_elbow_min_drop=CONSENSUS_ELBOW_MIN_DROP) -> dict:
     """The settings that produced a partition, stored alongside it.
 
     Earlier cluster files recorded no parameters at all, and the scenes were not
@@ -281,7 +285,10 @@ def _params_record(method, n_clusters, min_cluster_size, min_samples,
                            "consensus_linkage": consensus_linkage,
                            "consensus_k_max": int(consensus_k_max),
                            "consensus_tol": float(consensus_tol),
-                           "consensus_min_cluster_size": int(consensus_min_cluster_size)})
+                           "consensus_min_cluster_size": int(consensus_min_cluster_size),
+                           "consensus_k_rule": consensus_k_rule,
+                           "consensus_elbow_frac": float(consensus_elbow_frac),
+                           "consensus_elbow_min_drop": float(consensus_elbow_min_drop)})
     return record
 
 
@@ -305,6 +312,9 @@ def cluster_traces(
     consensus_k_max: int = CONSENSUS_K_MAX,
     consensus_tol: float = CONSENSUS_K_TOL,
     consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
+    consensus_k_rule: str = CONSENSUS_K_RULE,
+    consensus_elbow_frac: float = CONSENSUS_ELBOW_FRAC,
+    consensus_elbow_min_drop: float = CONSENSUS_ELBOW_MIN_DROP,
 ) -> tuple[list[int], dict | None]:
     """Pairwise Fréchet distance + clustering. Shared by per-scene and per-category runs.
 
@@ -356,6 +366,16 @@ def cluster_traces(
                                     cluster clears it. Distinct from ``min_cluster_size``
                                     above, which is an HDBSCAN density parameter for the
                                     replicate fits.
+        consensus_k_rule:           how the silhouette-vs-k curve is read: "elbow"
+                                    (default, the last k before the curve drops off a
+                                    cliff), "silhouette" (the plain argmax) or
+                                    "elbow_capped" (the argmax at or below that cliff).
+                                    Every reading is reported whichever one selects.
+        consensus_elbow_frac:       what counts as that cliff — a drop at least this
+                                    share of the steepest drop in the curve. 1.0 is
+                                    literally "the k before the steepest drop".
+        consensus_elbow_min_drop:   absolute floor on a cliff, so a curve flat to
+                                    within rounding is reported as having none.
         dist_matrix:                a precomputed Fréchet distance matrix. If given,
                                     ``traces`` is not needed and no distances are
                                     computed — this is the cheap path for re-running
@@ -380,6 +400,9 @@ def cluster_traces(
                           consensus_k_max=consensus_k_max,
                           consensus_tol=consensus_tol,
                           consensus_min_cluster_size=consensus_min_cluster_size,
+                          consensus_k_rule=consensus_k_rule,
+                          consensus_elbow_frac=consensus_elbow_frac,
+                          consensus_elbow_min_drop=consensus_elbow_min_drop,
                           n_jobs=n_jobs)
     elif method == "hdbscan":
         return hdbscan.HDBSCAN(
@@ -401,7 +424,10 @@ def _consensus(dist_matrix, *, min_cluster_size, min_samples,
                consensus_cluster=CONSENSUS_CLUSTER, consensus_input=CONSENSUS_INPUT,
                consensus_linkage=CONSENSUS_LINKAGE, consensus_k_max=CONSENSUS_K_MAX,
                consensus_tol=CONSENSUS_K_TOL,
-               consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE, n_jobs=1):
+               consensus_min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE,
+               consensus_k_rule=CONSENSUS_K_RULE,
+               consensus_elbow_frac=CONSENSUS_ELBOW_FRAC,
+               consensus_elbow_min_drop=CONSENSUS_ELBOW_MIN_DROP, n_jobs=1):
     """Bagged clustering: resample, average the partitions, cluster the average.
 
     The ensemble *produces* the labels here rather than annotating a single fit.
@@ -439,7 +465,8 @@ def _consensus(dist_matrix, *, min_cluster_size, min_samples,
             coassoc, dist=dist_matrix, input=consensus_input,
             linkage_method=consensus_linkage,
             min_cluster_size=consensus_min_cluster_size,
-            k_max=consensus_k_max, tol=consensus_tol)
+            k_max=consensus_k_max, tol=consensus_tol, rule=consensus_k_rule,
+            elbow_frac=consensus_elbow_frac, elbow_min_drop=consensus_elbow_min_drop)
     elif consensus_cluster == "hdbscan":
         # NB: cluster_selection_epsilon is in Fréchet units and belongs to the replicate
         # fits above. This fit runs on 1 - C, bounded in [0, 1], where that threshold
@@ -497,6 +524,9 @@ def run_clustering(
     consensus_k_max: int = CONSENSUS_K_MAX,
     consensus_tol: float = CONSENSUS_K_TOL,
     consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
+    consensus_k_rule: str = CONSENSUS_K_RULE,
+    consensus_elbow_frac: float = CONSENSUS_ELBOW_FRAC,
+    consensus_elbow_min_drop: float = CONSENSUS_ELBOW_MIN_DROP,
 ) -> None:
     """Cluster behavioural traces for one scene using Fréchet distance.
 
@@ -527,7 +557,9 @@ def run_clustering(
         consensus_cluster=consensus_cluster, consensus_input=consensus_input,
         consensus_linkage=consensus_linkage, consensus_k_max=consensus_k_max,
         consensus_tol=consensus_tol,
-        consensus_min_cluster_size=consensus_min_cluster_size, n_jobs=n_jobs)
+        consensus_min_cluster_size=consensus_min_cluster_size,
+        consensus_k_rule=consensus_k_rule, consensus_elbow_frac=consensus_elbow_frac,
+        consensus_elbow_min_drop=consensus_elbow_min_drop, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     stable = "" if stability is None else f", {stability['stable_share']:.0%} of traces stable"
@@ -546,7 +578,10 @@ def run_clustering(
                                  consensus_linkage=consensus_linkage,
                                  consensus_k_max=consensus_k_max,
                                  consensus_tol=consensus_tol,
-                                 consensus_min_cluster_size=consensus_min_cluster_size),
+                                 consensus_min_cluster_size=consensus_min_cluster_size,
+                                 consensus_k_rule=consensus_k_rule,
+                                 consensus_elbow_frac=consensus_elbow_frac,
+                                 consensus_elbow_min_drop=consensus_elbow_min_drop),
         "labels": labels,
         "metadata": metadata,
         "stability": stability,
@@ -576,6 +611,9 @@ def run_clustering_by_category(
     consensus_k_max: int = CONSENSUS_K_MAX,
     consensus_tol: float = CONSENSUS_K_TOL,
     consensus_min_cluster_size: int = CONSENSUS_MIN_CLUSTER_SIZE,
+    consensus_k_rule: str = CONSENSUS_K_RULE,
+    consensus_elbow_frac: float = CONSENSUS_ELBOW_FRAC,
+    consensus_elbow_min_drop: float = CONSENSUS_ELBOW_MIN_DROP,
 ) -> None:
     """Cluster behavioural traces pooled across every scene tagged with a category.
 
@@ -625,7 +663,9 @@ def run_clustering_by_category(
         consensus_cluster=consensus_cluster, consensus_input=consensus_input,
         consensus_linkage=consensus_linkage, consensus_k_max=consensus_k_max,
         consensus_tol=consensus_tol,
-        consensus_min_cluster_size=consensus_min_cluster_size, n_jobs=n_jobs)
+        consensus_min_cluster_size=consensus_min_cluster_size,
+        consensus_k_rule=consensus_k_rule, consensus_elbow_frac=consensus_elbow_frac,
+        consensus_elbow_min_drop=consensus_elbow_min_drop, n_jobs=n_jobs)
 
     n_found = len(set(l for l in labels if l != -1))
     print(f"Category '{category}': {n_found} clusters found ({labels.count(-1)} noise points)")
@@ -642,7 +682,10 @@ def run_clustering_by_category(
                                  consensus_linkage=consensus_linkage,
                                  consensus_k_max=consensus_k_max,
                                  consensus_tol=consensus_tol,
-                                 consensus_min_cluster_size=consensus_min_cluster_size),
+                                 consensus_min_cluster_size=consensus_min_cluster_size,
+                                 consensus_k_rule=consensus_k_rule,
+                                 consensus_elbow_frac=consensus_elbow_frac,
+                                 consensus_elbow_min_drop=consensus_elbow_min_drop),
         "labels": labels,
         "metadata": metadata,
         "stability": stability,

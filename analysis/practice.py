@@ -40,13 +40,16 @@ series (``d_own``), which gets a random intercept and a random slope on practice
 scenes, it does not condition on a strategy the player kept using, and its reference
 is set by the other players.
 
-**The primary model is the full nested lme4 model** (``run_practice_lme4``):
+**The scene-scale model is the main model on the primary measure** (``run_practice_lme4``):
 ``log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)``
 — a level's scenes are played back to back, so they are not independent, and only lme4
 can nest correlated scene effects inside levels. It is fitted in R by
 ``analysis/practice_lme4.R`` into ``lme4.json``; ``mixed_summary.csv`` marks its rows as
-``primary``. The statsmodels models (``fit_mixed``, ``fit_structure``) stay beside it as
-the robustness checks they became, and as the primary when R is not available.
+``primary``. Beside it, the **route-scale model** (``lme4_route.json``,
+``analysis/practice_lme4_route.R``) is the other main model: distance to the attempt's own
+route prototype against the nth use of that route, routes nested in scenes in levels. The
+statsmodels models (``fit_mixed``, ``fit_structure``) stay beside them as the robustness
+checks they became, and as the scene-scale stand-in when R is not available.
 
 **Two transforms, both kept.** Every model is fitted on ``log(d)`` — the primary
 (``PRIMARY_TRANSFORM``), with the ~0.6% of attempts at exactly ``d = 0`` dropped since
@@ -549,13 +552,13 @@ NESTED_MEASURES = ("d_nearest_norm", "d_nearest_norm_loso")
 NESTED_DESIGN = "v2"   # v2: level_scene warm-started from scene_uncorr, best of several optimisers
 SCENE_VC = {"scene": "0 + C(group)", "scene_slope": "0 + C(group):logt"}
 
-# The primary model, fitted in R (analysis/practice_lme4.R). d_own is not fitted: its unit
+# The scene-scale model, fitted in R (analysis/practice_lme4.R). d_own is not fitted: its unit
 # is scene x cluster, which would need a third nested level.
 LME4_MEASURES = ("d_nearest_norm", "d_nearest_norm_loso")
 LME4_DESIGN = "v1"
 LME4_SCRIPT = Path(__file__).with_name("practice_lme4.R")
 PRIMARY_STRUCTURE = "lme4_nested"     # which rows mixed_summary marks primary, when fitted
-# Secondary, within-route model: distance (px) to the attempt's own route prototype, against
+# Route-scale (within-route) model, the second main model: distance (px) to the attempt's own route prototype, against
 # the nth use of that route, routes nested in scenes nested in levels.
 ROUTE_MEASURES = ("d_own", "d_own_loso")
 ROUTE_DESIGN = "v1"
@@ -680,10 +683,10 @@ def mixed_summary(mixed: dict, nested: dict | None = None, lme4: dict | None = N
     as further rows, told apart by ``structure`` (``scene`` for the main model,
     ``scene_uncorr``, ``level_scene``), with their level variances in ``var_level_*``.
     With ``lme4`` (``lme4.json``), the R fits are added as ``lme4_scene`` (the main model,
-    refitted as a cross-check) and ``lme4_nested`` (the primary model); their CI is the
+    refitted as a cross-check) and ``lme4_nested`` (the scene-scale model); their CI is the
     profile-likelihood one, Wald where the profile failed (``ci_method``). When lme4 rows
     exist they are the ones marked ``primary``; otherwise the statsmodels main model is.
-    With ``lme4_route`` (``lme4_route.json``), the within-route model is added as
+    With ``lme4_route`` (``lme4_route.json``), the route-scale model is added as
     ``lme4_route``: its ``slope`` is per log nth use of the route (``clock``), its distance
     is in px, and ``n_groups`` counts routes.
 
@@ -803,12 +806,34 @@ def mixed_summary(mixed: dict, nested: dict | None = None, lme4: dict | None = N
     sorder = {k: i for i, k in enumerate(("lme4_nested", "lme4_route", "scene") + STRUCTURES
                                          + ("lme4_scene",))}
     df = pd.DataFrame(rows)
+    df["slope_p_holm"] = _holm_by_family(df)
     df["_form"] = df["form"].map(order)
     df["_tr"] = df["transform"].map(torder)
     df["_st"] = df["structure"].map(sorder)
     return (df.sort_values(["primary", "_st", "_tr", "measure", "completed_only", "_form", "subject"],
                            ascending=[False, True, True, True, True, True, True])
               .drop(columns=["_form", "_tr", "_st"]).reset_index(drop=True))
+
+
+# One family of tests = one fit setting run once per subject; Holm corrects across the
+# subjects in it, as the headline does ("tested on five subjects").
+HOLM_FAMILY = ["structure", "measure", "transform", "completed_only", "form"]
+
+
+def _holm_by_family(df: pd.DataFrame) -> pd.Series:
+    """Holm-adjusted ``slope_p`` across the subjects of each ``HOLM_FAMILY`` group.
+
+    Step-down: the smallest p times m, the next times m - 1, ..., never decreasing and
+    capped at 1. A missing p stays missing and does not count towards m.
+    """
+    out = pd.Series(np.nan, index=df.index)
+    for _, g in df.groupby(HOLM_FAMILY, dropna=False):
+        p = g["slope_p"].dropna().sort_values()
+        running = 0.0
+        for rank, (i, v) in enumerate(p.items()):
+            running = max(running, min(1.0, (len(p) - rank) * v))
+            out[i] = running
+    return out
 
 
 def write_mixed_summary(pdir: Path) -> None:
@@ -861,17 +886,315 @@ def _lme4_records(fits, curves, zeros, clock):
     return records
 
 
-def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> None:
-    """Fit the lme4 practice models: the primary model and the within-route model.
+def route_frame(df: pd.DataFrame, measure: str, subject: str, completed_only: bool = False,
+                transform: str = PRIMARY_TRANSFORM) -> pd.DataFrame:
+    """The route-scale model's rows for one fit: one per attempt on a route (noise dropped).
 
-    **Primary** (``lme4.json``): exports the exact model frames the statsmodels fits use
+    ``y`` is the transformed distance to the attempt's own route prototype, ``use`` the nth
+    use of that route at the scene (``cluster_use``). Shared by ``run_practice_lme4`` and
+    the route-scale diagnostics and bootstrap in ``docs/``, so all three fit the same rows.
+    """
+    d = _mixed_frame(df, measure, subject, completed_only, transform)
+    d = d[d["cluster"] >= 0]
+    return pd.DataFrame({
+        "measure": measure, "subject": subject, "transform": transform,
+        "completed_only": completed_only, "y": d["y"].values,
+        "use": d["cluster_use"].values, "log_use": np.log(d["cluster_use"].values),
+        "scene": d["scene"].values, "route": d["cluster"].values,
+        "level": d["scene"].map(level_of).values,
+        "n_zero_dropped": d.attrs["n_zero_dropped"]})
+
+
+FIT_CHECK_MODELS = ("nested", "route")    # lme4.json's main model, lme4_route.json's
+FIT_CHECK_SINGLE = 5                      # attempts 1..5 get a bin each; log-spaced after
+FIT_CHECK_BINS = 12
+
+
+def fit_check_data(df: pd.DataFrame, model: str, measure: str, subject: str,
+                   transform: str = PRIMARY_TRANSFORM, completed_only: bool = False, *,
+                   effects: pd.DataFrame | None = None, n_points: int = 1500, seed: int = 0) -> dict:
+    """The data an lme4 fit was made on, summarised for drawing under its curve.
+
+    Rows come from the frame the fit itself used — ``_mixed_frame`` for the scene-scale
+    model (``model="nested"``, x = attempt), ``route_frame`` for the route scale
+    (``model="route"``, x = nth use of the route) — so ``n_obs`` matches the fit's.
+    Bins are the mean of the *transformed* outcome, back-transformed: under ``log`` a
+    geometric mean, the same quantity the fixed-effect curve is, so the two compare like
+    with like (an arithmetic mean of ``d`` would sit above the curve from skew alone).
+    Attempts 1..``FIT_CHECK_SINGLE`` get a bin each, then log-spaced bins up to the
+    95th-percentile x, where the stored curve stops; bins under 2 rows are skipped.
+
+    ``bins`` pool the raw outcome, and mislead for the route model: the fixed slope is a
+    *within*-unit slope, and routes reused 20+ times are already ~30% tighter on their
+    first use, so pooled bins fall far below the line even when the model is right.
+    ``partial_bins`` are the check that matches the model: the same bins over the
+    ggeffects partial residuals (fixed prediction + conditional residual, i.e. each
+    attempt with its level's, scene's and route's own intercept and slope removed), from
+    ``effects`` — this fit's rows of ``load_effects()[0]``, in frame order (checked).
+    Without ``effects`` there are no ``partial_bins``. ``points`` is a seeded thinning,
+    ``[x, d, partial d]``, for drawing only. Error bars treat attempts as independent,
+    which they are not within a scene, so they are narrower than an honest CI.
+    """
+    if model == "route":
+        d = route_frame(df, measure, subject, completed_only, transform)
+        x = d["use"].to_numpy(float)
+    else:
+        d = _mixed_frame(df, measure, subject, completed_only, transform)
+        x = d["attempt"].to_numpy(float)
+    y = d["y"].to_numpy(float)
+    scene = d["scene"].to_numpy()
+    inverse = TRANSFORMS[transform][1]
+    out = {"n_obs": int(len(d)), "bins": [], "points": []}
+    if not len(d):
+        return out
+    partial = None
+    if effects is not None:
+        if len(effects) != len(d) or not np.allclose(effects["y"].to_numpy(float), y):
+            raise ValueError(f"effects rows do not line up with the {model} frame for sub-{subject}; "
+                             "rerun invoke run-practice-lme4-effects --force")
+        partial = effects["partial"].to_numpy(float)
+        out["partial_bins"] = []
+    top = float(np.quantile(x, 0.95))
+    edges = np.arange(1, FIT_CHECK_SINGLE + 2, dtype=float) - 0.5
+    if top > edges[-1]:
+        edges = np.unique(np.concatenate(
+            [edges, np.geomspace(edges[-1], top + 0.5, FIT_CHECK_BINS - FIT_CHECK_SINGLE + 1)]))
+    for key, v in (("bins", y), ("partial_bins", partial)):
+        if v is None:
+            continue
+        for lo, hi in zip(edges[:-1], edges[1:]):
+            m = (x >= lo) & (x < hi)
+            n = int(m.sum())
+            if n < 2:
+                continue
+            mu, se = v[m].mean(), v[m].std(ddof=1) / np.sqrt(n)
+            out[key].append({"x": float(np.exp(np.log(x[m]).mean())), "mean": float(inverse(mu)),
+                             "lo": float(inverse(mu - 1.96 * se)), "hi": float(inverse(mu + 1.96 * se)),
+                             "n_obs": n, "n_scenes": int(len(np.unique(scene[m])))})
+    keep = np.random.default_rng(seed).permutation(len(d))[:n_points]
+    pd_ = inverse(partial[keep]) if partial is not None else [None] * len(keep)
+    out["points"] = [[float(a), float(b), None if c is None else float(c)]
+                     for a, b, c in zip(x[keep], inverse(y[keep]), pd_)]
+    return out
+
+
+EFFECTS_SCRIPT = Path(__file__).with_name("practice_lme4_effects.R")
+EFFECTS_DESIGN = "v1"
+EFFECTS_TOLERANCE = 1e-4     # refit fixed effects must match the stored fit to this
+
+
+def effects_dir(output_dir) -> Path:
+    return practice_dir(output_dir) / "lme4_effects"
+
+
+def fit_id(model: str, measure: str, transform: str, completed_only: bool, subject: str) -> str:
+    """One lme4 fit's key, shared by the effects files and the dashboard payload."""
+    return f"{model}|{measure}|{transform}|{int(bool(completed_only))}|{subject}"
+
+
+def _stored_lme4_fits(output_dir):
+    """``(model, fit record)`` for every fit in lme4.json (nested) and lme4_route.json."""
+    pdir = practice_dir(output_dir)
+    out = []
+    for model, name in (("nested", "lme4.json"), ("route", "lme4_route.json")):
+        if (pdir / name).exists():
+            out += [(model, f) for f in json.loads((pdir / name).read_text())["fits"]
+                    if f["model"] == model]
+    return out
+
+
+def run_practice_lme4_effects(output_dir, *, smoke=False, force=False, n_cores=None) -> None:
+    """Partial residuals and per-unit random effects of every stored lme4 fit.
+
+    Refits each fit in ``lme4.json`` (nested model) and ``lme4_route.json`` in R
+    (``analysis/practice_lme4_effects.R``: same frames, formula and optimiser, no CIs) and
+    writes ``practice/lme4_effects/``: ``partial.csv.gz`` (per fitted row: x, y, and the
+    ggeffects partial residual — the fixed prediction plus the conditional residual, so the
+    outcome with its level's, scene's and route's own intercept and slope taken out),
+    ``ranef.csv.gz`` (every level's, scene's and route's BLUP intercept ``u`` and slope
+    ``v``) and ``fixef.json``. Each refit's fixed effects are checked against the stored fit
+    (``EFFECTS_TOLERANCE``) and the run stops on a mismatch, so these are the stored models'
+    effects, not a near relative's. ``smoke`` refits the first subject's primary fits only,
+    into a separate ``smoke/`` folder, never replacing a full run. Needs R with lme4 and
+    ggeffects; without them it says so and returns.
+    """
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    stored = _stored_lme4_fits(output_dir)
+    if not stored:
+        print("No lme4 fits on disk — run invoke run-practice-lme4 first.")
+        return
+    if shutil.which("Rscript") is None or subprocess.run(
+            ["Rscript", "-e", "quit(status = !requireNamespace('ggeffects', quietly = TRUE))"],
+            capture_output=True).returncode != 0:
+        print("Rscript with ggeffects not found — skipping the lme4 effects. Install it "
+              "(sudo apt install r-cran-ggeffects, or install.packages('ggeffects') in R) and "
+              "rerun invoke run-practice-lme4-effects.")
+        return
+    edir = effects_dir(output_dir) / ("smoke" if smoke else "")
+    if smoke:
+        first = sorted({f["subject"] for _, f in stored})[0]
+        stored = [(m, f) for m, f in stored if f["subject"] == first and f["transform"] == PRIMARY_TRANSFORM
+                  and not f["completed_only"] and f["measure"] in (PRIMARY, "d_own_loso")]
+    wanted = sorted(fit_id(m, f["measure"], f["transform"], f["completed_only"], f["subject"])
+                    for m, f in stored)
+    meta_path = edir / "fixef.json"
+    if meta_path.exists() and not force:
+        meta = json.loads(meta_path.read_text())
+        if meta.get("design") == EFFECTS_DESIGN and sorted(meta["fits"]) == wanted:
+            print(f"lme4 effects already computed for these {len(wanted)} fits, skipping "
+                  "(use --force to refit).")
+            return
+
+    df = load_attempts(output_dir)
+    frames = []
+    for model, f in stored:
+        args = (df, f["measure"], f["subject"], f["completed_only"], f["transform"])
+        if model == "route":
+            d = route_frame(*args)
+            x, route = d["log_use"].values, d["route"].values
+        else:
+            d = _mixed_frame(*args)
+            x, route = d["logt"].values, -1
+        frames.append(pd.DataFrame({
+            "fid": fit_id(model, f["measure"], f["transform"], f["completed_only"], f["subject"]),
+            "model": model, "subject": f["subject"], "y": d["y"].values, "x": x,
+            "scene": d["scene"].values, "level": d["scene"].map(level_of).values, "route": route}))
+    frames = pd.concat(frames, ignore_index=True)
+    frames["rid"] = np.arange(len(frames))
+    n_cores = n_cores or max(1, (os.cpu_count() or 2) - 1)
+    print(f"Refitting {len(wanted)} lme4 fits for partial residuals and random effects "
+          f"on {n_cores} cores...")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        frames.to_csv(tmp / "frames.csv", index=False)
+        out = [tmp / n for n in ("partial.csv", "ranef.csv", "fixef.csv")]
+        subprocess.run(["Rscript", str(EFFECTS_SCRIPT), str(tmp / "frames.csv"), *map(str, out),
+                        str(n_cores)], check=True)
+        partial, ranef, fixef = (pd.read_csv(p, keep_default_na=False, na_values=["NA"],
+                                             dtype={"fid": str, "id": str}) for p in out)
+
+    by_id = {fit_id(m, f["measure"], f["transform"], f["completed_only"], f["subject"]): f
+             for m, f in stored}
+    fixef["stored_b"] = fixef["fid"].map(lambda k: by_id[k]["b"])
+    fixef["stored_intercept"] = fixef["fid"].map(lambda k: by_id[k]["intercept"])
+    fixef["stored_n_obs"] = fixef["fid"].map(lambda k: by_id[k]["n_obs"])
+    gap = np.maximum(abs(fixef["b"] - fixef["stored_b"]), abs(fixef["intercept"] - fixef["stored_intercept"]))
+    bad = fixef[(gap > EFFECTS_TOLERANCE) | (fixef["n_obs"] != fixef["stored_n_obs"])]
+    if len(bad):
+        raise RuntimeError("lme4 refits do not reproduce the stored fits — rerun "
+                           "invoke run-practice-lme4 --force first:\n" + bad.to_string())
+
+    rows = frames.drop(columns=["model", "level"]).merge(partial.drop(columns="fid"), on="rid")
+    edir.mkdir(parents=True, exist_ok=True)
+    rows.drop(columns="rid").to_csv(edir / "partial.csv.gz", index=False)
+    ranef.to_csv(edir / "ranef.csv.gz", index=False)
+    meta_path.write_text(json.dumps({
+        "design": EFFECTS_DESIGN, "fits": wanted,
+        "max_fixef_gap": float(gap.max()), "max_ggeffects_gap": float(fixef["max_gap"].max()),
+        "fixef": {r.fid: {"intercept": r.intercept, "b": r.b, "singular": bool(r.singular)}
+                  for r in fixef.itertuples()}}, indent=2))
+    print(f"Wrote {edir}: {len(rows)} partial residuals, {len(ranef)} random effects; refits match "
+          f"the stored fits to {gap.max():.1e}, ggeffects matches lme4 to {fixef['max_gap'].max():.1e}.")
+
+
+def load_effects(output_dir, smoke=False):
+    """``(partial, ranef, fixef)`` from ``run_practice_lme4_effects``, or ``None`` if not run.
+
+    ``partial`` has one row per fitted attempt (``fid``, subject, scene, route, ``x`` on
+    the model's log scale, ``y`` and ``partial`` on the transform's scale); ``ranef`` one
+    row per level / scene / route and fit (``kind``, ``id`` as lme4 names it — ``w1l1``,
+    ``w1l1:w1l1s0``, ``w1l1:w1l1s0:3`` — ``u`` intercept, ``v`` slope).
+    """
+    edir = effects_dir(output_dir) / ("smoke" if smoke else "")
+    if not (edir / "fixef.json").exists():
+        return None
+    partial = pd.read_csv(edir / "partial.csv.gz", dtype={"subject": str, "fid": str, "scene": str})
+    ranef = pd.read_csv(edir / "ranef.csv.gz", dtype={"fid": str, "id": str})
+    return partial, ranef, json.loads((edir / "fixef.json").read_text())["fixef"]
+
+
+def unit_lines(ranef: pd.DataFrame, fixef: dict, fid: str) -> pd.DataFrame:
+    """Every scene's (and, for the route model, every route's) own fitted line for one fit.
+
+    A unit's line is ``(b0 + u_level + u_scene [+ u_route]) + (b1 + v_level + v_scene
+    [+ v_route]) * log(x)`` on the transform's scale. Columns: ``scene``, ``route`` (-1 for
+    the scene model), ``a`` intercept, ``b`` slope.
+    """
+    r = ranef[ranef["fid"] == fid]
+    fe = fixef[fid]
+    lv = r[r["kind"] == "level"].set_index("id")[["u", "v"]]
+    sc = r[r["kind"] == "scene"].set_index("id")[["u", "v"]]
+    out = pd.DataFrame({"key": sc.index, "scene": [k.split(":")[1] for k in sc.index]})
+    out["level"] = [k.split(":")[0] for k in sc.index]
+    out["a"] = fe["intercept"] + sc["u"].values + lv.loc[out["level"], "u"].values
+    out["b"] = fe["b"] + sc["v"].values + lv.loc[out["level"], "v"].values
+    routes = r[r["kind"] == "route"]
+    if not len(routes):
+        out["route"] = -1
+        return out[["scene", "route", "a", "b"]]
+    parts = routes["id"].str.split(":", expand=True)
+    rt = pd.DataFrame({"scene_key": parts[0] + ":" + parts[1], "scene": parts[1],
+                       "route": parts[2].astype(int), "u": routes["u"].values, "v": routes["v"].values})
+    base = out.set_index("key")
+    rt["a"] = base.loc[rt["scene_key"], "a"].values + rt["u"]
+    rt["b"] = base.loc[rt["scene_key"], "b"].values + rt["v"]
+    return rt[["scene", "route", "a", "b"]].reset_index(drop=True)
+
+
+SPAGHETTI_TOP = 6       # scenes per subject in the notebook figure: the most-played ones
+
+
+def spaghetti_data(partial: pd.DataFrame, ranef: pd.DataFrame, fixef: dict, fid: str,
+                   scenes=None, top: int = SPAGHETTI_TOP) -> dict:
+    """Per scene, the attempts and each unit's own fitted line, for one lme4 fit.
+
+    ``scenes`` defaults to the ``top`` scenes with the most attempts in this fit. Each
+    scene holds ``points`` (``[x, d, route]``, every attempt, x as attempt or nth use)
+    and ``lines``: one per scene for the scene-scale model, one per route for the route
+    model (``route``, intercept ``a`` and slope ``b`` on the transform's scale, drawn from
+    x = 1 to that unit's last attempt ``x1``), plus ``fixed`` — the average-scene line,
+    for reference. The lines are the fixed effects plus that unit's BLUPs (``unit_lines``).
+    """
+    transform = fid.split("|")[2]
+    inverse = TRANSFORMS[transform][1]
+    rows = partial[partial["fid"] == fid]
+    if scenes is None:
+        scenes = rows["scene"].value_counts().index[:top].tolist()
+    lines = unit_lines(ranef, fixef, fid)
+    fe = fixef[fid]
+    out = {"transform": transform, "fixed": {"a": fe["intercept"], "b": fe["b"]}, "scenes": {}}
+    for sc in scenes:
+        r = rows[rows["scene"] == sc]
+        if not len(r):
+            continue
+        x = np.rint(np.exp(r["x"].to_numpy(float))).astype(int)
+        route = r["route"].to_numpy(int)
+        last = pd.Series(x).groupby(route).max()
+        ls = lines[lines["scene"] == sc]
+        out["scenes"][sc] = {
+            "n": int(len(r)),
+            "points": [[int(a), float(b), int(c)] for a, b, c in zip(x, inverse(r["y"].to_numpy(float)), route)],
+            "lines": [{"route": int(l.route), "a": float(l.a), "b": float(l.b),
+                       "x1": int(last.get(l.route, x.max()) if l.route >= 0 else x.max())}
+                      for l in ls.itertuples() if l.route < 0 or l.route in last.index]}
+    return out
+
+
+def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> None:
+    """Fit the two main lme4 practice models: the scene-scale and the route-scale model.
+
+    **Scene scale** (``lme4.json``): exports the exact model frames the statsmodels fits use
     (``_mixed_frame``) for ``LME4_MEASURES`` x ``TRANSFORMS`` x all/completed attempts x
     subject, runs ``analysis/practice_lme4.R`` on them (parallel over fits), and stores, per
     fit, both the nested model and its scene-only twin: intercept, slope, Wald and profile
     CIs, the CI used (``ci``: profile, Wald where the profile failed), Wald p, variances at
     every level, AIC, singularity, the level likelihood-ratio test and the fitted curve.
 
-    **Within-route, secondary** (``lme4_route.json``): for ``ROUTE_MEASURES`` (``d_own``,
+    **Route scale** (``lme4_route.json``): for ``ROUTE_MEASURES`` (``d_own``,
     distance in px to the attempt's OWN route prototype, so the origin never changes along
     a series), practice counted as the nth use of that route (``cluster_use``), routes
     nested in scenes nested in levels (``analysis/practice_lme4_route.R``); Wald CIs.
@@ -890,7 +1213,7 @@ def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> 
     out_path = pdir / "lme4.json"
     route_path = pdir / "lme4_route.json"
     if shutil.which("Rscript") is None:
-        print("Rscript not found — skipping the lme4 models (the primary practice model). "
+        print("Rscript not found — skipping the lme4 models (the two main practice models). "
               "Install R and lme4 (e.g. sudo apt install r-base r-cran-lme4) and rerun "
               "invoke run-practice-lme4.")
         return
@@ -938,22 +1261,12 @@ def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> 
         print(f"Wrote {out_path}")
 
     if not route_ok:
-        frames = []
-        for measure in ROUTE_MEASURES:
-            for transform, completed_only, s in combos:
-                d = _mixed_frame(df, measure, s, completed_only, transform)
-                d = d[d["cluster"] >= 0]
-                frames.append(pd.DataFrame({
-                    "measure": measure, "subject": s, "transform": transform,
-                    "completed_only": completed_only, "y": d["y"].values,
-                    "use": d["cluster_use"].values, "log_use": np.log(d["cluster_use"].values),
-                    "scene": d["scene"].values, "route": d["cluster"].values,
-                    "level": d["scene"].map(level_of).values,
-                    "n_zero_dropped": d.attrs["n_zero_dropped"]}))
-        frames = pd.concat(frames, ignore_index=True)
+        frames = pd.concat([route_frame(df, measure, s, completed_only, transform)
+                            for measure in ROUTE_MEASURES
+                            for transform, completed_only, s in combos], ignore_index=True)
         zeros = (frames.groupby(["measure", "subject", "transform", "completed_only"])
                        ["n_zero_dropped"].first())
-        print(f"Fitting the within-route lme4 model: {zeros.size} fits on {n_cores} cores...")
+        print(f"Fitting the route-scale lme4 model: {zeros.size} fits on {n_cores} cores...")
         fits, curves = _run_lme4_script(ROUTE_SCRIPT, frames.drop(columns="n_zero_dropped"), n_cores)
         route_path.write_text(json.dumps({
             "design": ROUTE_DESIGN, "primary": "d_own_loso", "primary_transform": PRIMARY_TRANSFORM,

@@ -6,7 +6,7 @@ name = "mario-behaviour-analysis"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-    "airoh",
+    "airoh>=0.5.0",
     "invoke",
     "requests",
     "jupyter>=1.0",

@@ -53,6 +53,10 @@ const STABILITY_STOPS = [
   "#f07948", "#f4894b", "#f79952", "#f9a95e", "#fbb96d", "#fcc97f", "#fdd893", "#fcfdbf",
 ];
 
+/* The elbow rule's colour in the k-selection chart. Warm, so it cannot be mistaken
+ * for either silhouette series — it marks one k, not a curve. */
+const ELBOW_COLOR = "#eb6834";
+
 /* Legend order for the six stages, mirroring STAGES in analysis/stages.py. The
  * payload stores only the tertile letter; the stage is that plus the phase. */
 const STAGES = ["early_discovery", "middle_discovery", "late_discovery",
@@ -88,7 +92,8 @@ const state = {
   zoom: 1,
   pan: { x: 0, y: 0 },
   section: "clustering",   // or "stats": the practice-model section
-  stats: { model: "lme4_nested", measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all" },
+  stats: { model: "lme4_nested", measure: "d_nearest_norm", transform: "log", form: "log", attempts: "all",
+           spSubject: null },
   statsSubjectColors: new Map(),
 };
 
@@ -208,6 +213,93 @@ function visibleCounts(traces) {
 /* The clusters that still have at least one visible trace, in stable rank order. */
 function visibleRanked(rank, counts) {
   return rank.ranked.filter((l) => (counts.get(l) || 0) > 0);
+}
+
+/* ---------- which cut is on screen ---------- */
+
+/* The one place the dashboard departs from "filters never change the labels", and
+ * it does so loudly rather than quietly.
+ *
+ * Every candidate cut of the Ward tree was scored during the consensus run, and one
+ * of them was selected by the k rule. The others are just as real — they are the same
+ * tree cut at a different height — and being able to see them is how you tell a cut
+ * that found structure from one that split a cluster in half. So the payload ships
+ * all of them (`cons.k_candidates[].bounds`, k-1 split positions in the dendrogram
+ * leaf order) and this control draws a different one.
+ *
+ * What it is NOT: a re-analysis. Nothing is refitted, no distance is recomputed, the
+ * co-association matrix is untouched — the browser is still only drawing a stored
+ * result, just not the selected one. The title says so whenever the cut on screen is
+ * not the chosen one, because every other number in the interface (stable_share, the
+ * per-trace confidence, the index row) was measured at the chosen k. */
+
+function consensus() {
+  return (state.scene && state.scene.cons) || {};
+}
+
+function chosenK() {
+  const k = consensus().k;
+  return typeof k === "number" ? k : null;
+}
+
+function activeK() {
+  return state.k == null ? chosenK() : state.k;
+}
+
+function viewingAlternativeCut() {
+  return state.k != null && state.k !== chosenK();
+}
+
+/* Candidates this browser can actually draw. A cut is only decodable alongside the
+ * leaf order its positions index into, so a payload without one offers none — the
+ * export drops the bounds in that case for exactly this reason. */
+function cuttableCandidates() {
+  const cons = consensus();
+  const leaves = cons.leaves;
+  if (!state.scene || !Array.isArray(leaves)) return [];
+  if (leaves.length !== state.scene.traces.length) return [];
+  return (cons.k_candidates || []).filter(
+    (r) => Array.isArray(r.bounds) && r.bounds.length === r.k - 1);
+}
+
+/* Set every trace's label to the cut at k. Null (or the chosen k) restores the labels
+ * the run itself produced, which are kept verbatim in `c0` — the stored partition is
+ * authoritative and is never re-derived, even though decoding reproduces it exactly
+ * (ARI 1.000 over the corpus). Only the cluster *ids* can differ, because equal-sized
+ * clusters tie-break differently here than in _relabel_by_size, and that would repaint
+ * the scene for no reason at the one k where there is a stored answer to defer to. */
+function applyCut(k) {
+  if (!state.scene) return;
+  const traces = state.scene.traces;
+  if (traces.length && traces[0].c0 === undefined) for (const t of traces) t.c0 = t.c;
+
+  const row = k == null || k === chosenK()
+    ? null
+    : cuttableCandidates().find((r) => r.k === k);
+  if (!row) {
+    for (const t of traces) t.c = t.c0;
+    state.k = null;
+    return;
+  }
+
+  const leaves = consensus().leaves;
+  const bounds = new Set(row.bounds);
+  const group = new Int32Array(traces.length);
+  const size = new Array(row.k).fill(0);
+  let g = 0;
+  for (let p = 0; p < leaves.length; p++) {
+    if (bounds.has(p)) g++;
+    group[leaves[p]] = g;
+    size[g]++;
+  }
+  // Largest cluster becomes 0, as _relabel_by_size does, so the colour slots keep
+  // meaning "rank by size" at every k. Ties break by leaf order, which is arbitrary
+  // but deterministic — the point is that a redraw never reshuffles the palette.
+  const rank = new Map(size.map((n, i) => [i, n])
+    .sort((a, b) => (b[1] - a[1]) || (a[0] - b[0]))
+    .map(([i], slot) => [i, slot]));
+  traces.forEach((t, i) => { t.c = rank.get(group[i]); });
+  state.k = k;
 }
 
 /* Viridis position for a trace, normalised WITHIN ITS SUBJECT: every player's
@@ -473,7 +565,14 @@ function renderTitle(traces, rank, counts) {
   const filtered = traces.length !== total;
   const bits = [];
   if (filtered) bits.push(`<span class="filtered">${traces.length} of ${total} traces shown</span>`);
-  bits.push("cluster labels are fixed — filters only change what is drawn");
+  // Which cut is on screen has to be said outright: it is the one thing in this
+  // interface that changes the labels, and every stability number quoted elsewhere
+  // (the index row, stable_share, the per-trace confidence) belongs to the chosen one.
+  if (viewingAlternativeCut()) {
+    bits.push(`<span class="filtered">cut at k=${state.k}, not the chosen k=${chosenK()}</span>`);
+  } else {
+    bits.push("cluster labels are fixed — filters only change what is drawn");
+  }
   if (s.step > 1) bits.push(`polylines thinned to every ${s.step}${s.step === 3 ? "rd" : "th"} frame`);
   $("chart-sub").innerHTML = bits.join(" · ");
   $("clear-filters").hidden = !filtered && state.hiddenClusters.size === 0;
@@ -788,7 +887,8 @@ function showTooltip(t, clientX, clientY) {
     ["outcome", t.out],
     ["duration", t.dur == null ? "—" : `${t.dur} s`],
     ["cluster", t.c === -1 ? "noise" : t.c],
-    ["stability", t.sb == null ? "—" : t.sb.toFixed(2)],
+    ["stability", t.sb == null ? "—"
+      : viewingAlternativeCut() ? `${t.sb.toFixed(2)} (at k=${chosenK()})` : t.sb.toFixed(2)],
     ["x travelled", t.xt ?? "—"],
     ["hits taken", t.ht ?? "—"],
     ["enemies killed", t.ek ?? "—"],
@@ -917,6 +1017,12 @@ async function selectScene(id) {
   state.pinned = null; state.hover = null;
   state.zoom = 1; state.pan = { x: 0, y: 0 };
 
+  // Candidate lists differ per scene, so a k picked on the last one means nothing
+  // here: every scene opens on the cut its own run selected.
+  applyCut(null);
+  applyCutAvailability();
+  renderCutControl();
+
   // Subject -> color, assigned by sorted subject id over the SCENE's subjects,
   // exactly as subject_color_map() does in analysis/trace_plots.py.
   const subjects = [...new Set(payload.traces.map((t) => t.s))].sort();
@@ -954,6 +1060,90 @@ async function selectScene(id) {
   renderSceneList();
   renderSubjectList();
   render();
+}
+
+/* ---------- the k picker ---------- */
+
+function renderCutControl() {
+  const field = $("cut-field");
+  const range = $("cut-range");
+  const out = $("cut-value");
+  const hint = $("cut-hint");
+  const reset = $("cut-reset");
+  const rows = cuttableCandidates();
+
+  if (!rows.length) {
+    field.classList.add("unavailable");
+    range.disabled = reset.disabled = true;
+    range.max = 0; range.value = 0;
+    out.textContent = chosenK() == null ? "—" : `k=${chosenK()}`;
+    out.className = "";
+    hint.textContent = state.scene && state.scene.cons
+      ? "This scene ships only the cut that was taken — re-export it to carry the others."
+      : "Not a consensus run: there is no tree to cut at another k.";
+    return;
+  }
+
+  field.classList.remove("unavailable");
+  range.disabled = false;
+  range.max = String(rows.length - 1);
+  const k = activeK();
+  let i = rows.findIndex((r) => r.k === k);
+  if (i < 0) i = 0;
+  range.value = String(i);
+  const row = rows[i];
+  const alt = viewingAlternativeCut();
+  out.textContent = `k=${row.k}`;
+  out.className = alt ? "alt" : "";
+  reset.disabled = !alt;
+
+  const dust = row.min_size != null && row.min_size <= 2
+    ? ` · smallest cluster ${row.min_size} trace${row.min_size === 1 ? "" : "s"}`
+    : "";
+  const sil = typeof row.silhouette === "number"
+    ? ` · silhouette ${row.silhouette.toFixed(4)}` : "";
+  hint.textContent = alt
+    ? `Showing the k=${row.k} cut${sil}${dust}. The run chose k=${chosenK()} — ` +
+      `stability numbers and the scene list still describe that one.`
+    : `The cut the run selected${sil}${dust}. Drag to see the same tree cut elsewhere.`;
+}
+
+/* The per-trace confidence was measured against the chosen partition, so it means
+ * nothing about a cut the run did not make. Grey the mode out rather than paint a
+ * number from one partition onto another. */
+function applyCutAvailability() {
+  const alt = viewingAlternativeCut();
+  const btn = [...$("color-seg").querySelectorAll("button")]
+    .find((b) => b.dataset.value === "stability");
+  if (!btn) return;
+  btn.disabled = alt;
+  btn.title = alt
+    ? `Per-trace confidence was measured at the chosen cut (k=${chosenK()}), not at this one.`
+    : "";
+  if (alt && state.colorBy === "stability") {
+    state.colorBy = "cluster";
+    for (const b of $("color-seg").querySelectorAll("button")) {
+      b.setAttribute("aria-pressed", String(b.dataset.value === "cluster"));
+    }
+  }
+}
+
+function setCut(k) {
+  applyCut(k);
+  state.hiddenClusters.clear();
+  state.pinned = null; state.hover = null;
+  applyCutAvailability();
+  renderCutControl();
+  render();
+}
+
+function bindCutControl() {
+  $("cut-range").addEventListener("input", (e) => {
+    const rows = cuttableCandidates();
+    const row = rows[Number(e.target.value)];
+    if (row) setCut(row.k);
+  });
+  $("cut-reset").addEventListener("click", () => setCut(null));
 }
 
 /* Enable/disable the controls that need the derived fields. */
@@ -1130,9 +1320,15 @@ async function renderMatrix() {
   // pre-Ward arrangement to offer instead: in payload order (subject, then time) the
   // block structure is invisible, which is the whole reason such a figure is permuted
   // at all. So the caption names both halves rather than claiming one for the pair.
+  // The leaf order is the tree's, not the cut's, so it is the same at every k — which
+  // is what makes scrubbing k readable here: the rows hold still and only the blocks
+  // on the right redraw.
   $("matrix-caption").textContent = usingLeaves
     ? "co-association — values as measured, rows in Ward's leaf order"
     : "co-association — values as measured, rows grouped by Ward's cut";
+  $("partition-caption").innerHTML = viewingAlternativeCut()
+    ? `partition &mdash; the tree cut at k=${state.k}`
+    : "partition &mdash; the cut Ward returned";
 
   const total = state.scene.traces.length;
   const ordering = usingLeaves
@@ -1432,6 +1628,36 @@ function renderSelection() {
     ctx.restore();
   }
 
+  // The elbow: the last k before the curve falls off a cliff. Drawn as a rule of its
+  // own because it is a *different reading of the same curve*, not a second series —
+  // there is nothing to plot at each k, only one k that the shape of the curve points
+  // at. Whether it selected anything is `cons.rule`; the legend says which.
+  const elbow = cons.elbow || {};
+  const elbowIdx = elbow.k == null ? -1 : rows.findIndex((r) => r.k === elbow.k);
+  if (elbowIdx >= 0) {
+    ctx.save();
+    ctx.strokeStyle = ELBOW_COLOR;
+    ctx.globalAlpha = 0.7;
+    ctx.setLineDash([2, 3]);
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(px(elbowIdx), y0);
+    ctx.lineTo(px(elbowIdx), y1);
+    ctx.stroke();
+    // An arrow into the drop it names, so the rule reads as "and then it falls".
+    if (elbowIdx + 1 < rows.length) {
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 0.9;
+      const xa = px(elbowIdx), xb = px(elbowIdx + 1);
+      ctx.beginPath();
+      ctx.moveTo(xa, py(rows[elbowIdx].silhouette));
+      ctx.lineTo(xb, py(rows[elbowIdx + 1].silhouette));
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+    ctx.restore();
+  }
+
   const series = (key, color, dashed) => {
     const pts = rows
       .map((r, i) => ({ i, v: r[key] }))
@@ -1484,6 +1710,22 @@ function renderSelection() {
     ctx.restore();
   }
 
+  // ...and a second, wider ring on the cut currently drawn everywhere else, when that
+  // is not the chosen one. Two rings is the honest picture: the run made one choice,
+  // and you are looking at another.
+  const viewedIdx = rows.findIndex((r) => r.k === activeK());
+  if (viewingAlternativeCut() && viewedIdx >= 0
+      && typeof rows[viewedIdx].silhouette === "number") {
+    ctx.save();
+    ctx.strokeStyle = accent;
+    ctx.setLineDash([3, 3]);
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.arc(px(viewedIdx), py(rows[viewedIdx].silhouette), 10, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
+  }
+
   // Axis frame and k labels.
   ctx.strokeStyle = line;
   ctx.beginPath();
@@ -1493,12 +1735,17 @@ function renderSelection() {
   ctx.stroke();
 
   ctx.textAlign = "center";
+  const cuttable = new Set(cuttableCandidates().map((r) => r.k));
   rows.forEach((r, i) => {
     const chosen = r.k === cons.k;
-    ctx.fillStyle = chosen ? accent : ink3;
-    ctx.font = `${chosen ? "600 " : ""}10px system-ui, sans-serif`;
+    const viewed = r.k === activeK();
+    ctx.fillStyle = chosen || viewed ? accent : ink3;
+    ctx.font = `${chosen || viewed ? "600 " : ""}10px system-ui, sans-serif`;
     ctx.fillText(String(r.k), px(i), y1 + 14);
-    selectionPoints.push({ k: r.k, cx: px(i), cy: py(r.silhouette), row: r, chosen });
+    selectionPoints.push({
+      k: r.k, cx: px(i), cy: py(r.silhouette), row: r, chosen, viewed,
+      elbow: r.k === elbow.k, cuttable: cuttable.has(r.k),
+    });
   });
 
   ctx.fillStyle = ink2;
@@ -1510,11 +1757,12 @@ function renderSelection() {
   ctx.fillText("silhouette", 0, 0);
   ctx.restore();
 
-  renderSelectionLegend(accent, ink3, hasFrechet);
-  note.textContent = selectionExplainer(cons);
+  renderSelectionLegend(accent, ink3, hasFrechet, elbowIdx >= 0);
+  note.textContent = selectionExplainer(cons)
+    + (cuttable.size ? "  Click a k to draw that cut in every other view." : "");
 }
 
-function renderSelectionLegend(accent, ink3, hasFrechet) {
+function renderSelectionLegend(accent, ink3, hasFrechet, hasElbow) {
   const legend = $("selection-legend");
   legend.innerHTML = "";
   const item = (color, dashed, text) => {
@@ -1538,8 +1786,14 @@ function renderSelectionLegend(accent, ink3, hasFrechet) {
     el.appendChild(span);
     legend.appendChild(el);
   };
-  item(accent, false, "silhouette on 1 − C  (selects k)");
+  const cons = state.scene.cons || {};
+  const rule = cons.rule || "silhouette";
+  item(accent, false, `silhouette on 1 − C  (${rule === "silhouette" ? "selects k" : "recorded"})`);
   if (hasFrechet) item(ink3, true, "silhouette on Fréchet distance  (recorded only)");
+  if (hasElbow) {
+    item(ELBOW_COLOR, true, `elbow — last k before the drop  (${
+      rule === "silhouette" ? "recorded" : "selects k"})`);
+  }
   hollowNote(accent);
 }
 
@@ -1573,18 +1827,36 @@ function hollowNote(accent) {
 
 /* One sentence saying what happened, in the terms of the run that happened. */
 function selectionExplainer(cons) {
-  const rule = cons.tol > 0
+  const argmax = cons.tol > 0
     ? `smallest k scoring within ${cons.tol} of the best`
     : "highest silhouette (ties to the smaller k)";
+  const elbow = cons.elbow || {};
+  const cliff = elbow.k == null
+    ? "no drop in this curve reaches that depth, so it has no elbow"
+    : `the curve's steepest drop is ${elbow.steepest}, and k=${elbow.k} is the last ` +
+      `cut before the first drop of at least ${elbow.threshold}`;
+  const rules = {
+    silhouette: argmax,
+    elbow: `last k before the curve drops off a cliff — ${cliff}`,
+    elbow_capped: `highest silhouette at or below the elbow — ${cliff}`,
+    elbow_no_drop: `the elbow rule found no cliff, so it fell back to the argmax (${argmax})`,
+  };
+  const rule = rules[cons.selection] || argmax;
   const floor = cons.min_cluster_size > 1
     ? `Cuts whose smallest cluster fell below ${cons.min_cluster_size} traces were not eligible.`
     : "Every cut from k=2 upward was eligible — no minimum cluster size was imposed on the Ward cut.";
+  const aside = cons.selection === "silhouette" && elbow.k != null && elbow.k !== cons.k
+    ? ` The elbow rule would have cut at k=${elbow.k} instead; it is drawn but did not select.`
+    : "";
 
   switch (cons.selection) {
     case "silhouette":
+    case "elbow":
+    case "elbow_capped":
+    case "elbow_no_drop":
       return `Ward linkage over the co-association matrix (${cons.input} form), cut at ` +
         `k=${cons.k} of the ${(cons.k_candidates || []).length} candidates from 2 to ${cons.k_max}. ` +
-        `Rule: ${rule}. ${floor}`;
+        `Rule: ${rule}. ${floor}${aside}`;
     case "fallback_k2":
       return `No cut cleared the minimum cluster size of ${cons.min_cluster_size}, so the ` +
         `k=2 cut was taken rather than dropping the scene. The silhouette did not choose here.`;
@@ -1607,13 +1879,20 @@ function renderSelectionFacts(cons) {
   const pct = (v) => (typeof v === "number" ? `${(v * 100).toFixed(0)}%` : "—");
   const num = (v, d = 4) => (typeof v === "number" ? v.toFixed(d) : "—");
 
+  const elbow = cons.elbow || {};
   const rows = [
     ["clusters chosen (k)", String(cons.k ?? "—"), true],
-    ["silhouette at that k", num(cons.silhouette), true],
+    ["silhouette there", num(cons.silhouette), true],
+    ["cut on screen", viewingAlternativeCut() ? `k=${state.k}` : "the chosen cut",
+      viewingAlternativeCut()],
     ["silhouette on Fréchet", num(cons.silhouette_frechet), false],
+    ["elbow k", elbow.k == null ? "— (no cliff)" : String(elbow.k),
+      cons.selection === "elbow" || cons.selection === "elbow_capped"],
+    ["drop / steepest", elbow.k == null ? "—" : `${num(elbow.drop)} / ${num(elbow.steepest)}`, false],
     ["selection", cons.selection || "—", false],
     ["aggregation", `${cons.consensus_cluster || "—"} / ${cons.input || "—"} / ${cons.linkage || "—"}`, false],
     ["k searched", `2 … ${cons.k_max ?? "—"}`, false],
+    ["k rule", cons.rule || "silhouette", false],
     ["plateau tolerance", cons.tol > 0 ? String(cons.tol) : "0 (off)", false],
     ["min cluster size (cut)", cons.min_cluster_size > 1 ? String(cons.min_cluster_size) : "1 (off)", false],
     ["replicate k", reps.mean != null ? `${reps.mean} ± ${reps.sd}` : "—", false],
@@ -1634,18 +1913,33 @@ function renderSelectionFacts(cons) {
   }
 }
 
+function nearestSelectionPoint(clientX) {
+  const canvas = $("selection-canvas");
+  if (!selectionPoints.length) return null;
+  const r = canvas.getBoundingClientRect();
+  const mx = clientX - r.left;
+  let best = null, bestD = Infinity;
+  for (const p of selectionPoints) {
+    const d = Math.abs(p.cx - mx);
+    if (d < bestD) { bestD = d; best = p; }
+  }
+  return best && bestD <= 40 ? best : null;
+}
+
 function bindSelectionCanvas() {
   const canvas = $("selection-canvas");
   canvas.addEventListener("mousemove", (ev) => {
-    if (!selectionPoints.length) return;
-    const r = canvas.getBoundingClientRect();
-    const mx = ev.clientX - r.left;
-    let best = null, bestD = Infinity;
-    for (const p of selectionPoints) {
-      const d = Math.abs(p.cx - mx);
-      if (d < bestD) { bestD = d; best = p; }
-    }
-    if (!best || bestD > 40) { $("tooltip").dataset.show = "false"; return; }
+    const best = nearestSelectionPoint(ev.clientX);
+    canvas.style.cursor = best && best.cuttable ? "pointer" : "default";
+    if (!best) { $("tooltip").dataset.show = "false"; return; }
+    showSelectionTooltip(best, ev.clientX, ev.clientY);
+  });
+  // Clicking the curve draws that cut everywhere else. The chart is where the choice
+  // is argued about, so it is also where the alternative can be taken up.
+  canvas.addEventListener("click", (ev) => {
+    const best = nearestSelectionPoint(ev.clientX);
+    if (!best || !best.cuttable) return;
+    setCut(best.k === chosenK() ? null : best.k);
     showSelectionTooltip(best, ev.clientX, ev.clientY);
   });
   canvas.addEventListener("mouseleave", () => { $("tooltip").dataset.show = "false"; });
@@ -1654,14 +1948,21 @@ function bindSelectionCanvas() {
 function showSelectionTooltip(point, clientX, clientY) {
   const tip = $("tooltip");
   const r0 = point.row;
+  // Read live rather than from the point's stored flags: a click changes which cut is
+  // drawn before the chart is repainted, and a tooltip saying otherwise would be wrong
+  // for one frame at exactly the moment it is being read.
   const rows = [
     ["silhouette (1 − C)", typeof r0.silhouette === "number" ? r0.silhouette.toFixed(4) : "—"],
     ["silhouette (Fréchet)", typeof r0.silhouette_frechet === "number" ? r0.silhouette_frechet.toFixed(4) : "—"],
     ["smallest cluster", r0.min_size != null ? `${r0.min_size} traces` : "—"],
   ];
+  if (point.elbow) rows.push(["elbow", "last k before the drop"]);
+  const tags = [];
+  if (point.k === chosenK()) tags.push("chosen");
+  if (point.k === activeK()) tags.push("on screen");
   tip.innerHTML =
     `<div class="tt-head"><span>k = ${point.k}</span>` +
-    `<span>${point.chosen ? "chosen" : "not chosen"}</span></div>` +
+    `<span>${tags.join(" · ") || (point.cuttable ? "click to draw" : "not chosen")}</span></div>` +
     `<dl>${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
   tip.dataset.show = "true";
   const r = tip.getBoundingClientRect();
@@ -1846,20 +2147,21 @@ const subjColor = (s) => state.statsSubjectColors.get(s) || NOISE_COLOR;
  * was fitted in every practice form and for the own-medoid measure; the nested ones are
  * log form and nearest/spread only, so the other controls are disabled for them. */
 const STATS_MODELS = {
-  lme4_nested: { label: "full nested lme4", short: "full nested (lme4)",
-                 formula: "(1 + log(attempt) | level) + (1 + log(attempt) | level:scene), fitted in R's lme4" },
+  lme4_nested: { label: "scene-scale lme4", short: "scene scale (lme4)",
+                 formula: "distance to the nearest route prototype against attempt number, with " +
+                          "(1 + log(attempt) | level) + (1 + log(attempt) | level:scene), fitted in R's lme4" },
   scene: { label: "scene only (statsmodels)", short: "scene only",
            formula: "(1 + practice | scene), the first model, fitted in statsmodels" },
   level_scene: { label: "nested, no scene correlation (statsmodels)", short: "nested, no corr.",
                  formula: "levels + scenes, scene intercept and slope uncorrelated (all statsmodels can nest)" },
-  lme4_route: { label: "within-route lme4 (secondary)", short: "within-route (lme4)",
+  lme4_route: { label: "route-scale lme4", short: "route scale (lme4)",
                 formula: "distance in px to the attempt's OWN route prototype against the nth use of that " +
                          "route, with (1 + log(use) | level) + (1 + log(use) | level:scene) + " +
                          "(1 + log(use) | level:scene:route), fitted in R's lme4; Wald CIs" },
 };
 const SUMMARY_COLORS = { lme4: CLUSTER_COLORS[4], model: CLUSTER_COLORS[0], nested: CLUSTER_COLORS[6],
                          scene_boot: CLUSTER_COLORS[1], level_boot: CLUSTER_COLORS[2] };
-const SUMMARY_LABELS = { lme4: "full nested (lme4) — main", model: "scene only (statsmodels)",
+const SUMMARY_LABELS = { lme4: "scene scale (lme4) — main", model: "scene only (statsmodels)",
                          nested: "nested, no scene corr. (statsmodels)", scene_boot: "scene bootstrap",
                          level_boot: "level bootstrap" };
 
@@ -2103,7 +2405,8 @@ function drawLineChart(host, { series, yDomain, yLabel, xLabel, ref, refLabel, h
     if (!rows.length) { cross.setAttribute("visibility", "hidden"); hideStatsTooltip(); return; }
     vline.setAttribute("x1", px(shownX)); vline.setAttribute("x2", px(shownX));
     cross.setAttribute("visibility", "visible");
-    showStatsTooltip(`attempt ${shownX} at a scene`, null, rows, ev.clientX, ev.clientY);
+    showStatsTooltip(state.stats.model === "lme4_route" ? `use ${shownX} of the route`
+                       : `attempt ${shownX} at a scene`, null, rows, ev.clientX, ev.clientY);
   });
   hit.addEventListener("mouseleave", () => {
     cross.setAttribute("visibility", "hidden");
@@ -2160,16 +2463,386 @@ function renderStatsCurves() {
     "still contribute. The y-axis is zoomed to the data, so drops look steeper than they are.";
 }
 
+/* Fit against the data: the stored lme4 curve over the rows it was fitted on, from
+ * data/practice_points.json (export_fit_data, fetched only when this block is drawn).
+ * Two rows per subject: pooled bins, and the same bins over the ggeffects partial
+ * residuals (run-practice-lme4-effects: each attempt with its level's, scene's and
+ * route's own intercept and slope removed). The fixed slope is a within-unit slope, so
+ * the second row is the like-for-like check; the pooled row also carries between-unit
+ * differences (routes kept for many uses start tighter). Bins are geometric means under
+ * log, the same quantity the curve is. Drawing only: the points are a seeded sample. */
+let fitPoints = null;              // practice_points.json once loaded; false when unavailable
+let fitPointsLoading = false;
+const FIT_POINT_COLOR = "#898781";
+
+function renderStatsFitData() {
+  const block = $("stats-fitdata-block");
+  const model = state.stats.model;
+  const lme4 = model === "lme4_nested" || model === "lme4_route";
+  block.hidden = !lme4 || state.stats.form !== "log";
+  if (block.hidden) return;
+  if (fitPoints === null) {
+    $("stats-fitdata-cap").textContent = "loading the data under the fits…";
+    if (!fitPointsLoading) {
+      fitPointsLoading = true;
+      fetch("data/practice_points.json", { cache: "no-cache" })
+        .then((res) => (res.ok ? res.json() : false))
+        .catch(() => false)
+        .then((data) => { fitPoints = data; render(); });
+    }
+    return;
+  }
+  const pooledHost = $("stats-fitdata-pooled"), withinHost = $("stats-fitdata-within");
+  pooledHost.innerHTML = ""; withinHost.innerHTML = "";
+  if (!fitPoints) {
+    $("stats-fitdata-cap").textContent =
+      "No data/practice_points.json in this export. Run  invoke run-web-export --backfill  and reload.";
+    return;
+  }
+  const { measure, transform } = state.stats;
+  const completed = state.stats.attempts === "completed" ? 1 : 0;
+  const route = model === "lme4_route";
+  const panels = [];
+  for (const s of statsData.subjects) {
+    const fit = modelFit(`${measure}_loso`, s);
+    const data = fitPoints[`${model}|${measure}_loso|${transform}|${completed}|${s}`];
+    if (fit && fit.r && fit.r.curve && data && data.bins.length) panels.push({ s, fit: fit.r, data });
+  }
+  const hasPartial = panels.some((p) => p.data.partial_bins);
+  $("stats-fitdata-partial-label").hidden = !hasPartial;
+  withinHost.hidden = !hasPartial;
+  if (!panels.length) {
+    $("stats-fitdata-cap").textContent = "No fit for this selection.";
+    return;
+  }
+  // Every box is inserted before any is measured, or the first ones read the row as their width.
+  const boxes = panels.map((p) => {
+    const mk = (host) => { const b = document.createElement("div"); b.className = "stats-chart"; host.appendChild(b); return b; };
+    return { ...p, pooledBox: mk(pooledHost), withinBox: mk(withinHost) };
+  });
+  const inv = INVERSE[transform];
+  for (const within of hasPartial ? [false, true] : [false]) {
+    const col = within ? 2 : 1;
+    const ys = boxes.flatMap((b) => b.data.points.map((p) => p[col]).filter((v) => v != null && v > 0))
+      .sort((a, b) => a - b);
+    const q = (f) => ys[Math.min(ys.length - 1, Math.floor(f * ys.length))];
+    let [ylo, yhi] = [q(0.01), q(0.99)];
+    for (const b of boxes) {
+      for (const bin of (within ? b.data.partial_bins : b.data.bins) || []) { ylo = Math.min(ylo, bin.lo); yhi = Math.max(yhi, bin.hi); }
+    }
+    for (const b of boxes) {
+      if (within && !b.data.partial_bins) continue;
+      const curve = b.fit.curve.attempt.map((a, i) => [a, inv(b.fit.curve.y[i])]);
+      drawFitPanel(within ? b.withinBox : b.pooledBox, {
+        title: within ? null : `sub-${b.s} <span class="muted">n=${b.data.n_obs}</span>`,
+        points: b.data.points.filter((p) => p[col] != null).map((p) => [p[0], p[col]]),
+        bins: within ? b.data.partial_bins : b.data.bins, curve, color: subjColor(b.s),
+        yDomain: [ylo, yhi], ref: measure === "d_nearest_norm" ? 1 : null,
+        digits: MEASURE_INFO[measure].digits, route, within, subject: b.s,
+        yLabel: measure === "d_nearest_norm" ? "distance / spread" : "distance (px)",
+      });
+    }
+  }
+  $("stats-fitdata-legend").innerHTML =
+    legendHTML([[FIT_POINT_COLOR, "attempts (a sample)"]], true) +
+    legendHTML([["var(--ink)", "fitted curve"]]) +
+    legendHTML(panels.map((p) => [subjColor(p.s), `sub-${p.s} binned, 95% CI`]), true);
+  $("stats-fitdata-cap").innerHTML =
+    `The ${STATS_MODELS[model].label} fixed-effect curve (dark line), drawn over the rows it was fitted on ` +
+    `(leave-subject-out medoids, ${transform}(d), ${completed ? "completed attempts only" : "all attempts"}). ` +
+    "Grey points are a seeded sample of the attempts. The coloured bins use every attempt. They are " +
+    `the mean of ${transform}(d) per bin, converted back, which is the same quantity the curve is ` +
+    "(a plain mean of the distances would sit above it from skew alone). " +
+    `<strong>Read the second row.</strong> The fixed slope is a <em>within-${route ? "route" : "scene"}</em> slope, ` +
+    `because every ${route ? "route" : "scene"} has its own intercept and slope. The pooled row also mixes ` +
+    (route
+      ? "<em>different</em> routes: a route that ends up reused 20+ times is already about 30% tighter on its " +
+        "first use than one dropped after a few, so only the tight routes are left in the late pooled bins, " +
+        "and those bins fall well below the line even though the model is right. "
+      : "different scenes: only scenes played many times reach the late bins, so those bins could drift " +
+        "from the line if those scenes differed from the average. For this model the two rows come out " +
+        "almost the same (bins within 2-5%, 15% at one bin for sub-05): scenes differ little next to the " +
+        "attempt-to-attempt noise, and the scenes played longest are not systematically easier or harder, " +
+        "so here the raw data was already a fair check. ") +
+    (hasPartial
+      ? "The second row is the standard mixed-model check, the partial residuals (from the R package " +
+        "<code>ggeffects</code>): each attempt with its own level's, scene's" + (route ? " and route's" : "") +
+        " intercept and slope taken out, so it is compared with the line on the model's own terms. "
+      : "The partial-residual row needs <code>invoke run-practice-lme4-effects</code> (R with ggeffects), " +
+        "then <code>invoke run-web-export --backfill</code>. ") +
+    "Hover a bin for its n and how many scenes it holds. The error bars treat attempts as independent, " +
+    "which they are not within a scene, so read them as where the bin sits, not as a test. " +
+    "Both axes are on a log scale, where the model's curve is a straight line, so a bend in the bins " +
+    "is what a wrong shape would look like. The y-axes are shared within each row.";
+}
+
+function drawFitPanel(host, { title, points, bins, curve, color, yDomain, ref, digits, route, within, subject, yLabel }) {
+  if (title) {
+    const d = document.createElement("div");
+    d.className = "panel-title";
+    d.innerHTML = title;
+    host.appendChild(d);
+  }
+  const w = host.clientWidth || 240, height = 200;
+  const pad = { l: 52, r: 8, t: 8, b: 30 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${height}`, height, role: "img",
+                             "aria-label": `sub-${subject} data under the fitted curve` }, host);
+  const xMax = Math.max(curve[curve.length - 1][0], ...bins.map((b) => b.x));
+  // Both axes log: the model is linear in log(x) on log(d), so its curve is a straight line.
+  const fx = Math.log;
+  const [x0, x1] = [fx(0.8), fx(xMax * 1.15)];
+  const [y0, y1] = [Math.log(yDomain[0]), Math.log(yDomain[1])];
+  const px = (x) => pad.l + ((w - pad.l - pad.r) * (fx(x) - x0)) / (x1 - x0);
+  const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (Math.log(y) - y0)) / (y1 - y0 || 1);
+  const inside = (x, y) => y >= yDomain[0] && y <= yDomain[1] && fx(x) <= x1;
+
+  const yTicks = logTicks(yDomain[0], yDomain[1]);
+  for (const v of yTicks) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
+    svgEl("text", { x: pad.l - 5, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = v >= 10 ? v.toFixed(0) : v.toFixed(v < 1 ? 2 : 1).replace(/\.?0+$/, "");
+  }
+  const xTicks = [1, 2, 5, 10, 20, 50, 100, 200].filter((v) => v <= xMax * 1.15);
+  for (const v of xTicks) {
+    svgEl("text", { x: px(v), y: height - pad.b + 13, "text-anchor": "middle", class: "tick" }, svg).textContent = v;
+  }
+  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 4, "text-anchor": "middle", class: "axis-label" }, svg)
+    .textContent = (route ? "nth use of the route" : "attempt at scene") + " (log scale)";
+  const cy = (pad.t + height - pad.b) / 2;
+  svgEl("text", { x: 11, y: cy, "text-anchor": "middle", class: "axis-label",
+                  transform: `rotate(-90 11 ${cy})` }, svg).textContent = `${yLabel} (log scale)`;
+  if (ref != null && ref >= yDomain[0] && ref <= yDomain[1]) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(ref), y2: py(ref), class: "ref" }, svg);
+  }
+  // Integer x stacks into columns; a fixed seeded jitter (in the axis's own scale) spreads them.
+  const cloud = svgEl("g", { fill: FIT_POINT_COLOR, "fill-opacity": 0.22 }, svg);
+  let seed = 7;
+  const rand = () => { seed = (seed * 16807) % 2147483647; return seed / 2147483647 - 0.5; };
+  for (const [x, y] of points) {
+    const jx = x * Math.exp(0.22 * rand());
+    if (!inside(jx, y)) continue;
+    svgEl("circle", { cx: px(jx).toFixed(1), cy: py(y).toFixed(1), r: 1.3 }, cloud);
+  }
+  svgEl("polyline", { points: curve.filter(([, y]) => y > 0).map(([x, y]) => `${px(x)},${py(y)}`).join(" "),
+                      fill: "none", stroke: "var(--ink)", "stroke-width": 2,
+                      "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  for (const b of bins) {
+    const g = svgEl("g", {}, svg);
+    svgEl("line", { x1: px(b.x), x2: px(b.x), y1: py(b.lo), y2: py(b.hi), stroke: color, "stroke-width": 1.5 }, g);
+    svgEl("circle", { cx: px(b.x), cy: py(b.mean), r: 3.5, fill: color, class: "dot-ring" }, g);
+    const hit = svgEl("circle", { cx: px(b.x), cy: py(b.mean), r: 8, class: "hit" }, g);
+    hit.addEventListener("mousemove", (ev) => showStatsTooltip(
+      `sub-${subject} · ${route ? "use" : "attempt"} ≈ ${b.x.toFixed(b.x < 10 ? 1 : 0)}`, color,
+      [[within ? "partial residual, geometric mean" : "geometric mean", b.mean.toFixed(digits + 1)],
+       ["95% CI", `${b.lo.toFixed(digits + 1)} – ${b.hi.toFixed(digits + 1)}`],
+       ["attempts", b.n_obs], ["scenes", b.n_scenes]], ev.clientX, ev.clientY));
+    hit.addEventListener("mouseleave", hideStatsTooltip);
+  }
+}
+
+/* One line per scene (per route, for the route model): the "spaghetti" view of a mixed
+ * model, from data/practice_spaghetti.json (export_fit_data). For one subject, their most-
+ * played scenes, every attempt as a point and each unit's own line — the fixed effects plus
+ * its level's, scene's (and route's) random intercept and slope from the stored fit — with
+ * the fixed-effect line dashed. Exported for each model's primary setting only. Routes are
+ * coloured by their whole-scene rank, the slot they have in every other view. */
+let spaghettiData = null;          // practice_spaghetti.json once loaded; false when unavailable
+let spaghettiLoading = false;
+
+function renderStatsSpaghetti() {
+  const block = $("stats-spaghetti-block");
+  const model = state.stats.model;
+  block.hidden = !(model === "lme4_nested" || model === "lme4_route");
+  if (block.hidden) return;
+  if (spaghettiData === null) {
+    $("stats-spaghetti-cap").textContent = "loading the per-scene fits…";
+    if (!spaghettiLoading) {
+      spaghettiLoading = true;
+      fetch("data/practice_spaghetti.json", { cache: "no-cache" })
+        .then((res) => (res.ok ? res.json() : false))
+        .catch(() => false)
+        .then((data) => { spaghettiData = data; render(); });
+    }
+    return;
+  }
+  const host = $("stats-spaghetti");
+  host.innerHTML = "";
+  const src = spaghettiData && spaghettiData[model];
+  if (!src) {
+    $("stats-spaghetti-cap").innerHTML =
+      "No per-scene fits in this export. Run <code>invoke run-practice-lme4-effects</code> (R with ggeffects), " +
+      "then <code>invoke run-web-export --backfill</code>, and reload.";
+    $("stats-spaghetti-subject").innerHTML = "";
+    $("stats-spaghetti-legend").innerHTML = "";
+    return;
+  }
+  const route = model === "lme4_route";
+  const subjects = Object.keys(src.subjects).sort();
+  if (!subjects.includes(state.stats.spSubject)) state.stats.spSubject = subjects[0];
+  const subject = state.stats.spSubject;
+  $("stats-spaghetti-subject").innerHTML = subjects.map((s) =>
+    `<button type="button" data-subject="${s}" aria-pressed="${s === subject}">sub-${s}</button>`).join("");
+  $("stats-spaghetti-unit").textContent = route ? "route" : "scene";
+  const sp = src.subjects[subject];
+  const inv = INVERSE[sp.transform];
+  const scenes = Object.entries(sp.scenes);
+  // Every box is inserted before any is measured, or the first ones read the row as their width.
+  const boxes = scenes.map(() => {
+    const b = document.createElement("div");
+    b.className = "stats-chart";
+    host.appendChild(b);
+    return b;
+  });
+  const colorOf = (v) => {
+    if (!route) return () => subjColor(subject);
+    const slot = new Map(v.rank.map((c, i) => [c, i < N_DIRECT_CLUSTERS ? CLUSTER_COLORS[i] : OTHER_COLOR]));
+    return (r) => slot.get(r) || OTHER_COLOR;
+  };
+  const lineOf = (a, b, x1) => {
+    const n = 24, out = [];
+    for (let k = 0; k <= n; k++) {
+      const x = Math.exp((Math.log(Math.max(x1, 1.01)) * k) / n);
+      out.push([x, inv(a + b * Math.log(x))]);
+    }
+    return out;
+  };
+  scenes.forEach(([scene, v], i) => {
+    const color = colorOf(v);
+    const xMax = Math.max(...v.points.map((p) => p[0]));
+    drawSpaghettiPanel(boxes[i], {
+      title: `${scene} <span class="muted">n=${v.n}` +
+             (route ? ` · ${v.lines.length} route${v.lines.length === 1 ? "" : "s"}` : "") + "</span>",
+      points: v.points.map(([x, d, r]) => [x, d, color(r)]),
+      lines: v.lines.map((l) => ({ color: color(l.route), pts: lineOf(l.a, l.b, l.x1), route: l.route, b: l.b })),
+      fixed: lineOf(sp.fixed.a, sp.fixed.b, xMax),
+      route, digits: MEASURE_INFO[src.measure.replace("_loso", "")].digits,
+      ref: src.measure.startsWith("d_nearest_norm") ? 1 : null,
+    });
+  });
+  $("stats-spaghetti-legend").innerHTML =
+    legendHTML([[NOISE_COLOR, "fixed effect (average scene)"]]) +
+    (route ? legendHTML([[CLUSTER_COLORS[0], "routes, coloured by whole-scene size as everywhere else"]])
+           : legendHTML([[subjColor(subject), `sub-${subject}: attempts and the scene's own line`]]));
+  const notMain = state.stats.attempts !== "all" || state.stats.transform !== sp.transform
+    || `${state.stats.measure}_loso` !== src.measure;
+  $("stats-spaghetti-cap").innerHTML =
+    `The ${STATS_MODELS[model].label} model scene by scene, for sub-${subject}'s ${scenes.length} most-played ` +
+    "scenes: every attempt as a point, and " +
+    (route ? "one line per <strong>route</strong> used there, because this model gives every route its own " +
+             "intercept and slope. Each line is coloured like its route's points and stops at that route's last use. "
+           : "that scene's own fitted line. ") +
+    "A unit's line is the fixed effect plus its level's, scene's" + (route ? " and route's" : "") +
+    " random intercept and slope (the stored fit's BLUPs; rebuilding them reproduces lme4's fitted values). " +
+    "The dashed line is the fixed effect, the average scene. A line that misses its points is worth a look. " +
+    "A short or flat one usually means the unit has few attempts, and the model pulled it toward the average. " +
+    `Shown for this model's main setting (${src.measure}, ${sp.transform}(d), all attempts)` +
+    (notMain ? ', <span class="filtered">not the setting chosen above</span>.' : ".");
+}
+
+function drawSpaghettiPanel(host, { title, points, lines, fixed, route, digits, ref }) {
+  const t = document.createElement("div");
+  t.className = "panel-title";
+  t.innerHTML = title;
+  host.appendChild(t);
+  const w = host.clientWidth || 260, height = 190;
+  const pad = { l: 52, r: 8, t: 6, b: 30 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${height}`, height, role: "img",
+                             "aria-label": t.textContent }, host);
+  const ys = points.map((p) => p[1]).filter((y) => y > 0).sort((a, b) => a - b);
+  const ylo = ys[Math.floor(0.01 * (ys.length - 1))], yhi = ys[Math.ceil(0.99 * (ys.length - 1))];
+  const xMax = Math.max(...points.map((p) => p[0]));
+  const [x0, x1] = [Math.log(0.8), Math.log(xMax * 1.15)];
+  const [y0, y1] = [Math.log(ylo / 1.15), Math.log(yhi * 1.15)];
+  const px = (x) => pad.l + ((w - pad.l - pad.r) * (Math.log(x) - x0)) / (x1 - x0);
+  const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (Math.log(y) - y0)) / (y1 - y0 || 1);
+  const clipY = (y) => Math.min(Math.max(y, Math.exp(y0)), Math.exp(y1));
+  for (const v of logTicks(Math.exp(y0), Math.exp(y1))) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(v), y2: py(v), class: "grid" }, svg);
+    svgEl("text", { x: pad.l - 5, y: py(v) + 3.5, "text-anchor": "end", class: "tick" }, svg)
+      .textContent = v >= 10 ? v.toFixed(0) : String(Number(v.toPrecision(2)));
+  }
+  for (const v of [1, 2, 5, 10, 20, 50, 100, 200, 500].filter((v) => v <= xMax * 1.15)) {
+    svgEl("text", { x: px(v), y: height - pad.b + 13, "text-anchor": "middle", class: "tick" }, svg).textContent = v;
+  }
+  svgEl("text", { x: (pad.l + w - pad.r) / 2, y: height - 4, "text-anchor": "middle", class: "axis-label" }, svg)
+    .textContent = (route ? "nth use of the route" : "attempt at scene") + " (log scale)";
+  const cy = (pad.t + height - pad.b) / 2;
+  svgEl("text", { x: 11, y: cy, "text-anchor": "middle", class: "axis-label",
+                  transform: `rotate(-90 11 ${cy})` }, svg).textContent =
+    `${ref != null ? "distance / spread" : "distance (px)"} (log scale)`;
+  if (ref != null && ref >= Math.exp(y0) && ref <= Math.exp(y1)) {
+    svgEl("line", { x1: pad.l, x2: w - pad.r, y1: py(ref), y2: py(ref), class: "ref" }, svg);
+  }
+  const cloud = svgEl("g", { "fill-opacity": 0.55 }, svg);
+  for (const [x, y, c] of points) {
+    if (y < Math.exp(y0) || y > Math.exp(y1)) continue;
+    svgEl("circle", { cx: px(x).toFixed(1), cy: py(y).toFixed(1), r: 1.8, fill: c }, cloud);
+  }
+  const poly = (pts, attrs) => svgEl("polyline", {
+    points: pts.map(([x, y]) => `${px(x)},${py(clipY(y))}`).join(" "), fill: "none",
+    "stroke-linejoin": "round", "stroke-linecap": "round", ...attrs }, svg);
+  poly(fixed, { stroke: NOISE_COLOR, "stroke-width": 1.3, "stroke-dasharray": "4 3" });
+  for (const l of lines) {
+    poly(l.pts, { stroke: l.color, "stroke-width": 2.2 });
+    const hit = poly(l.pts, { stroke: "transparent", "stroke-width": 10, class: "hit" });
+    hit.addEventListener("mousemove", (ev) => showStatsTooltip(
+      route ? `route ${l.route}` : "this scene's own line", l.color,
+      [["slope on log(x)", signed(l.b, 3)],
+       ["at x = 1", l.pts[0][1].toFixed(digits + 1)],
+       ["at its last x", l.pts[l.pts.length - 1][1].toFixed(digits + 1)]], ev.clientX, ev.clientY));
+    hit.addEventListener("mouseleave", hideStatsTooltip);
+  }
+}
+
+/* Ticks for a log axis: 1-2-5 per decade, or the decades alone when that is too many. */
+function logTicks(lo, hi) {
+  const at = (mantissas) => {
+    const out = [];
+    for (let e = Math.floor(Math.log10(lo)); e <= Math.ceil(Math.log10(hi)); e++) {
+      for (const m of mantissas) { const v = Number((m * 10 ** e).toPrecision(6)); if (v >= lo && v <= hi) out.push(v); }
+    }
+    return out;
+  };
+  const fine = at([1, 2, 5]);
+  const decades = at([1]);
+  return fine.length > 6 && decades.length >= 2 ? decades : fine;
+}
+
+/* Holm step-down over [[key, p], ...]: smallest p times m, next times m - 1, ...,
+ * never decreasing, capped at 1. Twin of _holm_by_family in analysis/practice.py. */
+function holmAdjust(pairs) {
+  const sorted = [...pairs].sort((a, b) => a[1] - b[1]);
+  let running = 0;
+  return sorted.map(([k, p], i) => {
+    running = Math.max(running, Math.min(1, (sorted.length - i) * p));
+    return [k, running];
+  });
+}
+
 function renderStatsTable() {
   const { measure, form } = state.stats;
   const info = MEASURE_INFO[measure];
   const term = SLOPE_TERM[form];
-  const head = ["subject", "medoids", "coefficient", "95% CI", "p", "CI excludes 0",
+  // A log-log slope b is a proportional effect: each doubling of practice multiplies the
+  // distance by 2^b. Only under log(d) — log1p(d) slopes are not a clean ratio.
+  const doubling = form === "log" && state.stats.transform === "log";
+  const pctDoubling = (b) => `${b < 0 ? "−" : "+"}${Math.abs((2 ** b - 1) * 100).toFixed(1)}%`;
+  const head = ["subject", "medoids", "coefficient", "95% CI",
+                ...(doubling ? ["per doubling (95% CI)"] : []), "p", "p, Holm (5 subjects)", "CI excludes 0",
                 `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} 1 (${info.unit})`,
                 `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} ${STATS_AT} (${info.unit})`,
                 "attempts", "zeros dropped",
                 state.stats.model === "lme4_route" ? "routes" : measure === "d_own" ? "series" : "scenes",
                 "converged"];
+  // Holm across the subjects shown, separately for each medoid series: each series is one
+  // family of tests, run once per subject (as slope_p_holm in mixed_summary.csv).
+  const holm = new Map();
+  for (const ser of STATS_SERIES) {
+    const ps = statsData.subjects
+      .map((s) => { const f = modelFit(measure + ser.suffix, s); return [s, f && f.r && f.r.p[term]]; })
+      .filter(([, p]) => p != null);
+    for (const [s, p] of holmAdjust(ps)) holm.set(`${ser.suffix}|${s}`, p);
+  }
   const rows = [];
   for (const s of statsData.subjects) {
     for (const ser of [...STATS_SERIES].reverse()) {
@@ -2183,7 +2856,8 @@ function renderStatsTable() {
         `<td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
         `<td>${ser.suffix ? "leave-subject-out" : "all-subject"}</td>` +
         `<td>${signed(r.coef[term])}</td><td>${signed(lo)} to ${signed(hi)}</td>` +
-        `<td>${fmtP(r.p[term])}</td>` +
+        (doubling ? `<td>${pctDoubling(r.coef[term])} (${pctDoubling(lo)} to ${pctDoubling(hi)})</td>` : "") +
+        `<td>${fmtP(r.p[term])}</td><td>${fmtP(holm.get(`${ser.suffix}|${s}`))}</td>` +
         `<td class="${clear ? "clear" : "unclear"}">${clear ? "yes" : "no"}</td>` +
         `<td>${statsPredict(r.coef, form, 1).toFixed(info.digits)}</td>` +
         `<td>${statsPredict(r.coef, form, STATS_AT).toFixed(info.digits)}</td>` +
@@ -2194,10 +2868,91 @@ function renderStatsTable() {
   }
   $("stats-table").innerHTML =
     `<thead><tr>${head.map((h) => `<th>${h}</th>`).join("")}</tr></thead><tbody>${rows.join("")}</tbody>`;
+  $("stats-table-cap").textContent =
+    "p, Holm: the p-value corrected for testing the same model on five subjects, separately " +
+    "for all-subject and leave-subject-out medoids; significant after correction when below 0.05. " +
+    (doubling
+    ? `Per doubling: the change in distance each time the number of ` +
+      `${state.stats.model === "lme4_route" ? "uses of a route" : "attempts at a scene"} doubles, ` +
+      "(2^b − 1) × 100, with the CI converted the same way. It is a proportional change, so it " +
+      "holds at any point on the curve: 1→2, 10→20 and 30→60 all bring the same percentage."
+    : "Per-doubling percentages are shown only for the log form under log(d); under " +
+      (form === "log" ? "log(1 + d)" : "the linear form") + " the slope is not a proportional change.");
 }
 
-/* The summary view: every CI and p-value for the main result (primary measure, all
- * attempts, log form), per transform — the dashboard twin of docs/practice_summary.png. */
+/* Assumption checks for the selected model and transform. Read from the payload's
+ * `diagnostics` block, which grades docs/practice_residual_diagnostics*.csv with that
+ * script's own verdicts() — the dashboard never re-judges a check. Only the scene-scale
+ * lme4 model and the scene-only statsmodels model have been checked; for the others the
+ * block says so rather than borrowing another model's verdicts. */
+const CHECK_MODELS = { lme4_nested: "lme4", lme4_route: "route", scene: "scene" };
+const VERDICT_MARK = { ok: "✓", mild: "~", bad: "✕" };
+const CHECK_COLUMNS = [
+  ["n_obs", "attempts", 0], ["n_zero_dropped", "zeros dropped", 0],
+  ["max_bin_bias", "1. largest bin bias", 3], ["lag1_r", "2. lag-1 r", 3],
+  ["skew", "3-4. skew", 2], ["kurtosis", "3-4. kurtosis", 2], ["sd_ratio", "5. SD ratio", 2],
+  ["max_abs_z_re", "6. most extreme scene (SD)", 1],
+  ["share_scenes_outside_funnel", "7. scenes outside funnel", 2],
+  ["outside_shuffled_p95", "7. shuffled 95th pct", 2],
+  ["world_sd_ratio", "8. world SD ratio", 2], ["world_sd_ratio_shuffled_p95", "8. shuffled 95th pct", 2],
+];
+
+function renderStatsChecks() {
+  const diag = statsData.diagnostics;
+  const block = $("stats-checks-block");
+  block.hidden = !diag;
+  if (!diag) return;
+  const { transform, measure, attempts } = state.stats;
+  const key = CHECK_MODELS[state.stats.model];
+  const run = key && diag[key] && diag[key][transform];
+  const table = $("stats-checks"), subj = $("stats-checks-subj");
+  $("stats-checks-subj-wrap").hidden = !run;
+  $("stats-checks-fig-wrap").hidden = !(run && run.figure);
+  if (!run) {
+    const have = Object.values(diag).map((d) => d.label).join(" and ");
+    $("stats-checks-cap").textContent =
+      `No assumption checks have been run for the ${STATS_MODELS[state.stats.model].label} model` +
+      (key ? ` under ${transform}(d)` : "") + `. Checks exist for the ${have} models; select one ` +
+      "to see them. They are produced by docs/practice_residual_diagnostics.py.";
+    table.innerHTML = "";
+    subj.innerHTML = "";
+    return;
+  }
+  const checked = diag[key].measure || statsData.primary;
+  const shown = `${measure}_loso` === checked && attempts === "all";
+  $("stats-checks-cap").innerHTML =
+    `Residual and random-effect checks for the ${diag[key].label} model on ` +
+    `<code>${checked}</code>, <code>${transform}(d)</code>, all attempts` +
+    (shown ? "" : ' <span class="filtered">— not the measure selected above; the checks were run on this one only</span>') +
+    ". Each row is one assumption. The third column says what a violation would damage: the " +
+    "<b>slope</b> itself, or only its <b>CI</b> and p-value. Rows marked CI matter only if the CI " +
+    "actually moves, which is what the last row tests by comparing with a bootstrap that does " +
+    "not make these assumptions. Verdicts come from docs/practice_residual_diagnostics.py, " +
+    "not from this page.";
+  table.innerHTML =
+    "<thead><tr><th>check</th><th>question</th><th>if violated, it affects</th><th>verdict</th></tr></thead><tbody>" +
+    run.checks.map((c) => {
+      const [what, ...rest] = c.affects.split(" - ");
+      return `<tr><td class="check">${c.title}</td>` +
+        `<td>${c.question}<span class="verdict-detail">look for: ${c.look_for}</span></td>` +
+        `<td class="affects"><b>${what}</b>${rest.length ? " — " + rest.join(" - ") : ""}</td>` +
+        `<td><span class="verdict ${c.status}"><span aria-hidden="true">${VERDICT_MARK[c.status]}</span>${c.verdict}</span>` +
+        `<span class="verdict-detail">${c.detail}</span></td></tr>`;
+    }).join("") + "</tbody>";
+  const cols = CHECK_COLUMNS.filter(([k]) => run.subjects.some((r) => r[k] != null));
+  subj.innerHTML =
+    `<thead><tr><th>subject</th>${cols.map(([, h]) => `<th>${h}</th>`).join("")}</tr></thead><tbody>` +
+    run.subjects.map((r) => `<tr><td class="subj"><i style="background:${subjColor(r.subject)}"></i>sub-${r.subject}</td>` +
+      cols.map(([k, , d]) => `<td>${r[k] == null ? "—" : Number(r[k]).toFixed(d)}</td>`).join("") + "</tr>").join("") +
+    "</tbody>";
+  // The figure is ~1 MB: only fetched when the reader opens it.
+  const fig = $("stats-checks-fig"), wrap = $("stats-checks-fig-wrap");
+  fig.dataset.src = `data/${run.figure}`;
+  if (wrap.open) fig.src = fig.dataset.src;
+}
+
+/* The summary view: every CI and p-value for the scene-scale main result (primary measure,
+ * all attempts, log form), per transform — the dashboard twin of docs/practice_summary.png. */
 function renderStatsSummary() {
   const sum = statsData.summary;
   const block = $("stats-summary-block");
@@ -2285,7 +3040,7 @@ function renderStatsSummary() {
     return `<th colspan="${n}" class="grp">${t === "log" ? "main: log(d)" : "original: log(1 + d)"}</th>`;
   }).join("");
   const colHead = cols.map(([, m, k]) =>
-    `<th>${k === "p_holm" ? `${m === "lme4" ? "full nested" : "scene only"},<br>Holm-adjusted`
+    `<th>${k === "p_holm" ? `${m === "lme4" ? "scene scale" : "scene only"},<br>Holm-adjusted`
                           : SUMMARY_LABELS[m].replace(" (", "<br>(").replace(" — main", "")}</th>`).join("");
   const body = subjects.map((s) => `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>` +
     cols.map(([t, m, k]) => {
@@ -2299,9 +3054,9 @@ function renderStatsSummary() {
     `<thead><tr><th></th>${groupHead}</tr><tr><th>subject</th>${colHead}</tr></thead><tbody>${body}</tbody>`;
   $("stats-p-note").innerHTML =
     "<strong>How each p-value is computed</strong> — every one a two-sided test of no practice effect (b = 0). " +
-    "<em>Fitted models</em> (full nested lme4, scene only, nested statsmodels): Wald z test, z = b / SE with the SE " +
+    "<em>Fitted models</em> (scene-scale lme4, scene only, nested statsmodels): Wald z test, z = b / SE with the SE " +
     "from the model, p from a normal curve; lme4's bars above are profile-likelihood CIs. " +
-    "<em>Holm-adjusted</em>: the main (full nested) model's p-values corrected for testing five subjects. " +
+    "<em>Holm-adjusted</em>: the scene-scale model's p-values corrected for testing five subjects. " +
     "<em>Bootstraps</em>: the share of 200 resampled slopes on the far side of zero, doubled; no normality " +
     "assumed, and with 200 replicates the smallest it can show is 0.01. Bold = p < 0.05, the same call as an " +
     "interval clearing zero. The columns are different methods for the same question, not repeated tests.";
@@ -2369,39 +3124,56 @@ function renderStats() {
   }
 
   applyStatsAvailability();
+  // Two main results, one per scale: the scene scale on the primary measure (the scene-only
+  // statsmodels model stands in without R), and the route scale on the own-route distance.
   const primaryModel = statsData.lme4 ? "lme4_nested" : "scene";
-  const isPrimary = `${measure}_loso` === statsData.primary && state.stats.form === "log"
-                    && attempts === "all" && transform === statsData.primary_transform
-                    && state.stats.model === primaryModel;
+  const mainSetting = state.stats.form === "log" && attempts === "all"
+                      && transform === statsData.primary_transform;
+  const mainScale = !mainSetting ? null
+    : state.stats.model === primaryModel && `${measure}_loso` === statsData.primary ? "scene scale"
+    : state.stats.model === "lme4_route" && measure === "d_own" ? "route scale" : null;
   $("chart-sub").innerHTML =
     `${STATS_MODELS[state.stats.model].short} · ${MEASURE_INFO[measure].name} · ${transform}(d) · ` +
     `${state.stats.form} form · ` +
     `${attempts === "all" ? "all attempts" : "completed attempts only"}` +
     ` · ${statsData.n_scenes} scenes · ` +
-    (isPrimary ? "the main result" : '<span class="filtered">a robustness check, not the main result</span>');
+    (mainScale ? `a main result (${mainScale})` : '<span class="filtered">a robustness check, not a main result</span>');
   renderStatsSummary();
   renderStatsCoef();
   renderStatsCurves();
+  renderStatsFitData();
+  renderStatsSpaghetti();
   renderStatsTable();
+  renderStatsChecks();
   $("stats-note").innerHTML =
-    "Each subject is fitted separately, by maximum likelihood. The <strong>main model</strong> is the full " +
-    "nested lme4 model: <code>log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | " +
-    "level:scene)</code> — a level's scenes are played back to back, so scenes are nested in levels. " +
+    "Each subject is fitted separately, by maximum likelihood. There are <strong>two main models</strong>, " +
+    "one per scale, both in lme4. <strong>Scene scale</strong>: distance to the nearest route prototype, " +
+    "<code>log(d) ~ log(attempt) + (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)</code> — " +
+    "a level's scenes are played back to back, so scenes are nested in levels. <strong>Route scale</strong>: " +
+    "distance in px to the attempt's own route prototype against the nth use of that route, with routes " +
+    "nested in scenes in levels. The first asks whether players settle into routes, the second whether " +
+    "they execute a route more precisely. " +
     `Selected here: <em>${STATS_MODELS[state.stats.model].formula}</em>. ` +
     "The scene-only statsmodels model (random intercept and slope on the same time term per scene, per " +
     "scene × cluster for the own-medoid measure) is the one fitted in every form and measure. Coefficients are in the transform's " +
     "units, so compare <code>log</code> and <code>log1p</code> through the curves, not the slopes; " +
     "curves and the <em>at attempt</em> columns are converted back. Leave-subject-out " +
     "measures each subject against medoids and spreads chosen from the other subjects only. " +
-    `The main result is <code>${statsData.primary}</code> on <code>${statsData.primary_transform}(d)</code> ` +
+    `The main results are <code>${statsData.primary}</code> at the scene scale and <code>d_own_loso</code> at ` +
+    `the route scale, on <code>${statsData.primary_transform}(d)</code> ` +
     "(attempts at exactly 0 dropped), log form, all attempts; <code>log1p</code> is the original " +
     "analysis, kept because its residuals were heavily right-skewed and the switch should stay traceable; " +
-    "everything else here is a check on it. Sources: <code>output_data/practice/lme4.json</code>, " +
+    "everything else here is a check on them. Sources: <code>output_data/practice/lme4.json</code>, " +
+    "<code>lme4_route.json</code>, " +
     "<code>mixed.json</code>, <code>nested.json</code> (all flattened in <code>mixed_summary.csv</code>) and the " +
     "bootstraps under <code>docs/</code>.";
 }
 
 function bindStats() {
+  $("stats-checks-fig-wrap").addEventListener("toggle", (ev) => {
+    const fig = $("stats-checks-fig");
+    if (ev.target.open && fig.dataset.src && fig.getAttribute("src") !== fig.dataset.src) fig.src = fig.dataset.src;
+  });
   const section = $("section-seg");
   section.addEventListener("click", (ev) => {
     const btn = ev.target.closest("button");
@@ -2415,6 +3187,13 @@ function bindStats() {
     }
     hideStatsTooltip();
     render();
+  });
+  $("stats-spaghetti-subject").addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button");
+    if (!btn) return;
+    state.stats.spSubject = btn.dataset.subject;
+    hideStatsTooltip();
+    renderStatsSpaghetti();
   });
   for (const [id, key] of [["stats-model-seg", "model"],
                            ["stats-measure-seg", "measure"], ["stats-transform-seg", "transform"],
@@ -2472,6 +3251,7 @@ async function init() {
     render();
   });
   bindSeg("color-seg", "colorBy");
+  bindCutControl();
   $("toggle-noise").addEventListener("change", (e) => {
     state.showNoise = e.target.checked; render();
   });

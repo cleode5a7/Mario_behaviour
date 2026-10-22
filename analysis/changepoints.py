@@ -57,7 +57,60 @@ def load_all_attempts(subject: str, source_dir: Path) -> list[dict]:
     return records
 
 
-def phase_changepoints(records: list[dict]) -> list[int]:
+def rep_attempt_series(records: list[dict]) -> list[dict]:
+    """Collapse per-scene clips into one record per level repetition.
+
+    A ``.bk2`` repetition is one playthrough of a whole level (identified by
+    ``SourceBk2``); the scene clips are its segments, and a repetition may span
+    several lives. Aggregating to this unit is what rescues the completion
+    signal: a scene clip is a few seconds of Mario and is cleared ~92% of the
+    time, so the per-clip series sits at the ceiling that defeats the detectors
+    (see phase_changepoints()). Per repetition the cleared rate is ~53-81%
+    across subjects, with the dynamic range a mean-shift detector needs.
+
+    Two cleared definitions are returned because they differ a lot and answer
+    different questions:
+      - ``cleared``:  the repetition reached the end of the level (its final
+                      clip completed). Deaths along the way are allowed, since
+                      the player respawns and carries on.
+      - ``flawless``: every clip completed, i.e. the level was cleared without
+                      dying once. A strictly harder criterion (~0.22-0.54).
+
+    Input records must already be in chronological order (as load_all_attempts
+    returns them); repetitions come back ordered by their first clip.
+
+    Returns [{"source_bk2", "level", "phase", "session", "run", "start_frame",
+              "n_clips", "n_deaths", "cleared", "flawless", "duration"}, ...]
+    """
+    by_rep: dict[str, list[dict]] = {}
+    for r in records:
+        by_rep.setdefault(r.get("SourceBk2", ""), []).append(r)
+
+    reps: list[dict] = []
+    for source_bk2, clips in by_rep.items():
+        clips = sorted(clips, key=lambda d: (d["Session"], d["Run"], d["StartFrame"],
+                                             d.get("ClipCode", "")))
+        first, last = clips[0], clips[-1]
+        n_deaths = sum(1 for c in clips if c.get("Outcome") != "completed")
+        reps.append({
+            "source_bk2": source_bk2,
+            "level": first.get("Level"),
+            "phase": first.get("Phase"),
+            "session": first["Session"],
+            "run": first["Run"],
+            "start_frame": first["StartFrame"],
+            "n_clips": len(clips),
+            "n_deaths": n_deaths,
+            "cleared": 1 if last.get("Outcome") == "completed" else 0,
+            "flawless": 1 if n_deaths == 0 else 0,
+            "duration": sum(float(c.get("Duration", 0.0)) for c in clips),
+        })
+
+    reps.sort(key=lambda d: (d["session"], d["run"], d["start_frame"]))
+    return reps
+
+
+def phase_changepoints(records: list[dict], key: str = "Phase") -> list[int]:
     """Return attempt indices where the Phase annotation changes.
 
     Reads the 'Phase' field from each summary record (e.g. 'discovery',
@@ -66,10 +119,16 @@ def phase_changepoints(records: list[dict]) -> list[int]:
     This is the primary changepoint method: the Phase annotations encode the
     experimenters' protocol boundaries (e.g. discovery → practice). The
     Bayesian changepoint detector cannot recover these from the completion
-    signal alone because subjects' completion rates are near-ceiling (~90%)
-    throughout both phases, leaving no detectable step-change.
+    signal alone because subjects' per-scene-clip completion rates are
+    near-ceiling (~90%) throughout both phases, leaving no detectable
+    step-change. Aggregating to the level repetition removes that ceiling —
+    see rep_attempt_series().
+
+    ``key`` selects the field holding the phase label, so the same function
+    serves both raw summary records ('Phase') and the repetition records built
+    by rep_attempt_series() ('phase'); indices are then in rep-index space.
     """
-    phases = [r.get("Phase") for r in records]
+    phases = [r.get(key) for r in records]
     return [i + 1 for i, (a, b) in enumerate(zip(phases, phases[1:])) if a != b]
 
 
@@ -214,6 +273,128 @@ def ruptures_changepoints(
                             n_bkps=n_bkps, model=model)
 
 
+def level_adjusted_series(reps: list[dict], key: str = "cleared") -> tuple[np.ndarray, dict]:
+    """Per-repetition outcome minus that level's own average — difficulty removed, time kept.
+
+    The problem this solves: during discovery the subject walks through the game
+    in world order, so "later in the session" and "harder level" are the same
+    thing. A raw chronological cleared rate therefore *falls* (77% → 33% for
+    sub-01) and reads as un-learning when it is really the difficulty gradient.
+
+    Subtracting each level's own session-wide mean leaves, for every repetition,
+    "how did this attempt compare to how this subject usually does on *this*
+    level" — a residual in percentage points that keeps the true chronological
+    order intact. Levels are averaged over the **whole session** (not per phase),
+    so discovery and practice share one scale and the phase difference survives:
+    all five subjects sit ~5-12 points below their level average in discovery and
+    ~2-6 points above it in practice.
+
+    Prefer this for *reporting* an effect size over time. For *detection* use the
+    raw ``cleared`` series — the subtraction removes much of the mean shift the
+    detector keys on, and pushes ruptures' breakpoint from within 0-14
+    repetitions of the annotated boundary to 60-80 away.
+
+    Returns (residuals in the same order as ``reps``, {level: mean}).
+    """
+    means: dict[str, list[int]] = {}
+    for r in reps:
+        means.setdefault(r.get("level"), []).append(r[key])
+    level_means = {k: float(np.mean(v)) for k, v in means.items()}
+    return (np.array([r[key] - level_means[r.get("level")] for r in reps]),
+            level_means)
+
+
+def phase_thirds(reps: list[dict], values) -> dict[str, list[float]]:
+    """Split ``values`` into Early/Mid/Late by **true chronological order** per phase.
+
+    Unlike phase_thirds_cleared(..., within_level=True), the bins here are real
+    slabs of time: Early is the first third of the phase as it was actually
+    played. Pair it with level_adjusted_series() to get a time axis that is both
+    honest about chronology and free of the world-difficulty confound.
+
+    **Only the practice thirds are comparable to each other.** In practice every
+    third contains all 22 levels, so level mix is constant across bins and a
+    change between them is a real change in performance. In discovery each third
+    contains a *different, disjoint* set of levels (the subject walks the game in
+    world order, playing each level once), so bins differ in what was played, not
+    only in when — and no across-third comparison is valid there, adjusted or not.
+
+    Adjusting does not rescue discovery, it just hides the problem differently.
+    With level means taken per phase the discovery bins collapse to ~0.0 by
+    construction. With session-wide means (what level_adjusted_series does) they
+    do not collapse, and for some subjects appear to rise — but that rise tracks
+    a floor effect, not learning: late-discovery levels are the hard ones, which
+    have no room to improve (sub-02's world-8 levels gain -2/-8/+2 pp from
+    discovery to practice while w3l2 gains +75). Level practice-rate vs
+    discovery->practice gap correlates r=0.45; early-discovery levels average
+    +36 pp of headroom against +13 pp for late-discovery ones.
+    """
+    values = np.asarray(values, dtype=float)
+    out: dict[str, list[float]] = {}
+    for phase in dict.fromkeys(r.get("phase") for r in reps):
+        idx = np.array([i for i, r in enumerate(reps) if r.get("phase") == phase])
+        if not len(idx):
+            continue
+        out[phase] = [float(values[part].mean()) if len(part) else float("nan")
+                      for part in np.array_split(idx, 3)]
+    return out
+
+
+def phase_thirds_cleared(
+    reps: list[dict],
+    key: str = "cleared",
+    within_level: bool = True,
+) -> dict[str, list[float]]:
+    """Early/Mid/Late cleared rate within each phase — the lab's summary view.
+
+    Reproduces the "Cleared rate (%)" summary our collaborators plot: each phase
+    (discovery, practice) split into three bins, one rate per bin.
+
+    ``within_level=True`` (default) splits **each level's** repetitions into
+    thirds and pools across levels. This is the binning that matters: during
+    discovery the subject advances through progressively harder worlds, so plain
+    chronological thirds make the cleared rate *fall* (77% → 66% → 33% for
+    sub-01) — a difficulty effect masquerading as un-learning. Binning within
+    level removes the confound and the rate rises (52% → 61% → 64%), matching
+    the collaborators' figure. Pass ``within_level=False`` to get the raw
+    chronological thirds and see the confound for yourself.
+
+    NOT a changepoint input. The bins are cut *at* the phase boundary, so a
+    detector run on this series would be handed the very transition it is meant
+    to discover — and six points cannot be segmented anyway. Use the
+    per-repetition series for detection and this for reporting.
+
+    Returns {phase: [early, mid, late]} with rates in 0-1.
+    """
+    out: dict[str, list[float]] = {}
+    for phase in dict.fromkeys(r.get("phase") for r in reps):
+        in_phase = [r for r in reps if r.get("phase") == phase]
+        if not in_phase:
+            continue
+        if within_level:
+            groups: dict[str, list[int]] = {}
+            for r in in_phase:
+                groups.setdefault(r.get("level"), []).append(r[key])
+            bins: list[list[int]] = [[], [], []]
+            for seq in groups.values():
+                for i, part in enumerate(np.array_split(np.array(seq), 3)):
+                    bins[i].extend(part.tolist())
+        else:
+            bins = [part.tolist() for part in
+                    np.array_split(np.array([r[key] for r in in_phase]), 3)]
+        out[phase] = [float(np.mean(b)) if b else float("nan") for b in bins]
+    return out
+
+
+def _phase_segments(records: list[dict], changepoints: list[int], key: str) -> list[dict]:
+    """Turn phase-transition indices into [{"phase", "start", "end"}, ...] spans."""
+    boundaries = [0] + changepoints + [len(records)]
+    return [
+        {"phase": records[start].get(key), "start": start, "end": end}
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
+
+
 def run_changepoint(
     subject: str,
     source_dir: Path,
@@ -222,6 +403,7 @@ def run_changepoint(
     beta: float = 1.0,
     n_bkps: int | None = None,
     block_size: int = 50,
+    rep_block_size: int = 10,
 ) -> None:
     """Detect learning-phase changepoints for one subject.
 
@@ -229,6 +411,11 @@ def run_changepoint(
     'Phase' field (e.g. 'discovery' → 'practice'). These reflect the
     experimenters' protocol boundaries, which are the ground-truth learning
     phases for this dataset.
+
+    Runs the ruptures detector on two units:
+      - per scene clip (``ruptures``), near-ceiling at ~92% and largely flat;
+      - per level repetition (``repetitions``), ~53-81% cleared with real
+        dynamic range — the signal that actually tracks learning.
 
     Input:   all *_summary.json for sub-{subject} in mario.scenes/
     Output:  output_dir/<subject>_changepoints.json
@@ -238,17 +425,30 @@ def run_changepoint(
                "changepoints": [<attempt indices>],
                "phases": [{"phase": str, "start": int, "end": int}, ...],
                "method": "phase_annotation",
-               "ruptures": {  # non-Bayesian diagnostic, for comparison
+               "ruptures": {  # per scene clip; non-Bayesian diagnostic
                  "model": "l2", "block_size": int, "beta": float, "n_bkps": int,
                  "results": {"raw": {...}, "blocks": {...}}
+               },
+               "repetitions": {  # per level repetition — the un-ceilinged signal
+                 "n_reps": int, "block_size": int, "n_bkps": int,
+                 "cleared_rate": float, "flawless_rate": float,
+                 "changepoints": [<rep indices of Phase transitions>],
+                 "phases": [{"phase": str, "start": int, "end": int}, ...],
+                 "results": {"cleared": {...}, "flawless": {...}}
                }
              }
 
     Args:
-        max_attempts: if set, truncate to this many attempts (smoke testing)
-        beta:         ruptures penalty scale (see _ruptures_detect)
-        n_bkps:       fixed changepoint count for the Dynp algorithm
-        block_size:   attempts per block for the aggregated ruptures signal
+        max_attempts:   if set, truncate to this many attempts (smoke testing)
+        beta:           ruptures penalty scale (see _ruptures_detect)
+        n_bkps:         fixed changepoint count for the Dynp algorithm
+        block_size:     scene clips per block for the aggregated ruptures signal
+        rep_block_size: repetitions per block for the repetition signal. Much
+                        smaller than block_size because a subject has ~600-800
+                        reps vs ~10-13k clips; 10 was picked by sweeping
+                        {10,15,20,25,40} — it recovers the annotated phase
+                        transition to within 0-14 reps for every subject, and
+                        coarser blocks only quantize the answer away.
     """
     records = load_all_attempts(subject, source_dir)
 
@@ -260,14 +460,7 @@ def run_changepoint(
         records = records[:max_attempts]
 
     changepoints = phase_changepoints(records)
-
-    # Build per-phase segments for the notebook
-    boundaries = [0] + changepoints + [len(records)]
-    phase_labels = [records[b]["Phase"] for b in boundaries[:-1]]
-    phases = [
-        {"phase": label, "start": start, "end": end}
-        for label, start, end in zip(phase_labels, boundaries[:-1], boundaries[1:])
-    ]
+    phases = _phase_segments(records, changepoints, "Phase")
 
     # Non-Bayesian ruptures diagnostic on the completion signal. Defaulting
     # n_bkps to the phase-transition count makes Dynp directly comparable to
@@ -282,10 +475,38 @@ def run_changepoint(
         print(f"  (ruptures diagnostic failed for subject {subject}: {e})")
         rpt_results = {"raw": {}, "blocks": {}}
 
+    # Level-repetition view: the same completion idea one level up, where the
+    # rate is ~53-81% instead of pinned at ~92%. Phase boundaries are recomputed
+    # in rep-index space so they overlay this signal's own x-axis.
+    reps = rep_attempt_series(records)
+    rep_changepoints = phase_changepoints(reps, key="phase")
+    level_adjusted, level_means = level_adjusted_series(reps)
+    cleared = [r["cleared"] for r in reps]
+    flawless = [r["flawless"] for r in reps]
+    rep_bkps = max(1, len(rep_changepoints)) if n_bkps is None else n_bkps
+    try:
+        rep_results = {
+            "cleared": _ruptures_detect(cleared, block_size=rep_block_size,
+                                        beta=beta, n_bkps=rep_bkps),
+            "flawless": _ruptures_detect(flawless, block_size=rep_block_size,
+                                         beta=beta, n_bkps=rep_bkps),
+        }
+    except Exception as e:  # pragma: no cover - diagnostic must not break pipeline
+        print(f"  (repetition ruptures failed for subject {subject}: {e})")
+        rep_results = {"cleared": {"raw": {}, "blocks": {}},
+                       "flawless": {"raw": {}, "blocks": {}}}
+
     print(
         f"Subject {subject}: {len(records)} attempts → "
         f"{len(changepoints)} phase transition(s) at {changepoints} "
         f"({[p['phase'] for p in phases]})"
+    )
+    print(
+        f"  {len(reps)} level repetitions: cleared {np.mean(cleared):.3f}, "
+        f"flawless {np.mean(flawless):.3f}; "
+        f"cleared changepoints (blocks, dynp): "
+        f"{rep_results['cleared'].get('blocks', {}).get('dynp', [])} "
+        f"vs phase transition(s) at {rep_changepoints}"
     )
 
     out = output_dir / f"{subject}_changepoints.json"
@@ -301,6 +522,45 @@ def run_changepoint(
             "beta": beta,
             "n_bkps": rpt_n_bkps,
             "results": rpt_results,
+        },
+        "repetitions": {
+            "n_reps": len(reps),
+            "unit": "level_repetition",
+            "block_size": rep_block_size,
+            "beta": beta,
+            "n_bkps": rep_bkps,
+            "cleared_rate": float(np.mean(cleared)) if cleared else 0.0,
+            "flawless_rate": float(np.mean(flawless)) if flawless else 0.0,
+            "changepoints": rep_changepoints,
+            "phases": _phase_segments(reps, rep_changepoints, "phase"),
+            "results": rep_results,
+            # Reporting views only — see phase_thirds_cleared() on why these bins
+            # must never be fed to a detector.
+            "phase_thirds": {
+                # True chronological slabs: the primary reporting view.
+                "chronological": {
+                    "cleared": phase_thirds_cleared(reps, "cleared", within_level=False),
+                    "flawless": phase_thirds_cleared(reps, "flawless", within_level=False),
+                    # difficulty removed, chronology kept — flat in discovery by
+                    # construction (see phase_thirds), real signal in practice
+                    "level_adjusted": phase_thirds(reps, level_adjusted),
+                },
+                # NOT a time axis: bins are stages of practice at a level, pooled
+                # from across the whole session. Kept because it is the only
+                # within-discovery learning measure the design permits.
+                "within_level": {
+                    "cleared": phase_thirds_cleared(reps, "cleared"),
+                    "flawless": phase_thirds_cleared(reps, "flawless"),
+                },
+            },
+            "level_adjusted": {
+                "definition": "cleared minus that level's session-wide mean, per repetition",
+                "mean_by_phase": {
+                    p["phase"]: float(level_adjusted[p["start"]:p["end"]].mean())
+                    for p in _phase_segments(reps, rep_changepoints, "phase")
+                },
+                "level_means": level_means,
+            },
         },
     }, indent=2))
 

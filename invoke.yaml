@@ -1,8 +1,5 @@
 # invoke.yaml
 
-# Code folder
-code_dir: analysis
-
 # Notebooks folders
 notebooks_dir: notebooks
 
@@ -12,5 +9,58 @@ source_data_dir: source_data
 # output data folders
 output_data_dir: output_data
 
+# provenance records
+#
+# Written by `fetch` and `run` (see airoh.provenance). Both are git-tracked:
+# they are small, and they are the only record of what produced a result when
+# datalad is not in play. PROVENANCE.json is *expected* to change on every run
+# — that churn is the record doing its job, not a bug to fix.
+manifest_file: source_data/MANIFEST.json
+provenance_file: output_data/PROVENANCE.json
+# Files above this size record their metadata but no checksum, so one large
+# asset cannot make every fetch crawl.
+provenance_hash_max_bytes: 104857600
+
+# `invoke verify` settings — all optional; delete this block to accept the
+# defaults. See CLAUDE.md, "Verification".
+verify:
+  # Check names to skip entirely, e.g. [lint, tracked_size].
+  skip_checks: []
+  # Glob patterns exempt from the path and tracked-file checks.
+  # `*<*` covers the many filenames the docs name as a *pattern* rather than a
+  # file — `<scene_id>_clusters.json`, `<subject_id>_changepoints.json` — one per
+  # scene or subject, so no single path could ever exist to satisfy the check.
+  # The scene backgrounds are not in the dataset at all (see CLAUDE.md) and only
+  # appear once someone regenerates them.
+  ignore_paths:
+    - "*<*"
+    - source_data/mario.scenes/sourcedata/scene_backgrounds/*
+  # Largest file git may track before the check fails (default 10 MB).
+  max_tracked_bytes: 10485760
+
+# datalad datasets
+#
+# mario.scenes is a real datalad dataset, so it is fetched with `airoh.datalad`
+# (install + `datalad get`) rather than `airoh.acquisition.fetch_data`, which
+# only symlinks or downloads a plain file. `invoke fetch-mario-scenes --source
+# /path/to/checkout` symlinks an existing checkout instead of cloning — useful
+# when the 23 GB dataset already lives elsewhere on disk — and `source:` below
+# makes that the default for this machine. A symlinked checkout is left exactly
+# as it is: no branch checkout, no `datalad get`, no decompression.
+datasets:
+  mario_scenes:
+    output_dir: source_data/mario.scenes
+    url: git@github.com:courtois-neuromod/mario.scenes
+    # Branch the analysis expects; checked out after a fresh clone only.
+    branch: dev_refactor
+    # source: /path/to/existing/mario.scenes   # symlink instead of cloning
+
 # file sources
-files: {}
+#
+# scenes_mastersheet.csv has no fetch task: it is small, static, and checked
+# into Git (see source_data/CONTENT.md), so there is nothing to retrieve. It is
+# declared here only so `record_sources` puts its size and checksum in
+# source_data/MANIFEST.json alongside the datalad dataset.
+files:
+  scenes_mastersheet:
+    output_file: source_data/scenes_mastersheet.csv

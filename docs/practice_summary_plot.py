@@ -1,9 +1,9 @@
 """Summary: every confidence interval for the practice slope, one figure.
 
 For the primary measure (``d_nearest_norm_loso``, ``log`` practice form, all attempts),
-per subject: the original ``log1p(d)`` model, the full nested lme4 model and the
+per subject: the original ``log1p(d)`` model, the scene-scale lme4 model and the
 bootstraps (left), and the ``log(d)`` model, the statsmodels nested model (no scene
-correlation), the full nested lme4 model (profile CI, Wald where the profile failed) and
+correlation), the scene-scale lme4 model (profile CI, Wald where the profile failed) and
 the scene and level bootstraps (right). The two
 transforms' slopes are in different units, so they get separate panels, never one axis.
 A filled marker means the CI clears zero, hollow means it does not. Below the panels, a
@@ -38,12 +38,12 @@ SUMMARY = HERE.parent / "output_data" / "practice" / "mixed_summary.csv"
 # (key, label, colour) per interval, top to bottom within a subject's row.
 METHODS = {
     "log1p": [("model", "model CI (formula)", CLUSTER_COLORS[0]),
-              ("lme4", "full nested, lme4", CLUSTER_COLORS[4]),
+              ("lme4", "scene scale, lme4", CLUSTER_COLORS[4]),
               ("scene_boot", "scene bootstrap", CLUSTER_COLORS[1]),
               ("level_boot", "level bootstrap", CLUSTER_COLORS[2])],
     "log": [("model", "model CI (formula)", CLUSTER_COLORS[0]),
             ("nested", "nested, no scene corr. (statsmodels)", CLUSTER_COLORS[6]),
-            ("lme4", "full nested, lme4", CLUSTER_COLORS[4]),
+            ("lme4", "scene scale, lme4", CLUSTER_COLORS[4]),
             ("scene_boot", "scene bootstrap", CLUSTER_COLORS[1]),
             ("level_boot", "level bootstrap", CLUSTER_COLORS[2])],
 }
@@ -56,7 +56,7 @@ def intervals():
     s = pd.read_csv(SUMMARY, dtype={"subject": str})
     s = s[(s["measure"] == PRIMARY) & ~s["completed_only"].astype(bool) & (s["form"] == "log")]
     for _, r in s.iterrows():
-        # lme4_nested: the primary model; its CI is profile likelihood, Wald where that failed.
+        # lme4_nested: the scene-scale model; its CI is profile likelihood, Wald where that failed.
         key = {"scene": "model", "level_scene": "nested", "lme4_nested": "lme4"}.get(r["structure"])
         if key:
             out[(r["transform"], key, r["subject"])] = (r["slope"], r["slope_ci_low"], r["slope_ci_high"])
@@ -113,17 +113,17 @@ def fmt_p(v):
     return ("< 0.0001" if v < 1e-4 else f"{v:.4f}" if v < 0.01 else f"{v:.3f}"), v < 0.05
 
 
-TABLE_COLS = [("log1p", "model", "model\n(formula)"), ("log1p", "lme4", "full nested\n(lme4)"),
+TABLE_COLS = [("log1p", "model", "model\n(formula)"), ("log1p", "lme4", "scene scale\n(lme4)"),
               ("log1p", "scene_boot", "scene\nbootstrap"), ("log1p", "level_boot", "level\nbootstrap"),
-              ("log", "lme4", "full nested\n(lme4), main"), ("log", "holm", "full nested,\nHolm-adjusted"),
+              ("log", "lme4", "scene scale\n(lme4), main"), ("log", "holm", "scene scale,\nHolm-adjusted"),
               ("log", "model", "model\n(formula)"), ("log", "nested", "nested, no scene\ncorr. (statsmodels)"),
               ("log", "scene_boot", "scene\nbootstrap"), ("log", "level_boot", "level\nbootstrap")]
 P_NOTE = (
     "How each p-value is computed - every one is a two-sided test of 'no practice effect' (b = 0) for that subject.\n"
-    "  -  Model (formula), statsmodels nested, full nested (lme4): Wald z test. The fitted model gives the slope b and its standard error SE "
+    "  -  Model (formula), statsmodels nested, scene scale (lme4): Wald z test. The fitted model gives the slope b and its standard error SE "
     "(which assumes normal, equal-variance, independent noise); z = b / SE, and p = 2 x P(|Z| > |z|) on a normal curve.\n"
     "      lme4's intervals drawn above are profile-likelihood CIs; its p-value here is the Wald one, which gives the same call in all 18 fits with a profile CI (the 2 without one fall back to Wald CIs above too).\n"
-    "  -  Holm-adjusted: the main analysis's (full nested lme4, log(d)) p-values corrected for testing five subjects (smallest p x 5, next x 4, ...; never decreasing).\n"
+    "  -  Holm-adjusted: the main analysis's (scene-scale lme4, log(d)) p-values corrected for testing five subjects (smallest p x 5, next x 4, ...; never decreasing).\n"
     "  -  Scene / level bootstrap: the share of the 200 resampled slopes on the far side of zero, doubled - p = 2 x min(share >= 0, share <= 0). "
     "No normality is assumed.\n"
     "      With 200 replicates the smallest p it can show is 2/200 = 0.01, so '< 0.01' means none of the 200 slopes crossed zero.\n"

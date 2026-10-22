@@ -16,6 +16,11 @@
   --sidebar-w: 310px;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+  /* Status (assumption-check verdicts) — reserved, never a series colour; always shipped
+     with a symbol and a word, so the colour is never the only cue. */
+  --ok: #1b7a3e;
+  --mild: #8a5a00;
+  --bad: #b3261e;
 }
 
 /* Dark mode is stepped deliberately, not an automatic flip: the canvas surface
@@ -32,6 +37,9 @@
     --line: #33333a;
     --accent: #6ba6ee;
     --focus: #6ba6ee;
+    --ok: #5cc28a;
+    --mild: #e0a43a;
+    --bad: #f07a6e;
   }
 }
 
@@ -51,6 +59,12 @@ body {
 
 /* ---------- sidebar ---------- */
 
+/* overflow-y: auto, not hidden. As a column flex container the sidebar squashes its
+   own panels when their combined height exceeds the viewport — and a squashed panel
+   does not just clip, it lays its content over the panel below and steals the pointer
+   from whatever is underneath. On a short window that put the Subject list on top of
+   the Scene list and left the k slider un-draggable. Panels below keep their natural
+   height (.panel { flex-shrink: 0 }) and the sidebar scrolls instead. */
 #sidebar {
   width: var(--sidebar-w);
   flex: 0 0 var(--sidebar-w);
@@ -58,7 +72,8 @@ body {
   background: var(--surface-2);
   display: flex;
   flex-direction: column;
-  overflow: hidden;
+  overflow-y: auto;
+  overflow-x: hidden;
 }
 
 #sidebar header {
@@ -76,7 +91,11 @@ body {
   color: var(--ink-3);
 }
 
-.panel { padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.panel {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+  flex-shrink: 0;            /* a panel may scroll out of view, never into its neighbour */
+}
 .panel:last-child { border-bottom: none; }
 
 .panel h2 {
@@ -88,7 +107,9 @@ body {
   color: var(--ink-3);
 }
 
-#scene-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+/* Grows into spare height when the window is tall; floored so it cannot be
+   reduced to a sliver when it isn't. */
+#scene-panel { flex: 1 1 auto; display: flex; flex-direction: column; min-height: 220px; }
 
 input[type="search"], select {
   width: 100%;
@@ -225,6 +246,24 @@ select { margin-bottom: 6px; }
   color: var(--ink-3);
   opacity: 0.8;
 }
+
+/* k picker: slider, live readout, and a way back to the cut the run chose. */
+.cut-row { display: flex; align-items: center; gap: 8px; }
+.cut-row input[type="range"] {
+  flex: 1;
+  min-width: 0;
+  accent-color: var(--accent);
+}
+.cut-row output {
+  min-width: 34px;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  color: var(--ink-2);
+}
+.cut-row output.alt { color: var(--accent); font-weight: 600; }
+.cut-row button.ghost { padding: 3px 8px; font-size: 10px; }
+#cut-field.unavailable { opacity: 0.45; }
+#cut-field.unavailable .cut-row { pointer-events: none; }
 
 /* ---------- main ---------- */
 
@@ -500,8 +539,22 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
   border-bottom: 1px solid var(--line);
   font-size: 12px;
 }
-#selection-facts dt { color: var(--ink-3); margin: 0; }
-#selection-facts dd { margin: 0; color: var(--ink); font-family: var(--mono); }
+/* min-width:0 lets a long term shrink instead of pushing its value out of the row;
+   without it a flex item refuses to go below its content width and the two collide. */
+#selection-facts dt {
+  color: var(--ink-3);
+  margin: 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+#selection-facts dd {
+  margin: 0;
+  color: var(--ink);
+  font-family: var(--mono);
+  min-width: 0;
+  white-space: nowrap;
+  text-align: right;
+}
 #selection-facts dd.chosen { color: var(--accent); font-weight: 600; }
 
 
@@ -651,6 +704,22 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
 .stats-table td.clear { color: var(--ink); font-weight: 600; }
 .stats-table td.unclear { color: var(--ink-3); }
 
+/* Assumption checks: prose cells wrap, verdicts carry symbol + word + colour. */
+.stats-table.stats-checks td, .stats-table.stats-checks th { text-align: left; white-space: normal; vertical-align: top; }
+.stats-table.stats-checks td { font-family: var(--font); font-size: 11.5px; line-height: 1.45; }
+.stats-checks td.check { font-weight: 600; white-space: nowrap; }
+.stats-checks td.look { color: var(--ink-3); }
+.stats-checks .affects b { font-weight: 600; color: var(--ink-2); }
+.verdict { display: inline-flex; align-items: baseline; gap: 5px; font-weight: 600; white-space: nowrap; }
+.verdict.ok { color: var(--ok); }
+.verdict.mild { color: var(--mild); }
+.verdict.bad { color: var(--bad); }
+.verdict-detail { display: block; color: var(--ink-3); font-weight: 400; font-size: 11px; }
+.stats-details { margin-top: 10px; font-size: 12px; color: var(--ink-2); }
+.stats-details summary { cursor: pointer; padding: 4px 0; }
+.stats-details img { display: block; width: 100%; height: auto; margin-top: 8px;
+                     border: 1px solid var(--line); border-radius: var(--radius); background: #fff; }
+
 /* Model control: three long labels, one per row. */
 .seg--stack { flex-direction: column; }
 .seg--stack button { border-right: none; border-bottom: 1px solid var(--line); text-align: left; padding: 6px 8px; }
@@ -664,3 +733,15 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
 .stats-table.stats-ptable th { white-space: normal; font-size: 10px; line-height: 1.3; }
 .stats-table.stats-ptable td { font-size: 11px; }
 .stats-table.stats-ptable td:first-child, .stats-table.stats-ptable th:first-child { text-align: left; }
+
+/* Fit against the data: five subjects per row, two rows (pooled, within unit). */
+.stats-multiples.stats-five { grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+.stats-multiples.stats-six { grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); }
+.stats-fitdata-row-label {
+  margin: 10px 0 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--ink-2);
+}
+.stats-inline-seg { display: inline-flex; width: auto; margin: 2px 0 4px; }
+.stats-inline-seg button { flex: 0 0 auto; padding-left: 14px; padding-right: 14px; }

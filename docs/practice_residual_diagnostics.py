@@ -12,7 +12,7 @@ Verdicts are computed from those numbers (thresholds in ``verdicts()``), never w
 by hand, so the figure for each transform says what that transform's residuals show.
 Reads only ``output_data/practice/attempts/``; writes nothing under ``output_data/``.
 
-**lme4 mode.** With ``lme4`` the same nine checks run on the full nested model instead
+**lme4 mode.** With ``lme4`` the same nine checks run on the scene-scale lme4 model instead
 (``(1 + log(attempt) | level) + (1 + log(attempt) | level:scene)``, fitted in R by
 ``docs/practice_lme4_resid.R`` on the same frames), into
 ``docs/practice_residual_diagnostics_lme4_<transform>.png`` / ``.csv``. Residuals then net
@@ -23,9 +23,21 @@ where the profile failed) with the level bootstrap — the bootstrap that, like 
 assume a level's scenes are independent. A bootstrap of the nested model itself (hours of
 refits) is not run.
 
+**route mode.** With ``route`` the checks run on the route-scale model instead:
+``log(d_own_loso) ~ log(use)`` with ``(1 + log(use) | level) + (1 + log(use) | level:scene)
++ (1 + log(use) | level:scene:route)``, fitted in R by ``docs/practice_lme4_route_resid.R``
+on ``analysis.practice.route_frame``'s rows. The unit of rows 2, 7 and 8 is the *route*
+(consecutive uses of one route; per-route noise; route effects by world), the clock of
+row 1 is the nth use, and row 9 compares the model's Wald CI with the route-scale level
+bootstrap (``docs/practice_route_bootstrap.py``). The same R script refits two simpler
+models without the terms the singular fits collapse, into
+``docs/practice_route_simplified.csv``, so it can be checked that singularity did not
+shape the slope. Output: ``docs/practice_residual_diagnostics_route_<transform>.png`` / ``.csv``.
+
     uv run python docs/practice_residual_diagnostics.py            # both transforms
     uv run python docs/practice_residual_diagnostics.py log        # one
     uv run python docs/practice_residual_diagnostics.py lme4       # nested lme4 model, both
+    uv run python docs/practice_residual_diagnostics.py route      # route-scale model, both
 """
 
 import shutil
@@ -45,7 +57,7 @@ import statsmodels.formula.api as smf
 from scipy import stats
 
 from analysis.practice import (PRIMARY, PRIMARY_TRANSFORM, TRANSFORMS, _fit_lmm, _mixed_frame,
-                               level_of, load_attempts)
+                               level_of, load_attempts, route_frame)
 from analysis.trace_plots import CLUSTER_COLORS, SUBJECT_COLORS
 
 HERE = Path(__file__).parent
@@ -107,6 +119,37 @@ LME4_ROW9 = ("9. Does it matter? (level bootstrap)",
              "Is this model's CI right without its assumptions?",
              "green lines at the pink band's edges",
              "CI - the level bootstrap does not assume normal noise, nor that a level's scenes are independent")
+ROUTE_MEASURE = "d_own_loso"
+ROUTE_SUMMARY = HERE / "practice_route_level_bootstrap.csv"
+ROUTE_DRAWS = HERE / "practice_route_level_bootstrap_draws.csv"
+ROUTE_SIMPLIFIED = HERE / "practice_route_simplified.csv"
+# Route mode asks the same questions with the route as the unit and the nth use as the clock.
+ROUTE_ROWS = [
+    ROWS[0],
+    ("1. Shape of the trend",
+     "Centre half of row 0, against the nth use of the route: is the average residual 0 at every stage?",
+     ROWS[1][2], ROWS[1][3]),
+    ("2. Independence",
+     "Is a use's residual unrelated to the previous use of the same route?",
+     ROWS[2][2], ROWS[2][3]),
+    ROWS[3], ROWS[4], ROWS[5],
+    ("6. Route random effects",
+     "Are the route intercepts u and slopes v (and the level ones) bell-shaped?",
+     "both sets of points on the line (standardised)",
+     "ROUTE VARIANCES, and the slope a little - extreme routes can pull b and distort shrinkage"),
+    ("7. Equal variance across routes",
+     "Is the noise of a route's uses the same for every route?",
+     ROWS[7][2],
+     "CI - a residual check grouped by route; noisy and quiet routes get equal weight"),
+    ("8. Equal random-effect variance",
+     "Do the route u and v spread equally in every world?",
+     ROWS[8][2],
+     "ROUTE VARIANCES and CI - one var(u), one var(v) for all routes"),
+    ("9. Does it matter? (level bootstrap)",
+     "Is this model's CI right without its assumptions?",
+     "green lines at the pink band's edges",
+     "CI - the level bootstrap does not assume normal noise, nor that a level's scenes are independent"),
+]
 N_SHUFFLE = 200        # permutations behind the chance level in rows 7 and 8
 RNG_SEED = 0
 MIN_SCENE = 5          # scenes with fewer attempts have no usable residual SD
@@ -145,6 +188,64 @@ def fit_lme4_all(df, transform):
     return out
 
 
+def fit_route_all(df, transform):
+    """{subject: (d, route effects, level effects)} for the route-scale model, via R.
+
+    ``group`` is ``scene|route``, so "previous" and "per unit" mean the same route; route
+    effects are indexed the same way, which keeps the world parse in row 8 working.
+    Also writes the simplified refits to ``ROUTE_SIMPLIFIED`` (rows for this transform).
+    """
+    if shutil.which("Rscript") is None:
+        sys.exit("Rscript not found - install R and lme4: sudo apt install r-base r-cran-lme4")
+    frames = {}
+    for s in sorted(df["subject"].unique()):
+        d = route_frame(df, ROUTE_MEASURE, s, False, transform).reset_index(drop=True)
+        d["rid"] = np.arange(len(d))
+        frames[s] = d
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        pd.concat([d[["subject", "rid", "y", "log_use", "scene", "route", "level"]]
+                   for d in frames.values()]).to_csv(tmp / "frames.csv", index=False)
+        subprocess.run(["Rscript", str(HERE / "practice_lme4_route_resid.R"), str(tmp / "frames.csv"),
+                        str(tmp / "resid.csv"), str(tmp / "ranef.csv"), str(tmp / "simple.csv")],
+                       check=True)
+        resid = pd.read_csv(tmp / "resid.csv", dtype={"subject": str})
+        ranef = pd.read_csv(tmp / "ranef.csv", dtype={"subject": str, "id": str})
+        simple = pd.read_csv(tmp / "simple.csv", dtype={"subject": str}).assign(transform=transform)
+    old = pd.read_csv(ROUTE_SIMPLIFIED, dtype={"subject": str}) if ROUTE_SIMPLIFIED.exists() else None
+    if old is not None:
+        simple = pd.concat([old[old["transform"] != transform], simple], ignore_index=True)
+    simple.round(6).to_csv(ROUTE_SIMPLIFIED, index=False)
+    # lme4 names nested groups "level:scene:route"; keep "scene|route" for routes.
+    ranef["id"] = [i.split(":", 1)[1].replace(":", "|") if k == "route" else i
+                   for i, k in zip(ranef["id"], ranef["kind"])]
+    out = {}
+    for s, d in frames.items():
+        r = resid[resid["subject"] == s].set_index("rid").loc[d["rid"]]
+        n_zero = int(d["n_zero_dropped"].iloc[0])
+        d = d.assign(fit=r["fit"].values, res=r["res"].values, attempt=d["use"],
+                     group=d["scene"] + "|" + d["route"].astype(str)).sort_values(["group", "use"])
+        d.attrs["n_zero_dropped"] = n_zero
+        d["prev"] = d.groupby("group")["res"].shift()
+        re = ranef[(ranef["subject"] == s) & (ranef["kind"] == "route")].set_index("id")[["u", "v"]]
+        lev = ranef[(ranef["subject"] == s) & (ranef["kind"] == "level")].set_index("id")[["u", "v"]]
+        out[s] = (d, re, lev)
+    return out
+
+
+def load_route_vs_level(transform):
+    """Row 9 in route mode: the route-scale Wald CI against its level bootstrap.
+
+    ``docs/practice_route_bootstrap.py`` already stores the model CI beside the bootstrap
+    one, in the columns the verdict and drawing code expect."""
+    if not (ROUTE_SUMMARY.exists() and ROUTE_DRAWS.exists()):
+        return None, None
+    summ = pd.read_csv(ROUTE_SUMMARY, dtype={"subject": str})
+    draws = pd.read_csv(ROUTE_DRAWS, dtype={"subject": str})
+    summ, draws = summ[summ["transform"] == transform], draws[draws["transform"] == transform]
+    return (summ, draws) if len(summ) else (None, None)
+
+
 def fit(df, subject, transform):
     d = _mixed_frame(df, PRIMARY, subject, transform=transform)
     res = _fit_lmm(smf, "y ~ logt", d, "~logt")
@@ -155,7 +256,7 @@ def fit(df, subject, transform):
     return d, re
 
 
-def verdicts(m: pd.DataFrame, boot: pd.DataFrame | None) -> list[tuple[str, str]]:
+def verdicts(m: pd.DataFrame, boot: pd.DataFrame | None, unit: str = "scene") -> list[tuple[str, str]]:
     """One (text, colour) per row, from the per-subject numbers in ``m`` (and ``boot``)."""
     def grade(value, ok, mild):
         return ("OK", OK) if value <= ok else ("MILD", WARN) if value <= mild else ("VIOLATED", BAD)
@@ -189,7 +290,7 @@ def verdicts(m: pd.DataFrame, boot: pd.DataFrame | None) -> list[tuple[str, str]
         (f"{normal[0]} - {norm_txt}", normal[1]),
         (f"{normal[0]} - {norm_txt}", normal[1]),
         (f"{spread[0]} - SD grows up to x{ratio:.1f} low to high", spread[1]),
-        (f"{reff[0]} - most extreme scene {z:.1f} SD out", reff[1]),
+        (f"{reff[0]} - most extreme {unit} {z:.1f} SD out", reff[1]),
         (f"{scene_var[0]} - outside share up to x{excess:.1f} its shuffled 95th pct", scene_var[1]),
         (f"{world_var[0]} - {n_world_out} of {len(m)} subjects beyond shuffled chance", world_var[1]),
         boot_verdict(boot),
@@ -205,7 +306,7 @@ def boot_verdict(boot):
     flips = int((boot["model_excludes_zero"] != boot["boot_excludes_zero"]).sum())
     lo, hi = boot["width_ratio"].min(), boot["width_ratio"].max()
     found = set(boot.get("unit", []))
-    units = ("level boot vs lme4" if found == {"level"} else
+    units = ("level boot vs model" if found == {"level"} else
              "scene + level" if "level" in found else "scene")
     if flips:
         return (f"CHANGES - {flips} call(s) flip ({units})", BAD)
@@ -257,31 +358,47 @@ def load_lme4_vs_level(transform):
 
 
 def run(df, transform, model="scene"):
-    lme4 = model == "lme4"
-    boot, boot_draws = load_lme4_vs_level(transform) if lme4 else load_boot(transform)
-    fits = fit_lme4_all(df, transform) if lme4 else None
-    rows = ROWS[:-1] + [LME4_ROW9] if lme4 else ROWS
+    route = model == "route"
+    lme4 = model in ("lme4", "route")     # both are lme4 fits checked against a level bootstrap
+    unit = "route" if route else "scene"
+    clock = "nth use of the route" if route else "attempt at scene"
+    if route:
+        boot, boot_draws = load_route_vs_level(transform)
+        fits = fit_route_all(df, transform)
+        rows = ROUTE_ROWS
+    else:
+        boot, boot_draws = load_lme4_vs_level(transform) if lme4 else load_boot(transform)
+        fits = fit_lme4_all(df, transform) if lme4 else None
+        rows = ROWS[:-1] + [LME4_ROW9] if lme4 else ROWS
     subjects = sorted(df["subject"].unique())
     n = len(subjects)
     fig = plt.figure(figsize=(3.7 * n, 3.55 * len(rows) + 1.4))
     gs = fig.add_gridspec(len(rows), n, top=1 - 2.6 / (3.55 * len(rows) + 1.4),
                           bottom=0.02, left=0.05, right=0.99, hspace=0.95, wspace=0.32)
     role = "main analysis" if transform == PRIMARY_TRANSFORM else "original analysis, kept for comparison"
-    if lme4:
-        fig.suptitle(f"Residual checks: FULL NESTED lme4 model, {transform}({PRIMARY}) ~ log(attempt) "
+    if route:
+        fig.suptitle(f"Residual checks: ROUTE-SCALE lme4 model, {transform}({ROUTE_MEASURE}) ~ log(use) "
+                     "+ (1 + log(use) | level) + (1 + log(use) | level:scene) + "
+                     f"(1 + log(use) | level:scene:route)  ({role})",
+                     fontsize=14, fontweight="bold", y=0.997)
+    elif lme4:
+        fig.suptitle(f"Residual checks: SCENE-SCALE lme4 model, {transform}({PRIMARY}) ~ log(attempt) "
                      "+ (1 + log(attempt) | level) + (1 + log(attempt) | level:scene)  "
                      f"({role})", fontsize=14, fontweight="bold", y=0.997)
     else:
         fig.suptitle(f"Residual checks: {transform}({PRIMARY}) ~ log(attempt), one LMM per subject "
                      f"({role})", fontsize=15, fontweight="bold", y=0.997)
-    effects = "the level's and the scene's u and v" if lme4 else "the scene's own u and v"
+    effects = ("the level's, scene's and route's u and v" if route else
+               "the level's and the scene's u and v" if lme4 else "the scene's own u and v")
     fig.text(0.5, 0.984, f"A residual is observed - predicted ({effects} "
              "included). If the model captured the structure, residuals look like "
              "patternless noise: centred on 0 everywhere, the same spread everywhere, "
              "independent, bell-shaped.", ha="center", fontsize=10.5, color="#444")
     fig.text(0.5, 0.976, "Each row says what a failure would affect: the SLOPE b itself, or only "
              "its CI (b right on average, uncertainty misjudged). Row 9 checks whether the CI "
-             "problems matter, with " + ("the level bootstrap against this model's profile CI."
+             "problems matter, with " + ("the level bootstrap against this model's Wald CI."
+                                         if route else
+                                         "the level bootstrap against this model's profile CI."
                                          if lme4 else
                                          "the scene bootstrap (docs/practice_scene_bootstrap.py)."),
              ha="center", fontsize=10.5, color="#1f3f73", style="italic")
@@ -323,7 +440,7 @@ def run(df, transform, model="scene"):
         ax[0].axhline(0, color="k", lw=0.8)
         ax[0].errorbar(x, b["mean"], yerr=1.96 * b["sem"], fmt="o", color=c, capsize=2)
         ax[0].set_xticks(x, [f"{iv.left + 1}-{iv.right}" for iv in b.index], rotation=45, fontsize=7)
-        ax[0].set_xlabel("attempt at scene", fontsize=8)
+        ax[0].set_xlabel(clock, fontsize=8)
         ax[0].set_ylabel("mean residual", fontsize=8)
         ax[0].set_ylim(-lim, lim)
 
@@ -332,8 +449,8 @@ def run(df, transform, model="scene"):
         r = p.corr().iloc[0, 1]
         ax[1].hexbin(p["prev"], p["res"], gridsize=40, bins="log", cmap="Greys",
                      extent=(lo, hi, lo, hi))
-        ax[1].set_xlabel("previous attempt's residual", fontsize=8)
-        ax[1].set_ylabel("this attempt's residual", fontsize=8)
+        ax[1].set_xlabel(f"previous {'use' if route else 'attempt'}'s residual", fontsize=8)
+        ax[1].set_ylabel(f"this {'use' if route else 'attempt'}'s residual", fontsize=8)
         ax[1].text(0.04, 0.92, f"r = {r:.2f}", transform=ax[1].transAxes, fontsize=10,
                    fontweight="bold")
 
@@ -371,7 +488,7 @@ def run(df, transform, model="scene"):
             zmax = max(zmax, float(z.abs().max()))
             (qm, qr), _ = stats.probplot(z, dist="norm")
             ax[5].plot(qm, qr, mk, ms=3, color=c, alpha=0.6 if col == "u" else 0.35,
-                       mfc=c if col == "u" else "none", label=("scene " + lab) if lme4 else lab)
+                       mfc=c if col == "u" else "none", label=(f"{unit} " + lab) if lme4 else lab)
         if lev is not None and len(lev) > 2:
             for col, mk, lab in (("u", "s", "level u"), ("v", "D", "level v")):
                 sd = lev[col].std()
@@ -385,7 +502,7 @@ def run(df, transform, model="scene"):
         line = np.array([-3.2, 3.2])
         ax[5].plot(line, line, color="red", lw=1)
         ax[5].set_xlabel("normal quantile", fontsize=8)
-        ax[5].set_ylabel("standardised scene effect", fontsize=8)
+        ax[5].set_ylabel(f"standardised {unit} effect", fontsize=8)
         ax[5].legend(fontsize=7, frameon=False, loc="upper left")
 
         # 7. per-scene residual SD against attempts, in the chance funnel for equal variance
@@ -415,8 +532,8 @@ def run(df, transform, model="scene"):
         ax[6].axhline(sigma, color="k", lw=0.8, ls="--")
         ax[6].scatter(sc["size"], sc["std"], s=8, color=c, alpha=0.6)
         ax[6].set_xscale("log")
-        ax[6].set_xlabel("attempts in the scene (log scale)", fontsize=8)
-        ax[6].set_ylabel("residual SD in the scene", fontsize=8)
+        ax[6].set_xlabel(f"{'uses of the route' if route else 'attempts in the scene'} (log scale)", fontsize=8)
+        ax[6].set_ylabel(f"residual SD in the {unit}", fontsize=8)
         ax[6].text(0.97, 0.92, f"{outside:.0%} outside\nshuffled: {chance_mean:.0%} "
                    f"(95th pct {chance_p95:.0%})", transform=ax[6].transAxes,
                    ha="right", va="top", fontsize=8.5, fontweight="bold")
@@ -440,7 +557,7 @@ def run(df, transform, model="scene"):
         ax[7].set_ylim(-5, 5)
         ax[7].axhline(0, color="k", lw=0.6)
         ax[7].set_xlabel("world", fontsize=8)
-        ax[7].set_ylabel("standardised scene effect", fontsize=8)
+        ax[7].set_ylabel(f"standardised {unit} effect", fontsize=8)
         sizes = zre.groupby("world").size()
         big = sizes[sizes >= MIN_WORLD].index
         sds = zre[zre["world"].isin(big)].groupby("world")[["u", "v"]].std()
@@ -468,7 +585,7 @@ def run(df, transform, model="scene"):
             ax[8].hist(x, bins=30, color=c, alpha=0.7)
             if lme4:
                 ax[8].axvspan(r9.model_ci_low, r9.model_ci_high, color=CLUSTER_COLORS[4], alpha=0.2,
-                              label="lme4 nested CI")
+                              label="route-scale Wald CI" if route else "scene-scale lme4 CI")
                 ax[8].axvline(r9.boot_ci_low, color=CLUSTER_COLORS[2], lw=1.6, ls="--",
                               label="level bootstrap CI")
                 ax[8].axvline(r9.boot_ci_high, color=CLUSTER_COLORS[2], lw=1.6, ls="--")
@@ -487,7 +604,7 @@ def run(df, transform, model="scene"):
             ax[8].set_xlabel("bootstrap slope b (200 " + ("level" if lme4 else "scene")
                              + " resamples)", fontsize=8)
             ax[8].set_ylabel("replicates", fontsize=8)
-            txt = (f"level boot / lme4 x{r9.width_ratio:.2f}" if lme4
+            txt = (f"level boot / model x{r9.width_ratio:.2f}" if lme4
                    else f"scene x{r9.width_ratio:.2f}")
             if len(lv):
                 txt += f"\nlevel x{lv.iloc[0].width_ratio:.2f}"
@@ -512,7 +629,7 @@ def run(df, transform, model="scene"):
         })
 
     metrics = pd.DataFrame(metrics)
-    for i, ((title, q, look, affects), (verdict, vc)) in enumerate(zip(rows, verdicts(metrics, boot))):
+    for i, ((title, q, look, affects), (verdict, vc)) in enumerate(zip(rows, verdicts(metrics, boot, unit))):
         bbox = gs[i, 0].get_position(fig)
         y = bbox.y1 + (0.036 if i == 0 else 0.03)
         fig.text(0.012, y, title, fontsize=12.5, fontweight="bold", va="bottom")
@@ -523,7 +640,8 @@ def run(df, transform, model="scene"):
         fig.text(0.012, y - 0.0045, f"If violated, affects: {affects}", fontsize=9.5,
                  color="#1f3f73", style="italic", va="top")
 
-    out = HERE / f"practice_residual_diagnostics_{'lme4_' if lme4 else ''}{transform}.png"
+    prefix = "route_" if route else "lme4_" if lme4 else ""
+    out = HERE / f"practice_residual_diagnostics_{prefix}{transform}.png"
     fig.savefig(out, dpi=110)
     plt.close(fig)
     metrics.round(4).to_csv(out.with_suffix(".csv"), index=False)
@@ -532,7 +650,7 @@ def run(df, transform, model="scene"):
 
 def main():
     args = sys.argv[1:]
-    model = "lme4" if "lme4" in args else "scene"
+    model = "route" if "route" in args else "lme4" if "lme4" in args else "scene"
     df = load_attempts(Path("output_data"))
     for transform in [a for a in args if a in TRANSFORMS] or list(TRANSFORMS):
         run(df, transform, model)

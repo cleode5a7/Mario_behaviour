@@ -96,6 +96,55 @@ CONSENSUS_K_TOL = 0.0
 # test on a full-data cut, with nothing to scale.
 CONSENSUS_MIN_CLUSTER_SIZE = 1
 
+# Which rule reads the silhouette-vs-k curve. "silhouette" is the plain argmax above.
+# The other two read the curve's *shape* instead of its maximum, via `elbow_k`:
+#
+#   "elbow"         cut at the cliff edge itself — the last k before the curve drops.
+#   "elbow_capped"  the argmax, searched only at or below that cliff.
+#
+# All three are computed on every run; this constant only says which one assigns the
+# labels. Measured over the corpus, against the argmax (the `elbow` row is from the
+# shipped run itself; `elbow_capped` is derived from the stored curves, which fix k
+# and the smallest cluster exactly but say nothing about stability):
+#
+#   rule           k (median/mean)   changes k   dust (<= 2)   stable_share
+#   silhouette         6 / 7.45          —        126 scenes      79.1%
+#   elbow              7 / 7.79      154 scenes   152 scenes      76.9%
+#   elbow_capped       6 / 6.51       40 scenes    99 scenes      not measured
+#
+# The partitions themselves barely move: median ARI 1.000 against the argmax corpus,
+# 266 of 308 scenes above 0.9. The cost is concentrated — 42 scenes disagree, one as
+# low as 0.061 — and the 2.2 pp of stable_share is bought by those plus the extra dust.
+#
+# The two are not variations on one idea, and the table is why. "elbow" is the literal
+# reading and it runs *finer* as often as coarser: the curve usually plateaus at the
+# top with wiggles below `elbow_min_drop`, so the first real cliff sits above the
+# argmax and the rule walks out to meet it. "elbow_capped" can only ever be coarser,
+# because the cliff is used as a ceiling rather than as the answer — it changes only
+# the 40 scenes where the argmax had climbed *past* a cliff (w1l1s5: k=15 against a
+# cliff at k=4), which is exactly the flat-tail pathology CONSENSUS_K_TOL describes,
+# and it costs a median of 0.0000 silhouette to fix them.
+#
+# **The default is "elbow": the corpus on disk is cut at the cliff edge.** That is a
+# deliberate choice and not the one the table above would argue for — `elbow_capped`
+# is the rule that reduces dust, and plain `elbow` does not. It is what the analysis
+# asks for: the last k before the ensemble's agreement breaks, rather than the k that
+# scores best on a metric which cannot see a singleton. Pass
+# `--consensus-k-rule silhouette` to get the argmax corpus back; the alternatives are
+# one flag and one re-cluster away in either direction.
+CONSENSUS_K_RULE = "elbow"
+
+# A drop counts as the cliff when it is at least this share of the steepest drop in
+# the curve. 1.0 is literally "the k before the steepest drop"; below that, an earlier
+# drop of comparable depth wins, which is what keeps the rule from walking past a real
+# cliff to a slightly deeper one further up the tail.
+CONSENSUS_ELBOW_FRAC = 0.5
+
+# ...and at least this much in absolute silhouette, so a curve that is flat within
+# rounding (values are stored to 4 dp) is reported as having no cliff at all rather
+# than having one at its largest piece of noise.
+CONSENSUS_ELBOW_MIN_DROP = 0.005
+
 
 def _fit(dist: np.ndarray, min_cluster_size, min_samples, epsilon) -> np.ndarray:
     """One HDBSCAN fit on a precomputed distance matrix."""
@@ -367,10 +416,131 @@ def _consensus_tree(coassoc, *, input, linkage_method):
     return Z, d
 
 
+def elbow_k(rows, *, frac=CONSENSUS_ELBOW_FRAC, min_drop=CONSENSUS_ELBOW_MIN_DROP):
+    """The last k before the silhouette curve falls off a cliff. Returns a report.
+
+    A second reading of the same curve the argmax reads, and it asks a different
+    question. The argmax asks *which cut scores best*; this asks *where does the curve
+    stop being able to add a cluster without damage* — the *shape* of the curve rather
+    than its maximum. The two differ because the silhouette on ``1 - C`` is not a
+    well-behaved objective here: it plateaus once clusters are isolated, and a
+    singleton peeled off a cluster costs it nothing (sklearn scores a singleton 0, and
+    a never-co-clustered trace already scored ~0 inside its parent). So the argmax can
+    wander up a flat tail of dust, while a cliff in the curve is a real event — the cut
+    at which Ward had to break something that the resampling did hold together.
+
+    The rule, in one sentence: **find the steepest drop between consecutive candidates,
+    then take the k immediately before the first drop at least ``frac`` as deep.**
+
+    ``frac=1.0`` makes that literally "the k before the steepest drop". The default 0.5
+    exists because the steepest drop is not always the first real one: a curve can fall
+    hard at k=7, wander, and fall slightly harder at k=13, and reporting 12 there would
+    describe the tail rather than the structure. Requiring only half the depth takes
+    the first cliff of comparable size instead.
+
+    ``min_drop`` is an absolute floor on what counts as a cliff at all. Without it a
+    curve that is flat to within rounding would still hand back its largest wiggle.
+
+    Returns ``{"k", "drop", "steepest", "threshold"}`` with ``k`` None when the curve
+    has no cliff — a monotonically rising curve genuinely has no last-k-before-a-drop,
+    and callers fall back to the argmax rather than inventing one.
+    """
+    sil = [r["silhouette"] for r in rows if r.get("silhouette") is not None]
+    ks = [r["k"] for r in rows if r.get("silhouette") is not None]
+    empty = {"k": None, "drop": None, "steepest": None, "threshold": None}
+    if len(sil) < 2:
+        return empty
+
+    # Positive = the curve fell going from this candidate to the next one.
+    drops = [sil[i] - sil[i + 1] for i in range(len(sil) - 1)]
+    steepest = max(drops)
+    if steepest < min_drop:
+        return {**empty, "steepest": round(float(steepest), 4)}
+
+    threshold = max(min_drop, frac * steepest)
+    i = next(i for i, d in enumerate(drops) if d >= threshold)
+    return {"k": int(ks[i]), "drop": round(float(drops[i]), 4),
+            "steepest": round(float(steepest), 4),
+            "threshold": round(float(threshold), 4)}
+
+
+def _candidate_cuts(Z, n, *, k_max, min_cluster_size):
+    """Every eligible cut of the tree, as ``{k: labels}``.
+
+    ``cut_tree`` returns exactly k where ``fcluster(..., "maxclust")`` returns *at
+    most* k — that difference bit in testing, where a collapsed cut reached
+    ``silhouette_score`` as a single label and raised. Ties can still collapse a cut,
+    so candidates are keyed by the k actually returned (duplicates collapse) and
+    single-label cuts dropped.
+
+    Shared by ``ward_consensus_labels`` and ``consensus_cut_bounds`` so the dashboard's
+    alternative cuts are the same objects the selection chose between, not a second
+    implementation that could drift from it.
+    """
+    cuts: dict[int, np.ndarray] = {}
+    for k in range(2, min(int(k_max), n - 1) + 1):
+        labels = np.squeeze(np.asarray(cut_tree(Z, n_clusters=k)))
+        found, counts = np.unique(labels, return_counts=True)
+        if len(found) < 2 or counts.min() < min_cluster_size:
+            continue
+        cuts.setdefault(len(found), labels)
+    return cuts
+
+
+def cut_bounds(labels, leaves) -> list[int] | None:
+    """Where a cut falls in the dendrogram's leaf order, as split positions.
+
+    A cut's clusters are contiguous runs in the leaf order — ``cut_tree`` cannot split
+    a leaf run, since the leaf order is built from the same merges the cut walks back.
+    So a whole partition is ``k - 1`` positions, which is what lets the dashboard carry
+    *every* candidate cut in a few hundred bytes instead of one label array per k.
+
+    Returns None if the runs are not contiguous, rather than an encoding that would
+    silently decode into a different partition. Nothing in the corpus trips it; it is
+    here because a wrong partition drawn confidently is worse than a missing feature.
+    """
+    labels = np.asarray(labels)
+    seq = [int(labels[i]) for i in leaves]
+    bounds, seen = [], {seq[0]}
+    for p in range(1, len(seq)):
+        if seq[p] == seq[p - 1]:
+            continue
+        if seq[p] in seen:
+            return None          # this cluster already ended — not contiguous
+        seen.add(seq[p])
+        bounds.append(p)
+    return bounds
+
+
+def consensus_cut_bounds(coassoc, *, input="features", linkage_method="ward",
+                         k_max=CONSENSUS_K_MAX,
+                         min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE) -> dict[int, list[int]]:
+    """``{k: cut_bounds}`` for every candidate, rebuilt from a stored ensemble.
+
+    The migration path for cluster files written before the bounds were recorded.
+    ``_consensus_tree`` and ``_candidate_cuts`` are pure functions of ``C`` and the two
+    settings the file records, so this reproduces the same tree and the same candidate
+    list — the same reason ``run-coassociation`` can regenerate the matrix exactly.
+    """
+    C = np.asarray(coassoc, dtype=float)
+    Z, _ = _consensus_tree(C, input=input, linkage_method=linkage_method)
+    leaves = [int(i) for i in leaves_list(Z)]
+    out = {}
+    for k, labels in _candidate_cuts(Z, len(C), k_max=k_max,
+                                     min_cluster_size=min_cluster_size).items():
+        bounds = cut_bounds(labels, leaves)
+        if bounds is not None:
+            out[int(k)] = bounds
+    return out
+
+
 def ward_consensus_labels(coassoc, *, dist=None, input="features",
                           linkage_method="ward",
                           min_cluster_size=CONSENSUS_MIN_CLUSTER_SIZE,
-                          k_max=CONSENSUS_K_MAX, tol=CONSENSUS_K_TOL):
+                          k_max=CONSENSUS_K_MAX, tol=CONSENSUS_K_TOL,
+                          rule=CONSENSUS_K_RULE,
+                          elbow_frac=CONSENSUS_ELBOW_FRAC,
+                          elbow_min_drop=CONSENSUS_ELBOW_MIN_DROP):
     """Cluster the ensemble with Ward linkage, choosing k by silhouette.
 
     The default consensus aggregation, replacing ``consensus_labels`` and its tuned
@@ -381,6 +551,15 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
     k with the highest silhouette on 1 - C.** Ward itself has no k — ``linkage`` returns
     the full merge tree — so every k from 2 to ``k_max`` is cut, scored, and the best
     taken. Ties go to the smaller k.
+
+    ``rule="elbow"`` reads the same curve by its shape instead — the last k before it
+    falls off a cliff (see ``elbow_k``) — and ``rule="elbow_capped"`` uses that cliff as
+    a ceiling on the argmax rather than as the answer. **The elbow is computed on every
+    run regardless**, the way ``silhouette_frechet`` is recorded without selecting, so
+    the report always says where the other rules would have cut; ``rule`` only decides
+    which one assigns the labels. The default stays ``"silhouette"``: switching it
+    repartitions the corpus, which is a measured change, not a default to drift into
+    (the module constants carry the measurement).
 
     Two guards sit on that rule and both default to **off**; ``tol`` and
     ``min_cluster_size`` turn them on. See the module constants for the measured
@@ -402,6 +581,12 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
               for selection because it systematically prefers coarser cuts, and coarser
               flatters ``stable_share`` for free (the same gameability ``select_params``
               guards against by maximising k above a floor).
+        rule: which reading of the curve assigns the labels — ``"silhouette"`` (the
+              argmax, default), ``"elbow"`` (the last k before the cliff) or
+              ``"elbow_capped"`` (the argmax at or below that cliff). The elbow is
+              computed and reported whichever one is in force.
+        elbow_frac, elbow_min_drop: what counts as that cliff; see ``elbow_k``. They
+              shape the reported elbow whether or not it selects.
     """
     C = np.asarray(coassoc, dtype=float)
     n = len(C)
@@ -412,14 +597,18 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         "min_cluster_size": int(min_cluster_size),
         "k_max": int(k_max),
         "tol": float(tol),
+        "rule": rule,
+        "elbow_frac": float(elbow_frac),
+        "elbow_min_drop": float(elbow_min_drop),
     }
+    no_elbow = {"k": None, "drop": None, "steepest": None, "threshold": None}
 
     if n < 3:
         # Nothing to select between: silhouette needs 2 <= k <= n - 1.
         return (np.zeros(n, dtype=int),
                 {**settings, "k": 1 if n else 0, "selection": "too_small",
                  "silhouette": None, "silhouette_frechet": None, "k_candidates": [],
-                 "leaves": None})
+                 "elbow": no_elbow, "leaves": None})
 
     # An ensemble that never once put any pair together carries no information: every
     # replicate called every point noise. 1 - C is then all ones, the silhouette is
@@ -432,25 +621,16 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         return (np.full(n, -1, dtype=int),
                 {**settings, "k": 0, "selection": "no_ensemble_signal",
                  "silhouette": None, "silhouette_frechet": None, "k_candidates": [],
-                 "leaves": None})
+                 "elbow": no_elbow, "leaves": None})
 
     Z, d = _consensus_tree(C, input=input, linkage_method=linkage_method)
     frechet = None if dist is None else np.asarray(dist, dtype=float)
+    leaves = [int(i) for i in leaves_list(Z)]
 
     def cut(k):
         return np.squeeze(np.asarray(cut_tree(Z, n_clusters=k)))
 
-    # cut_tree returns exactly k where fcluster(..., "maxclust") returns *at most* k —
-    # that difference bit in testing, where a collapsed cut reached silhouette_score as
-    # a single label and raised. Ties can still collapse a cut, so candidates are keyed
-    # by the k actually returned (duplicates collapse) and single-label cuts dropped.
-    candidates: dict[int, np.ndarray] = {}
-    for k in range(2, min(int(k_max), n - 1) + 1):
-        labels = cut(k)
-        found, counts = np.unique(labels, return_counts=True)
-        if len(found) < 2 or counts.min() < min_cluster_size:
-            continue
-        candidates.setdefault(len(found), labels)
+    candidates = _candidate_cuts(Z, n, k_max=k_max, min_cluster_size=min_cluster_size)
 
     rows = []
     for k, labels in sorted(candidates.items()):
@@ -462,14 +642,41 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         if frechet is not None:
             row["silhouette_frechet"] = round(
                 float(silhouette_score(frechet, labels, metric="precomputed")), 4)
+        # Where this cut falls in the leaf order, so every candidate partition — not
+        # just the one taken — travels with the curve at k-1 integers apiece. That is
+        # what lets the dashboard show an alternative cut without re-deriving it in the
+        # browser: it is still drawing a stored result, just not the selected one.
+        bounds = cut_bounds(labels, leaves)
+        if bounds is not None:
+            row["bounds"] = bounds
         rows.append(row)
+
+    elbow = elbow_k(rows, frac=elbow_frac, min_drop=elbow_min_drop)
 
     if rows:
         best = max(r["silhouette"] for r in rows)
-        chosen = min((r for r in rows if r["silhouette"] >= best - tol),
-                     key=lambda r: r["k"])
+        by_silhouette = min((r for r in rows if r["silhouette"] >= best - tol),
+                            key=lambda r: r["k"])
+        if rule not in ("silhouette", "elbow", "elbow_capped"):
+            raise ValueError(f"Unknown k rule '{rule}'. "
+                             f"Use 'silhouette', 'elbow' or 'elbow_capped'.")
+        if rule == "silhouette":
+            chosen, selection = by_silhouette, "silhouette"
+        elif elbow["k"] is None:
+            # A curve with no cliff has no last-k-before-one. Fall back to the argmax
+            # and say so, rather than quietly handing back the largest candidate.
+            chosen, selection = by_silhouette, "elbow_no_drop"
+        elif rule == "elbow":
+            chosen, selection = next(r for r in rows if r["k"] == elbow["k"]), "elbow"
+        else:
+            # The cliff as a ceiling, not as the answer: best silhouette among the cuts
+            # at or below it. Coarser than the argmax or equal to it, never finer.
+            capped = [r for r in rows if r["k"] <= elbow["k"]]
+            top = max(r["silhouette"] for r in capped)
+            chosen = min((r for r in capped if r["silhouette"] >= top - tol),
+                         key=lambda r: r["k"])
+            selection = "elbow_capped"
         labels = candidates[chosen["k"]]
-        selection = "silhouette"
     else:
         # No cut clears the size floor. Take the coarsest partition available and say
         # so, rather than dropping a small scene entirely.
@@ -491,6 +698,10 @@ def ward_consensus_labels(coassoc, *, dist=None, input="features",
         "silhouette": chosen.get("silhouette"),
         "silhouette_frechet": chosen.get("silhouette_frechet"),
         "k_candidates": rows,
+        # Recorded on every run, whichever rule selected: where the *other* reading of
+        # this curve would have cut it. Same standing as `silhouette_frechet` — visible
+        # so the choice can be argued with, and not consulted unless `rule` says so.
+        "elbow": elbow,
         # Dendrogram leaf order, in this matrix's own row order. The tree carries
         # structure the labels throw away — which clusters are adjacent in it, and how
         # each one is built internally — and that structure is only visible if the
@@ -1031,7 +1242,14 @@ def _compare_consensus_one(scene, output_dir, params, B, frac, seed, scheme,
             lab, report = ward_consensus_labels(
                 coassoc, dist=dist, input=input_kind,
                 min_cluster_size=params.get("consensus_min_cluster_size",
-                                            CONSENSUS_MIN_CLUSTER_SIZE))
+                                            CONSENSUS_MIN_CLUSTER_SIZE),
+                # ...and the k rule the run itself used, for the same reason: this
+                # compares aggregations, so everything else about the cut has to be
+                # what the corpus was actually made with.
+                rule=params.get("consensus_k_rule", CONSENSUS_K_RULE),
+                elbow_frac=params.get("consensus_elbow_frac", CONSENSUS_ELBOW_FRAC),
+                elbow_min_drop=params.get("consensus_elbow_min_drop",
+                                          CONSENSUS_ELBOW_MIN_DROP))
             silhouette = report["silhouette"]
             silhouette_frechet = report["silhouette_frechet"]
             selection = report["selection"]

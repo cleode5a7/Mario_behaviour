@@ -24,12 +24,12 @@
       <div class="field">
         <label for="stats-model-seg">Model</label>
         <div class="seg seg--wrap seg--stack" id="stats-model-seg" role="group" aria-label="Model">
-          <button data-value="lme4_nested" aria-pressed="true">Full nested (lme4) &mdash; main</button>
+          <button data-value="lme4_nested" aria-pressed="true">Scene scale (lme4) &mdash; main</button>
           <button data-value="scene" aria-pressed="false">Scene only (statsmodels)</button>
           <button data-value="level_scene" aria-pressed="false">Nested, no scene corr. (statsmodels)</button>
-          <button data-value="lme4_route" aria-pressed="false">Within-route (lme4) &mdash; secondary</button>
+          <button data-value="lme4_route" aria-pressed="false">Route scale (lme4) &mdash; main</button>
         </div>
-        <p class="hint">the nested models are log form and nearest/spread only; within-route is log form and own-medoid only (distance to the attempt's own route, against nth use of the route); the scene-only model has every form and measure</p>
+        <p class="hint">the two scales are the main results: scene scale is distance to the nearest route prototype against attempt number (scenes in levels); route scale is distance to the attempt's own route prototype against nth use of that route (routes in scenes in levels). The nested models are log form only, and each scale has one measure; the scene-only model has every form and measure</p>
       </div>
       <div class="field">
         <label for="stats-measure-seg">Measure</label>
@@ -129,6 +129,17 @@
           <button data-value="stability" aria-pressed="false">Stability</button>
         </div>
       </div>
+      <div class="field" id="cut-field">
+        <label for="cut-range">Clusters (k)</label>
+        <div class="cut-row">
+          <input type="range" id="cut-range" min="0" max="0" step="1" value="0"
+                 aria-label="Number of clusters in the cut">
+          <output id="cut-value">—</output>
+          <button class="ghost" id="cut-reset" type="button" title="Back to the cut the run selected">chosen</button>
+        </div>
+        <p class="hint" id="cut-hint">every cut of the same Ward tree — the run selected one of them</p>
+      </div>
+
       <div class="check-list">
         <label class="check"><input type="checkbox" id="toggle-noise" checked> Show noise (label −1)</label>
         <label class="check"><input type="checkbox" id="toggle-bg" checked> Show scene background</label>
@@ -205,9 +216,39 @@
             <div class="stats-chart" id="stats-curves"></div>
             <div class="stats-legend" id="stats-curve-legend"></div>
           </section>
+          <section class="stats-block" id="stats-fitdata-block">
+            <h3>Fit against the data <span class="muted">&mdash; does the curve follow the attempts?</span></h3>
+            <p class="stats-cap" id="stats-fitdata-cap"></p>
+            <div class="stats-fitdata-row-label">Pooled: every attempt, binned</div>
+            <div class="stats-multiples stats-five" id="stats-fitdata-pooled"></div>
+            <div class="stats-fitdata-row-label" id="stats-fitdata-partial-label">Partial residuals: each attempt with its own scene's (and route's) effect removed</div>
+            <div class="stats-multiples stats-five" id="stats-fitdata-within"></div>
+            <div class="stats-legend" id="stats-fitdata-legend"></div>
+          </section>
+          <section class="stats-block" id="stats-spaghetti-block">
+            <h3>One line per <span id="stats-spaghetti-unit">scene</span> <span class="muted">&mdash; the model scene by scene</span></h3>
+            <p class="stats-cap" id="stats-spaghetti-cap"></p>
+            <div class="seg stats-inline-seg" id="stats-spaghetti-subject" role="group" aria-label="subject"></div>
+            <div class="stats-multiples stats-six" id="stats-spaghetti"></div>
+            <div class="stats-legend" id="stats-spaghetti-legend"></div>
+          </section>
           <section class="stats-block">
             <h3>Results table</h3>
+            <p class="stats-cap" id="stats-table-cap"></p>
             <div class="stats-table-wrap"><table class="stats-table" id="stats-table"></table></div>
+          </section>
+          <section class="stats-block" id="stats-checks-block">
+            <h3>Assumption checks <span class="muted">&mdash; can the model's CIs be trusted?</span></h3>
+            <p class="stats-cap" id="stats-checks-cap"></p>
+            <div class="stats-table-wrap"><table class="stats-table stats-checks" id="stats-checks"></table></div>
+            <details class="stats-details" id="stats-checks-subj-wrap">
+              <summary>Numbers per subject</summary>
+              <div class="stats-table-wrap"><table class="stats-table" id="stats-checks-subj"></table></div>
+            </details>
+            <details class="stats-details" id="stats-checks-fig-wrap">
+              <summary>Full diagnostic figure (one row per check, one column per subject)</summary>
+              <img id="stats-checks-fig" alt="Residual and random-effect diagnostic figure">
+            </details>
           </section>
           <p class="note" id="stats-note"></p>
         </div>

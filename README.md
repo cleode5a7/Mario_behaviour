@@ -85,7 +85,7 @@ uv run invoke run-cluster-audit                  # what made the current cluster
 uv run invoke run-cluster-sweep --scenes w1l1s0  # score the parameter grid for one scene
 uv run invoke select-cluster-params              # choose one setting corpus-wide
 uv run invoke run-clustering --smoke              # first scene only
-uv run invoke run-clustering-by-category --smoke  # first category only
+uv run invoke run-clustering-by-category --smoke  # smallest category (fewest scenes)
 uv run invoke run-web-export --scenes w1l1s0      # export one scene for the dashboard
 uv run invoke run-web-export --backfill           # add derived fields to existing payloads (seconds)
 ```

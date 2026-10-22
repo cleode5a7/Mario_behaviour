@@ -303,7 +303,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
                                     raise it to get fewer, merged clusters
         recompute_frechet:          force recompute of the cached distance matrix
     """
-    from analysis.clustering import list_categories, category_slug, run_clustering_by_category as _run_clustering_by_category
+    from analysis.clustering import list_categories, category_slug, smallest_category, run_clustering_by_category as _run_clustering_by_category
 
     source_dir = Path(c.config.get("source_data_dir"))
     output_dir = Path(c.config.get("output_data_dir")) / "clusters_by_category"
@@ -314,7 +314,7 @@ def run_clustering_by_category(c, categories=None, smoke=False, method="hdbscan"
         print("No scene categories found — check source_data/scenes_mastersheet.csv.")
         return
     if smoke:
-        all_categories = all_categories[:1]
+        all_categories = [smallest_category(source_dir)]   # fewest scenes, not the first tag
     if categories:
         all_categories = categories.split(",")
 
@@ -888,7 +888,7 @@ def run_smoke(c):
     run_changepoints(c, smoke=True)             # first subject, first 500 attempts
     run_changepoints_by_category(c, smoke=True)  # first subject, per category
     run_clustering(c, smoke=True)                # first scene only
-    run_clustering_by_category(c, smoke=True)    # first category only
+    run_clustering_by_category(c, smoke=True)    # smallest category (fewest scenes)
     run_practice_distances(c, smoke=True)        # medoid distances, first scene
     run_practice_models(c, smoke=True)           # practice models on what exists
     run_practice_lme4(c, smoke=True)             # primary lme4 model (skips without R)

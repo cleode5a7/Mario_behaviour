@@ -47,6 +47,22 @@ def list_categories(source_dir: Path) -> list[str]:
     return sorted(load_scene_patterns(source_dir)["pattern"].unique().tolist())
 
 
+def smallest_category(source_dir: Path) -> str | None:
+    """The category tagging the fewest scenes (ties alphabetical) — the ``--smoke`` target.
+
+    Pooled cost grows with the square of the trace count, so a smoke run must not take
+    the alphabetically first tag: that is ``2-Horde`` (41 scenes, ~7,000 traces, ~25M
+    Fréchet pairs), which ran for over a day. Scene count needs only the mastersheet and
+    tracks trace count closely. Today that picks ``Enemy stair valley``: 1 scene, ~170
+    traces (it ties with ``Gap stair valley`` on scenes and wins alphabetically).
+    """
+    patterns = load_scene_patterns(source_dir)
+    if patterns.empty:
+        return None
+    counts = patterns.groupby("pattern")["scene_id"].nunique()
+    return min(counts.index, key=lambda c: (counts[c], c))
+
+
 def category_slug(category: str) -> str:
     """Filesystem-safe slug for a category name, e.g. 'Gap stair valley' -> 'gap_stair_valley'."""
     return category.lower().replace(" ", "_").replace("/", "-")

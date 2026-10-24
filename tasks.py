@@ -652,6 +652,33 @@ def run_practice_lme4_effects(c, smoke=False, force=False, cores=None):
     output_dir = Path(c.config.get("output_data_dir"))
     _run(output_dir, smoke=smoke, force=force, n_cores=int(cores) if cores else None)
 
+
+@task
+def run_practice_route_checks(c, smoke=False, force=False, cores=None):
+    """Is the route-scale decrease a scene effect or a route effect, and is it curved?
+
+    Fits the route-scale data (log distance to the attempt's own route prototype against
+    log nth use of that route) per subject at three corrections: pooled (least squares),
+    scene (level + scene random effects, no route effect) and route (lme4_route.json's
+    model), each linear on log-log axes and with a log(use)^2 term, compared by AIC and a
+    likelihood-ratio test, with BH-FDR p across subjects. Writes
+    output_data/practice/route_checks.json; stops if the route fit does not reproduce
+    lme4_route.json. Needs R with lme4; without Rscript it says so and skips. --smoke fits
+    two scenes from each of the first three levels into route_checks_smoke.json; --cores
+    sets R's parallel workers (default: all but one).
+    """
+    from analysis.practice import practice_dir, run_practice_route_checks as _run
+    from analysis.route_usage import smoke_scenes
+
+    output_dir = Path(c.config.get("output_data_dir"))
+    files = sorted((practice_dir(output_dir) / "attempts").glob("*.csv"))
+    if not files:
+        print("No attempt distances — run invoke run-practice-distances first.")
+        return
+    scenes = smoke_scenes([f.stem for f in files]) if smoke else None
+    _run(output_dir, scenes=scenes, force=force, n_cores=int(cores) if cores else None)
+
+
 @task
 def run_route_usage(c, subjects=None, smoke=False, null_reps=200, bootstraps=200, seed=0,
                     force=False, cores=None):
@@ -848,7 +875,7 @@ def run_notebooks(c):
     airoh_run_notebooks(c, notebooks_dir, output_dir, keys=["source_data_dir", "output_data_dir"])
 
 
-@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_practice_lme4, run_practice_lme4_effects, run_route_usage, run_web_export, run_notebooks])
+@task(pre=[fetch, run_changepoints, run_changepoints_by_category, run_clustering, run_clustering_by_category, run_practice_distances, run_practice_models, run_practice_lme4, run_practice_lme4_effects, run_practice_route_checks, run_route_usage, run_web_export, run_notebooks])
 def run(c):
     """Full pipeline.
 
@@ -860,7 +887,8 @@ def run(c):
 
     record_run(c, tasks="fetch,run-changepoints,run-changepoints-by-category,"
                         "run-clustering,run-clustering-by-category,run-practice-distances,"
-                        "run-practice-models,run-practice-lme4,run-practice-lme4-effects,run-route-usage,"
+                        "run-practice-models,run-practice-lme4,run-practice-lme4-effects,"
+                        "run-practice-route-checks,run-route-usage,"
                         "run-web-export,run-notebooks")
     print("Pipeline complete.")
 
@@ -893,6 +921,7 @@ def run_smoke(c):
     run_practice_models(c, smoke=True)           # practice models on what exists
     run_practice_lme4(c, smoke=True)             # primary lme4 model (skips without R)
     run_practice_lme4_effects(c, smoke=True)     # partial residuals (skips without ggeffects)
+    run_practice_route_checks(c, smoke=True)     # scene vs route effects, curvature (skips without R)
     run_route_usage(c, smoke=True)               # route-usage model (skips fits without R)
     run_web_export(c, smoke=True)                # dashboard payload, first scene
     run_notebooks(c)
@@ -992,6 +1021,21 @@ def clean_practice_lme4_effects(c):
     else:
         print("No lme4 effects to clean.")
 
+
+@task
+def clean_practice_route_checks(c):
+    """Remove the route-scale checks (practice/route_checks.json and its smoke twin)."""
+    from analysis.practice import practice_dir
+
+    pdir = practice_dir(Path(c.config.get("output_data_dir")))
+    removed = [f for f in (pdir / "route_checks.json", pdir / "route_checks_smoke.json") if f.exists()]
+    for f in removed:
+        f.unlink()
+        print(f"Removed {f}")
+    if not removed:
+        print("No route checks to clean.")
+
+
 @task
 def clean_route_usage(c):
     """Remove route-usage outputs (cells, models and figures)."""
@@ -1019,7 +1063,7 @@ def clean_frechet(c):
         print("No cached Fréchet matrices to clean.")
 
 
-@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_practice_lme4_effects, clean_practice, clean_route_usage, clean_frechet])
+@task(pre=[clean_changepoints, clean_changepoints_by_category, clean_clustering, clean_clustering_by_category, clean_web_export, clean_stability, clean_coassociation, clean_practice_lme4_effects, clean_practice_route_checks, clean_practice, clean_route_usage, clean_frechet])
 def clean(c):
     """Remove all computed outputs."""
     pass

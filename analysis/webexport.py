@@ -506,6 +506,7 @@ def practice_bh(output_dir: Path) -> dict | None:
 MODEL_BOOTSTRAPS = {
     "lme4_nested": [("practice_lme4_level_bootstrap", "level bootstrap of this model")],
     "lme4_route": [("practice_route_level_bootstrap", "level bootstrap of this model")],
+    "route_scene": [("practice_route_scene_level_bootstrap", "level bootstrap of this model")],
     "scene": [("practice_scene_bootstrap", "scene bootstrap"),
               ("practice_level_bootstrap", "level bootstrap")],
 }
@@ -538,7 +539,8 @@ def practice_bootstraps(docs_dir: Path = DOCS_DIR) -> dict | None:
             entries.append({"label": label, "file": f"docs/{stem}.csv",
                             "rows": json.loads(d.to_json(orient="records"))})
         if entries:
-            out[model] = {"measure": "d_own_loso" if model == "lme4_route" else "d_nearest_norm_loso",
+            out[model] = {"measure": ("d_own_loso" if model in ("lme4_route", "route_scene")
+                                      else "d_nearest_norm_loso"),
                           "runs": entries}
     return out or None
 
@@ -739,7 +741,8 @@ def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     ``mixed.json`` (the statsmodels models), and when present ``lme4.json`` (the primary,
     scene-scale model) as ``lme4``, ``lme4_route.json`` (the route-scale model) as
     ``lme4_route``, ``nested.json`` (statsmodels nested structures) as
-    ``nested``, ``practice_summary()`` (every CI and p-value) as ``summary``,
+    ``nested``, ``route_checks.json`` (the route-scale data under pooled / scene / route
+    corrections, linear and quadratic) as ``route_checks``, ``practice_summary()`` (every CI and p-value) as ``summary``,
     ``practice_bh()`` (every BH-FDR adjusted p, from statsmodels via ``mixed_summary.csv``)
     as ``bh``, ``practice_bootstraps()`` (the CI-check bootstraps per model) as
     ``bootstraps``, and ``assumption_checks()`` as ``diagnostics`` (the diagnostic figures are copied to
@@ -758,7 +761,7 @@ def export_practice(output_dir: Path, web_dir: Path) -> Path | None:
     mixed = json.loads(src.read_text())
     payload = {k: v for k, v in mixed.items() if k != "scenes"}
     payload["n_scenes"] = len(mixed.get("scenes", []))
-    for name in ("lme4", "lme4_route", "nested"):
+    for name in ("lme4", "lme4_route", "nested", "route_checks"):
         path = pdir / f"{name}.json"
         if path.exists():
             payload[name] = {k: v for k, v in json.loads(path.read_text()).items() if k != "scenes"}

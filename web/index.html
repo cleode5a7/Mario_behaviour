@@ -28,8 +28,9 @@
           <button data-value="scene" aria-pressed="false">Scene only (statsmodels)</button>
           <button data-value="level_scene" aria-pressed="false">Nested, no scene corr. (statsmodels)</button>
           <button data-value="lme4_route" aria-pressed="false">Route scale (lme4) &mdash; main</button>
+          <button data-value="route_scene" aria-pressed="false">Own route, scene &amp; level effects only (lme4)</button>
         </div>
-        <p class="hint">the two scales are the main results: scene scale is distance to the nearest route prototype against attempt number (scenes in levels); route scale is distance to the attempt's own route prototype against nth use of that route (routes in scenes in levels). The nested models are log form only, and each scale has one measure; the scene-only model has every form and measure</p>
+        <p class="hint">the two scales are the main results: scene scale is distance to the nearest route prototype against attempt number (scenes in levels); route scale is distance to the attempt's own route prototype against nth use of that route (routes in scenes in levels). "Own route, scene &amp; level effects only" is the same data with no route effect: scene and level differences removed, route differences left in the slope. The nested models are log form only, and each scale has one measure; the scene-only model has every form and measure</p>
       </div>
       <div class="field">
         <label for="stats-measure-seg">Measure</label>
@@ -239,6 +240,19 @@
             <div class="seg stats-inline-seg" id="stats-spaghetti-subject" role="group" aria-label="subject"></div>
             <div class="stats-multiples stats-six" id="stats-spaghetti"></div>
             <div class="stats-legend" id="stats-spaghetti-legend"></div>
+          </section>
+          <section class="stats-block" id="stats-rchk-block">
+            <h3>Scene effects or route effects? <span class="muted">&mdash; and is the decrease curved?</span></h3>
+            <p class="stats-cap" id="stats-rchk-cap"></p>
+            <div class="stats-table-wrap"><table class="stats-table" id="stats-rchk-table"></table></div>
+            <div class="seg stats-inline-seg" data-axis-units role="group" aria-label="axis labels">
+              <button type="button" data-units="units" aria-pressed="true">axis labels: uses &amp; distance</button>
+              <button type="button" data-units="ln" aria-pressed="false">axis labels: ln (model scale)</button>
+            </div>
+            <div class="stats-multiples stats-five" id="stats-rchk-panels"></div>
+            <div class="stats-legend" id="stats-rchk-legend"></div>
+            <p class="stats-cap" id="stats-rchk-quad-cap"></p>
+            <div class="stats-table-wrap"><table class="stats-table" id="stats-rchk-quad"></table></div>
           </section>
           <section class="stats-block">
             <h3>Results table</h3>

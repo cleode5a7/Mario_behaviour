@@ -242,6 +242,21 @@ The practice effect, measured as distance to cluster medoids. Written by
   level:scene:route)` per subject × transform × all/completed attempts. Same fields as
   `lme4.json` (Wald CIs: `ci_method` `wald`), plus `n_routes` and route-level variances
   (`route_var_*`); its `curve` is on the nth-use axis (`use`, mirrored in `attempt`).
+- `route_checks.json` — from `invoke run-practice-route-checks` (`analysis/practice_route_checks.R`):
+  the route-scale model's own rows (`route_frame()`) fitted per subject × `d_own`/`d_own_loso` ×
+  transform × all/completed at four `correction`s — `pooled` (least squares, no random
+  effects; its SEs treat attempts as independent), `scene` (`(1 + log_use | level) + (1 +
+  log_use | level:scene)`, no route effect), `route_int` (`scene` + `(1 | level:scene:route)`,
+  route intercepts only) and `route` (the `lme4_route.json` model, checked
+  to reproduce it: `max_gap_vs_lme4_route`) — each with `shape` `linear` and `quadratic`
+  (`+ log_use^2`, fixed only). Per fit: `intercept`, `b`, `se`, Wald CI, `p_wald`, `b2`/`se2`/
+  `p2_wald`, `aic`, `loglik`, `singular`, the local slope and its SE at uses 1/5/20/50
+  (`slope_at_<u>`, `slope_se_at_<u>`), the quadratic-vs-linear likelihood-ratio test
+  (`lrt_chisq`, `lrt_p`, on the quadratic row), BH-FDR across subjects (`p_bh`, `lrt_p_bh`)
+  and the fixed-effect `curve` on the nth-use axis. A `--smoke` run writes
+  `route_checks_smoke.json` beside it.
+- `figure_practice_route_checks.png` — from `figure_practice.ipynb`: per subject, the pooled
+  route-scale bins under every line of `route_checks.json` (primary setting).
 - `lme4_effects/` — from `invoke run-practice-lme4-effects` (`analysis/practice_lme4_effects.R`),
   which refits every fit in `lme4.json` (nested model) and `lme4_route.json` and checks the
   refit reproduces the stored coefficients. Not tracked in git (~18 MB, regenerated).
@@ -403,7 +418,7 @@ figures above, with scene / subject / phase / stage / outcome filters. Written b
   `analysis.webexport.export_practice`, floats rounded to 6 decimals and the `scenes`
   list reduced to `n_scenes`, with `practice/lme4.json` as `lme4`, `practice/lme4_route.json` as
   `lme4_route`, `practice/nested.json` as
-  `nested`, and `summary` — every CI and p-value for the primary measure (lme4 with
+  `nested`, `practice/route_checks.json` as `route_checks`, and `summary` — every CI and p-value for the primary measure (lme4 with
   BH-FDR adjusted p, scene-only model, statsmodels nested, and the scene and level bootstraps read
   from `docs/practice_*_bootstrap*.csv` when present), per transform and subject, `bh` —
   every BH-FDR adjusted slope p from `mixed_summary.csv`'s `slope_p_bh`, keyed

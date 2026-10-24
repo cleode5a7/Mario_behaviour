@@ -531,6 +531,60 @@ clear), so the scene-scale headline moves from "3 clear + sub-03 borderline" to 
 clear after correction**. The Holm figures in the sections above are left as they were
 reported at the time. Code: `_bh_by_family()` in `analysis/practice.py` calls `statsmodels.stats.multitest.multipletests(method="fdr_bh")` and writes `slope_p_bh` to `mixed_summary.csv`; the dashboard, the summary figure and the notebook read that column (the notebook calls `multipletests` itself) rather than adjusting again.
 
+## Scene effects or route effects, and the shape of the route-scale decrease (2026-10-23)
+
+The route-scale fit-check plot shows a steep pooled decrease and a nearly flat within-route
+line. The supervisor read this as route selection driving most of the effect and asked two
+things: is the pooled decrease robust to scene effects, and is it better described by a
+quadratic than a straight line on log-log axes? `invoke run-practice-route-checks` fits the
+route model's own rows at three corrections (pooled least squares; level + scene random
+intercepts and slopes, no route effect; + route effects, the route-scale model), each linear
+and with a fixed `log(use)^2` term. Primary setting (`d_own_loso`, `log`, all attempts), change
+per doubling of uses:
+
+| subject | pooled | scene + level | + route |
+|---|---|---|---|
+| 01 | −7.8% | −4.3% [−6.6, −2.0] | −0.6% [−1.7, +0.6] |
+| 02 | −9.6% | −6.0% [−8.1, −3.8] | −1.6% [−2.6, −0.6] |
+| 03 | −10.5% | −9.7% [−13.2, −6.2] | −2.3% [−4.2, −0.4] |
+| 05 | −7.0% | −8.7% [−11.8, −5.5] | −3.1% [−4.5, −1.8] |
+| 06 | −12.0% | −7.9% [−10.0, −5.7] | −2.9% [−4.2, −1.6] |
+
+**The pooled decrease survives scene effects** for all five (BH p ≤ 0.0003); scenes take away
+part of it for 01, 02 and 06 and almost none for 03 and 05. Most of it goes only when routes
+are separated, so it is a difference between routes in the same scene. Adding route effects
+lowers AIC by 5,500-8,400 per subject. **The quadratic adds nothing consistent**: with scene
+effects, ΔAIC (quadratic − linear) is +1.4, +1.4, −1.6, −0.6, −4.4, the bend goes both ways
+(flattening for 01/02/06, steepening for 03/05), and no curvature test survives BH (smallest
+0.056, sub-06); with route effects, all BH p ≥ 0.12. Pooled, sub-05 is strongly curved
+(ΔAIC −83) and 02/03 mildly, but that test treats attempts as independent. A straight line
+on log-log axes stays the model. Wald CIs, no bootstrap yet; the curvature is a fixed effect
+only. Dashboard: Stats → route-scale model → *Scene effects or route effects?*; figure
+`output_data/practice/figure_practice_route_checks.png`.
+
+**Level bootstrap of the scene & level model (2026-10-24).** That model leaves the route out,
+so attempts on one route are correlated and nothing in it says so, which could make its
+Wald CI too narrow. `uv run python docs/practice_route_bootstrap.py scene` resamples whole
+levels (B=200, seed 0, 14 min on 11 cores) and refits it: bootstrap CIs are **0.88-1.03x**
+the model's width under `log(d)` (0.87-1.06x under `log1p`), every CI still excludes 0, no
+call changes. Written to `docs/practice_route_scene_level_bootstrap.csv` (+ `_draws.csv`);
+shown in the dashboard's *CI check by bootstrap* for the model `route_scene`, which is now
+selectable in the Model control with its own results table.
+
+**Route intercepts only (2026-10-24).** Is the decrease structure (some routes are simply
+tighter) or change along a route? A fourth step, `route_int`, adds a random intercept per
+route to the scene & level model, with no route slope: routes may differ in how tight they
+are but improve at the same rate. Per doubling: 01 −0.2% [−1.6, +1.1], 02 −1.5% [−2.6, −0.5],
+03 −2.2% [−4.2, −0.1], 05 −3.1% [−4.3, −1.8], 06 −2.8% [−4.0, −1.5] (BH 0.72, 0.005, 0.056,
+<0.0001, <0.0001), almost the same as the full route model (−0.6 to −3.1%). Route baselines
+alone take out nearly all of what separates the scene & level model from the route model,
+and lower AIC by 5,500-8,300; adding route slopes lowers it by a further 5.5-52 (routes do
+differ in their rate of improvement), but moves the average slope by at most 0.4 points.
+So the decrease is mostly structural, and what is left is a small within-route improvement:
+clear for 02, 05 and 06, borderline for 03 (0.056 here, 0.021 in the route model), absent
+for 01. With no route slopes this model's CI may be too narrow; the route model stays the
+within-route estimate.
+
 ## Where everything is
 
 **Start with `docs/practice_summary.png`**: every confidence interval for the scene-scale result in
@@ -545,6 +599,7 @@ Regenerate with `uv run python docs/practice_summary_plot.py` (seconds; no refit
 | **scene-scale model (lme4)** | `output_data/practice/lme4.json` (and its `lme4_nested` rows in `mixed_summary.csv`); `invoke run-practice-lme4`, code `analysis/practice_lme4.R` |
 | **route-scale model (lme4)** | `output_data/practice/lme4_route.json` (rows `lme4_route` in `mixed_summary.csv`); code `analysis/practice_lme4_route.R` |
 | its assumption checks | `docs/practice_residual_diagnostics_route_log.png` / `_route_log1p.png` (+ `.csv`); residuals and simplified refits from `docs/practice_lme4_route_resid.R` into `docs/practice_route_simplified.csv`; level bootstrap `docs/practice_route_level_bootstrap.csv` (+ `_draws.csv`) from `docs/practice_route_bootstrap.py` / `docs/practice_lme4_route_boot.R` |
+| scene vs route effects, quadratic check | `output_data/practice/route_checks.json`; `invoke run-practice-route-checks`, code `analysis/practice_route_checks.R`; figure `output_data/practice/figure_practice_route_checks.png` |
 | its assumption checks | `docs/practice_residual_diagnostics_lme4_log.png` / `_lme4_log1p.png` (+ `.csv`); residuals from `docs/practice_lme4_resid.R` |
 | model code | `analysis/practice.py` (`fit_mixed`, `TRANSFORMS`, `PRIMARY_TRANSFORM`) |
 | all fits, both transforms | `output_data/practice/mixed.json` |

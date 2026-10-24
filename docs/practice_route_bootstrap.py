@@ -8,6 +8,13 @@ and compares the percentile CI of the replicate slopes with the model's own CI â
 the route-scale diagnostics ("does it matter?"). Run on the main measure,
 ``d_own_loso``, all attempts, both transforms.
 
+With ``scene`` it bootstraps the same data's model **without** the route term, the own-route
+model with scene and level effects only (``route_checks.json``, ``correction == "scene"``,
+linear; the dashboard's ``route_scene``). Its Wald CI is the one most at risk: attempts on one
+route are correlated and the model has no term for it. Resampling whole levels carries that
+correlation into the bootstrap CI. Writes ``docs/practice_route_scene_level_bootstrap.csv``
+(+ ``_draws.csv``) instead.
+
 Writes ``docs/practice_route_level_bootstrap.csv`` (one row per subject x transform, in the
 same columns as ``docs/practice_level_bootstrap.csv``) and
 ``docs/practice_route_level_bootstrap_draws.csv`` (every replicate slope). Reads only
@@ -15,6 +22,7 @@ same columns as ``docs/practice_level_bootstrap.csv``) and
 
     uv run python docs/practice_route_bootstrap.py              # B=200, both transforms
     uv run python docs/practice_route_bootstrap.py 50 log       # quicker, one transform
+    uv run python docs/practice_route_bootstrap.py scene        # the scene & level-only model
 """
 
 import json
@@ -37,28 +45,39 @@ SEED = 0
 SUMMARY = HERE / "practice_route_level_bootstrap.csv"
 DRAWS = HERE / "practice_route_level_bootstrap_draws.csv"
 ROUTE_FITS = HERE.parent / "output_data" / "practice" / "lme4_route.json"
+CHECK_FITS = HERE.parent / "output_data" / "practice" / "route_checks.json"
+SCENE_SUMMARY = HERE / "practice_route_scene_level_bootstrap.csv"
+SCENE_DRAWS = HERE / "practice_route_scene_level_bootstrap_draws.csv"
 
 
 def main():
     args = sys.argv[1:]
     n_boot = next((int(a) for a in args if a.isdigit()), 200)
     transforms = [a for a in args if a in TRANSFORMS] or list(TRANSFORMS)
+    scene_only = "scene" in args
+    summary_path, draws_path = (SCENE_SUMMARY, SCENE_DRAWS) if scene_only else (SUMMARY, DRAWS)
     n_cores = max(1, (os.cpu_count() or 2) - 1)
 
     df = load_attempts(Path("output_data"))
     subjects = sorted(df["subject"].unique())
     frames = pd.concat([route_frame(df, MEASURE, s, False, t)
                         for t in transforms for s in subjects], ignore_index=True)
-    print(f"Route-scale level bootstrap: B={n_boot}, {len(subjects)} subjects x "
+    print(f"{'Own-route scene & level' if scene_only else 'Route-scale'} level bootstrap: B={n_boot}, {len(subjects)} subjects x "
           f"{len(transforms)} transform(s), {n_cores} cores")
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         frames.drop(columns="n_zero_dropped").to_csv(tmp / "frames.csv", index=False)
         subprocess.run(["Rscript", str(HERE / "practice_lme4_route_boot.R"), str(tmp / "frames.csv"),
-                        str(tmp / "draws.csv"), str(n_boot), str(SEED), str(n_cores)], check=True)
+                        str(tmp / "draws.csv"), str(n_boot), str(SEED), str(n_cores),
+                        *(["scene"] if scene_only else [])], check=True)
         draws = pd.read_csv(tmp / "draws.csv", dtype={"subject": str})
 
-    fits = json.loads(ROUTE_FITS.read_text())["fits"]
+    if scene_only:   # the model's own fit and Wald CI, from run-practice-route-checks
+        fits = [{**f, "ci": [f["wald_low"], f["wald_high"]]}
+                for f in json.loads(CHECK_FITS.read_text())["fits"]
+                if f["correction"] == "scene" and f["shape"] == "linear"]
+    else:
+        fits = json.loads(ROUTE_FITS.read_text())["fits"]
     rows = []
     for (t, s), g in draws.groupby(["transform", "subject"]):
         f = next(x for x in fits if x["measure"] == MEASURE and x["subject"] == s
@@ -81,12 +100,12 @@ def main():
                                       "level"].nunique()),
         })
     summary = pd.DataFrame(rows)
-    summary.round(5).to_csv(SUMMARY, index=False)
-    draws.to_csv(DRAWS, index=False)
+    summary.round(5).to_csv(summary_path, index=False)
+    draws.to_csv(draws_path, index=False)
     print(summary[["transform", "subject", "b", "model_ci_low", "model_ci_high", "boot_ci_low",
                    "boot_ci_high", "width_ratio", "model_excludes_zero", "boot_excludes_zero"]]
           .round(4).to_string(index=False))
-    print(f"Wrote {SUMMARY.name} and {DRAWS.name}")
+    print(f"Wrote {summary_path.name} and {draws_path.name}")
 
 
 if __name__ == "__main__":

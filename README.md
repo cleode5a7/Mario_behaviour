@@ -46,6 +46,7 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `run-practice-models`         | Model the practice effect on those distances: per-series curve comparison (linear/quadratic/power/exponential), one mixed model per subject, strategy-switch trend |
 | `run-practice-lme4`           | Fit the two main practice models in R's lme4 — scene scale (nearest prototype, scenes nested in levels) and route scale (own route's prototype, routes nested in scenes and levels); needs R with lme4, skips without it |
 | `run-practice-lme4-effects`   | Refit the stored lme4 models for their partial residuals (via `ggeffects`) and each level's, scene's and route's own line — the data behind the fit-check and per-scene (spaghetti) plots; needs R with lme4 and ggeffects, skips without them |
+| `run-practice-route-checks`   | The route-scale data fitted at three corrections — pooled, scene + level effects, + route effects — each linear on log-log axes and with a quadratic term: is the pooled decrease a scene or a route effect, and is it curved? Needs R with lme4, skips without it |
 | `run-route-usage`             | Model route usage per subject: does route choice concentrate across early/late discovery and practice? (unbiased Simpson index + rarefied Shannon check, in R's lme4; skips the fits without R) |
 | `run-web-export`              | Export clustered traces to a static payload for the interactive dashboard |
 | `dashboard`                   | Serve the interactive clustering and stats dashboard on `localhost` (needs `run-web-export`) |
@@ -64,6 +65,7 @@ Creates a `.venv` and installs all dependencies from `pyproject.toml`.
 | `clean-coassociation`         | Remove `output_data/coassociation/`                                      |
 | `clean-practice`              | Remove `output_data/practice/`                                           |
 | `clean-practice-lme4-effects` | Remove `output_data/practice/lme4_effects/`                              |
+| `clean-practice-route-checks` | Remove `output_data/practice/route_checks.json` (and its smoke twin)  |
 | `clean-route-usage`           | Remove `output_data/route_usage/`                                        |
 | `clean-frechet`               | Remove cached Fréchet distance matrices (kept separate so re-clustering reuses them) |
 | `clean`                       | Remove all computed outputs                                              |

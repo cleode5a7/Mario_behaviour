@@ -1286,6 +1286,111 @@ def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> 
         print(f"Rewrote {pdir}/mixed_summary.csv with the lme4 rows.")
 
 
+# Checks on the route-scale effect (analysis/practice_route_checks.R): the route plot's data
+# under three corrections, each linear on log-log axes and with a quadratic in log(use).
+ROUTE_CHECKS_SCRIPT = Path(__file__).with_name("practice_route_checks.R")
+ROUTE_CHECKS_DESIGN = "v2"   # v2: adds route_int (route random intercepts only)
+ROUTE_CHECK_CORRECTIONS = ("pooled", "scene", "route_int", "route")
+ROUTE_CHECK_FAMILY = ["measure", "transform", "completed_only", "correction", "shape"]
+ROUTE_CHECK_TOLERANCE = 1e-4   # route/linear must reproduce lme4_route.json's slope
+
+
+def run_practice_route_checks(output_dir, *, scenes=None, force=False, n_cores=None) -> None:
+    """Is the route-scale decrease a scene effect, a route effect, and is it curved?
+
+    Fits ``route_frame()``'s rows (the route-scale model's own data: distance in px to the
+    attempt's own route prototype against the nth use of that route) per subject x
+    ``ROUTE_MEASURES`` x ``TRANSFORMS`` x all/completed attempts, at three corrections:
+    ``pooled`` (plain least squares, no random effects: the line through the pooled plot),
+    ``scene`` (level and scene random intercepts and slopes, no route effect), ``route_int``
+    (plus a random intercept per route: routes differ only in how tight they are) and
+    ``route`` (plus a random slope per route too: ``lme4_route.json``'s model). Each is fitted linear in
+    ``log(use)`` and with a ``log(use)^2`` term, compared by AIC and a 1-df likelihood-ratio
+    test. Writes ``practice/route_checks.json``: every fit's coefficients, Wald CIs, the
+    local slope at uses 1/5/20/50, its curve, and Benjamini-Hochberg p across the five
+    subjects (``p_bh`` for the slope, ``lrt_p_bh`` for the curvature), per
+    ``ROUTE_CHECK_FAMILY``. Stops if the ``route`` linear fit does not reproduce
+    ``lme4_route.json`` to ``ROUTE_CHECK_TOLERANCE``. Skips when already fitted on these
+    scenes; a subset run (``scenes``) writes ``route_checks_smoke.json`` instead and never
+    replaces the full file. Needs R with lme4; without ``Rscript`` it says so and returns.
+    """
+    import os
+    import shutil
+
+    from statsmodels.stats.multitest import multipletests
+
+    output_dir = Path(output_dir)
+    pdir = practice_dir(output_dir)
+    out_path = pdir / ("route_checks.json" if scenes is None else "route_checks_smoke.json")
+    if shutil.which("Rscript") is None:
+        print("Rscript not found — skipping the route checks. Install R and lme4 "
+              "(e.g. sudo apt install r-base r-cran-lme4) and rerun invoke run-practice-route-checks.")
+        return
+    df = load_attempts(output_dir, scenes)
+    used = sorted(df["scene"].unique())
+    if out_path.exists() and not force:
+        prev = json.loads(out_path.read_text())
+        if prev.get("scenes") == used and prev.get("design") == ROUTE_CHECKS_DESIGN:
+            print("Route checks already fitted on these scenes, skipping (use --force to refit).")
+            return
+    subjects = sorted(df["subject"].unique())
+    n_cores = n_cores or max(1, (os.cpu_count() or 2) - 1)
+    frames = pd.concat([route_frame(df, measure, s, completed_only, transform)
+                        for measure in ROUTE_MEASURES for transform in TRANSFORMS
+                        for completed_only in (False, True) for s in subjects], ignore_index=True)
+    n_groups = frames.groupby(["measure", "subject", "transform", "completed_only"]).ngroups
+    print(f"Fitting the route checks: {n_groups} fits x {2 * len(ROUTE_CHECK_CORRECTIONS)} models "
+          f"on {n_cores} cores...")
+    fits, curves = _run_lme4_script(ROUTE_CHECKS_SCRIPT, frames.drop(columns="n_zero_dropped"),
+                                    n_cores)
+
+    fits["p_bh"] = np.nan
+    fits["lrt_p_bh"] = np.nan
+    for _, g in fits.groupby(ROUTE_CHECK_FAMILY):
+        fits.loc[g.index, "p_bh"] = multipletests(g["p_wald"].to_numpy(), method="fdr_bh")[1]
+        if g["lrt_p"].notna().all():
+            fits.loc[g.index, "lrt_p_bh"] = multipletests(g["lrt_p"].to_numpy(), method="fdr_bh")[1]
+
+    route_path = pdir / "lme4_route.json"
+    max_gap = None
+    if scenes is None and route_path.exists():
+        stored = {(f["measure"], f["subject"], f["transform"], f["completed_only"]): f["b"]
+                  for f in json.loads(route_path.read_text())["fits"]}
+        mine = fits[(fits["correction"] == "route") & (fits["shape"] == "linear")]
+        gaps = [abs(r.b - stored[(r.measure, r.subject, r.transform, bool(r.completed_only))])
+                for r in mine.itertuples()
+                if (r.measure, r.subject, r.transform, bool(r.completed_only)) in stored]
+        max_gap = max(gaps) if gaps else None
+        if max_gap is not None and max_gap > ROUTE_CHECK_TOLERANCE:
+            raise RuntimeError(f"route/linear differs from lme4_route.json by {max_gap:.1e} — "
+                               "rerun invoke run-practice-lme4 --force first")
+
+    keys = ["measure", "subject", "transform", "completed_only", "correction", "shape"]
+    records = []
+    for _, r in fits.iterrows():
+        rec = {k: _nan_to_none(v.item() if hasattr(v, "item") else v) for k, v in r.items()}
+        rec["warnings"] = rec.get("warnings") or ""
+        c = curves[(curves[keys] == pd.Series({k: rec[k] for k in keys})).all(axis=1)]
+        rec["curve"] = {"use": c["use"].astype(int).tolist(), "y": c["y"].tolist()}
+        records.append(rec)
+    out_path.write_text(json.dumps({
+        "design": ROUTE_CHECKS_DESIGN, "primary": "d_own_loso", "primary_transform": PRIMARY_TRANSFORM,
+        "clock": "nth use of the route (cluster_use)",
+        "formulas": {
+            "pooled": "y ~ log_use (least squares, no random effects)",
+            "scene": "y ~ log_use + (1 + log_use | level) + (1 + log_use | level:scene)",
+            "route_int": ("y ~ log_use + (1 + log_use | level) + (1 + log_use | level:scene)"
+                          " + (1 | level:scene:route)"),
+            "route": ("y ~ log_use + (1 + log_use | level) + (1 + log_use | level:scene)"
+                      " + (1 + log_use | level:scene:route)"),
+            "quadratic": "the same, + log_use^2 (fixed effect only)"},
+        "max_gap_vs_lme4_route": max_gap,
+        "scenes": used, "subjects": subjects, "measures": list(ROUTE_MEASURES),
+        "transforms": list(TRANSFORMS), "fits": records}, indent=2))
+    print(f"Wrote {out_path}" + (f" (route/linear matches lme4_route.json to {max_gap:.1e})"
+                                 if max_gap is not None else ""))
+
+
 # ---------------------------------------------------------------------------
 # Driver
 # ---------------------------------------------------------------------------

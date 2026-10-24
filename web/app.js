@@ -2158,7 +2158,14 @@ const STATS_MODELS = {
                 formula: "distance in px to the attempt's OWN route prototype against the nth use of that " +
                          "route, with (1 + log(use) | level) + (1 + log(use) | level:scene) + " +
                          "(1 + log(use) | level:scene:route), fitted in R's lme4; Wald CIs" },
+  route_scene: { label: "own route, scene & level effects (lme4)", short: "own route, scene & level effects",
+                 formula: "distance in px to the attempt's OWN route prototype against the nth use of that " +
+                          "route, with (1 + log(use) | level) + (1 + log(use) | level:scene) and NO route " +
+                          "effect, fitted in R's lme4 (run-practice-route-checks); Wald CIs" },
 };
+// Models on the route clock: x is the nth use of a route, y the distance to its own prototype.
+const ROUTE_CLOCK = new Set(["lme4_route", "route_scene"]);
+const onRouteClock = () => ROUTE_CLOCK.has(state.stats.model);
 const SUMMARY_COLORS = { lme4: CLUSTER_COLORS[4], model: CLUSTER_COLORS[0], nested: CLUSTER_COLORS[6],
                          lme4_level_boot: CLUSTER_COLORS[3], scene_boot: CLUSTER_COLORS[1],
                          level_boot: CLUSTER_COLORS[2] };
@@ -2188,6 +2195,21 @@ function modelFit(measure, subject) {
               singular: f.singular },
       r: { coef: { Intercept: f.intercept, logt: f.b }, ci: { logt: f.ci }, p: { logt: f.p_wald },
            curve: f.curve, converged: !f.warnings },
+    };
+  }
+  if (model === "route_scene") {
+    const f = statsData.route_checks && statsData.route_checks.fits.find((x) => x.correction === "scene"
+      && x.shape === "linear" && x.measure === measure && x.subject === subject
+      && x.transform === transform && x.completed_only === completed);
+    if (!f) return null;
+    const zeros = statsData.lme4_route && statsData.lme4_route.fits.find((x) => x.measure === measure
+      && x.subject === subject && x.transform === transform && x.completed_only === completed);
+    return {
+      meta: { n_obs: f.n_obs, n_groups: f.n_scenes, n_levels: f.n_levels,
+              n_zero_dropped: zeros ? zeros.n_zero_dropped : null, best_form: null, ci_method: "wald",
+              singular: f.singular, p_bh: f.p_bh },
+      r: { coef: { Intercept: f.intercept, logt: f.b }, ci: { logt: [f.wald_low, f.wald_high] },
+           p: { logt: f.p_wald }, curve: { ...f.curve, attempt: f.curve.use }, converged: !f.warnings },
     };
   }
   if (model === "lme4_nested") {
@@ -2286,7 +2308,7 @@ function renderStatsCoef() {
   }
   svgEl("line", { x1: px(0), x2: px(0), y1: pad.t - 4, y2: h - pad.b, class: "zero" }, svg);
   svgEl("text", { x: (pad.l + w - pad.r) / 2, y: h - 8, "text-anchor": "middle", class: "axis-label" }, svg)
-    .textContent = (state.stats.model === "lme4_route" ? "log(nth use of route) coefficient"
+    .textContent = (onRouteClock() ? "log(nth use of route) coefficient"
                     : form === "log" ? "log(attempt) coefficient" : "coefficient per 10 attempts") +
       `, ${state.stats.transform} units — left of 0 = closer to the prototypes with practice`;
   subjects.forEach((s, i) => {
@@ -2408,7 +2430,7 @@ function drawLineChart(host, { series, yDomain, yLabel, xLabel, ref, refLabel, h
     if (!rows.length) { cross.setAttribute("visibility", "hidden"); hideStatsTooltip(); return; }
     vline.setAttribute("x1", px(shownX)); vline.setAttribute("x2", px(shownX));
     cross.setAttribute("visibility", "visible");
-    showStatsTooltip(state.stats.model === "lme4_route" ? `use ${shownX} of the route`
+    showStatsTooltip(onRouteClock() ? `use ${shownX} of the route`
                        : `attempt ${shownX} at a scene`, null, rows, ev.clientX, ev.clientY);
   });
   hit.addEventListener("mouseleave", () => {
@@ -2444,7 +2466,7 @@ function renderStatsCurves() {
     series, height: 340, digits: info.digits,
     yDomain: paddedDomain(series.flatMap((s) => s.points.map((p) => p[1])), info.ref),
     yLabel: `${info.name} (${info.unit})`,
-    xLabel: state.stats.model === "lme4_route"
+    xLabel: onRouteClock()
       ? "nth use of the route at that scene (each route's own count)"
       : "attempt at a scene (restarts at 1 for every scene)",
     ref: info.ref, refLabel: info.ref != null ? "1.0 = typical cluster member" : null,
@@ -2461,6 +2483,10 @@ function renderStatsCurves() {
     (state.stats.model === "lme4_route"
       ? "Here practice is the nth use of a route, and the distance is always to that route's own " +
         "prototype, so the origin never changes along a series: a fall is tighter execution of a route. "
+      : state.stats.model === "route_scene"
+      ? "Here practice is the nth use of a route and the distance is to that route's own prototype, " +
+        "but routes get no effect of their own: a fall mixes tighter execution of a route with players " +
+        "moving to routes that were tight from the start. "
       : "") +
     "Each stops at that subject's 95th percentile of practice, past which few scenes " +
     "still contribute. The y-axis is zoomed to the data, so drops look steeper than they are.";
@@ -2812,6 +2838,7 @@ function logTicks(lo, hi) {
   };
   const fine = at([1, 2, 5]);
   const decades = at([1]);
+  if (fine.length < 3) return at([1, 1.5, 2, 3, 4, 5, 7]);   // a narrow range: label it densely
   return fine.length > 6 && decades.length >= 2 ? decades : fine;
 }
 
@@ -2822,6 +2849,7 @@ const BH_STRUCTURE = { lme4_nested: "lme4_nested", lme4_route: "lme4_route", sce
                        level_scene: "level_scene" };
 function statsBh(measure, subject) {
   const { model, transform, form } = state.stats;
+  if (model === "route_scene") { const f = modelFit(measure, subject); return f ? f.meta.p_bh : undefined; }
   const completed = state.stats.attempts === "completed" ? 1 : 0;
   const key = `${BH_STRUCTURE[model]}|${measure}|${transform}|${completed}|${model === "scene" ? form : "log"}|${subject}`;
   return statsData.bh ? statsData.bh[key] : undefined;
@@ -2885,6 +2913,175 @@ function renderStatsBootstrap() {
     ` Source: ${data.runs.map((r) => `<code>${r.file}</code>`).join(", ")}.`;
 }
 
+/* Scene effects or route effects, and the shape: the route-scale data (own-route distance against
+ * nth use) fitted at three corrections — pooled least squares, scene + level random effects, and
+ * scene + level + route (the route-scale model) — each linear on log-log axes and with a
+ * log(use)^2 term. From statsData.route_checks (output_data/practice/route_checks.json, fitted by
+ * analysis/practice_route_checks.R); the browser only draws and tabulates it. The bins under the
+ * lines are the pooled bins of the fit-check panel (practice_points.json). */
+const RCHK = [
+  ["pooled", "nothing removed (plain line)", FIT_POINT_COLOR],
+  ["scene", "scene & level differences removed", CLUSTER_COLORS[0]],
+  ["route_int", "+ route baselines removed (route intercepts)", CLUSTER_COLORS[2]],
+  ["route", "scene, level & route differences removed (route model)", CLUSTER_COLORS[1]],
+];
+
+function renderStatsRouteChecks() {
+  const block = $("stats-rchk-block");
+  block.hidden = !onRouteClock() || state.stats.form !== "log";
+  if (block.hidden) return;
+  const rc = statsData.route_checks;
+  const table = $("stats-rchk-table"), quad = $("stats-rchk-quad"), host = $("stats-rchk-panels");
+  table.innerHTML = ""; quad.innerHTML = ""; host.innerHTML = "";
+  $("stats-rchk-legend").innerHTML = ""; $("stats-rchk-quad-cap").textContent = "";
+  if (!rc) {
+    $("stats-rchk-cap").innerHTML = "Not in this export. Run <code>invoke run-practice-route-checks</code>, " +
+      "then <code>invoke run-web-export --backfill</code>, and reload.";
+    return;
+  }
+  const { measure, transform } = state.stats;
+  const m = `${measure}_loso`;
+  const completed = state.stats.attempts === "completed";
+  const fit = (s, correction, shape) => rc.fits.find((f) => f.measure === m && f.transform === transform &&
+    f.completed_only === completed && f.subject === s && f.correction === correction && f.shape === shape);
+  const doubling = transform === "log";
+  const pct = (b) => `${b < 0 ? "−" : "+"}${Math.abs((2 ** b - 1) * 100).toFixed(1)}%`;
+  const eff = (b) => (doubling ? pct(b) : signed(b, 3));
+  const subjects = statsData.subjects.filter((s) => fit(s, "route", "linear"));
+  // A file fitted before route_int existed (design v1) lacks that step; show what it has.
+  const shown = RCHK.filter(([c]) => rc.fits.some((f) => f.correction === c));
+  const has = (c) => shown.some(([x]) => x === c);
+
+  // 1. The slope at each correction: does the pooled decrease survive scene effects, then routes?
+  const rows = subjects.map((s) => {
+    const cells = shown.map(([c]) => {
+      const f = fit(s, c, "linear");
+      const clear = f.wald_high < 0 || f.wald_low > 0;
+      return `<td class="${clear ? "clear" : "unclear"}">${eff(f.b)} <span class="muted">(${eff(f.wald_low)} to ` +
+             `${eff(f.wald_high)})</span></td><td>${c === "pooled" ? "—" : fmtP(f.p_bh)}</td>`;
+    });
+    return `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>${cells.join("")}</tr>`;
+  });
+  table.innerHTML = "<thead><tr><th>subject</th>" +
+    shown.map(([c, label]) => `<th>${label}: ${doubling ? "per doubling" : "slope"} (95% CI)</th>` +
+                             `<th>p, BH-FDR</th>`).join("") +
+    `</tr></thead><tbody>${rows.join("")}</tbody>`;
+
+  // 2. Every line over the pooled bins, one panel per subject.
+  const inv = INVERSE[transform];
+  const panels = subjects.map((s) => {
+    const box = document.createElement("div");
+    box.className = "stats-chart";
+    host.appendChild(box);
+    const data = fitPoints && fitPoints[`lme4_route|${m}|${transform}|${completed ? 1 : 0}|${s}`];
+    const lines = shown.flatMap(([c, , color]) => ["linear", "quadratic"].map((shape) => {
+      const f = fit(s, c, shape);
+      return { color, shape, label: c, pts: f.curve.use.map((u, i) => [u, inv(f.curve.y[i])]) };
+    }));
+    return { s, box, bins: (data && data.bins) || [], lines };
+  });
+  const ys = panels.flatMap((p) => [...p.bins.flatMap((b) => [b.lo, b.hi]),
+                                    ...p.lines.flatMap((l) => l.pts.map(([, y]) => y))]).filter((y) => y > 0);
+  const yDomain = [Math.min(...ys) * 0.95, Math.max(...ys) * 1.05];
+  for (const p of panels) drawRouteCheckPanel(p, yDomain, MEASURE_INFO[measure].digits);
+  $("stats-rchk-legend").innerHTML =
+    legendHTML(shown.map(([, label, color]) => [color, label])) +
+    '<span class="muted">solid: linear on log-log · dashed: + quadratic term</span> ' +
+    legendHTML([["var(--ink)", "pooled bins, 95% CI"]], true);
+  if (fitPoints === null) renderStatsFitData();   // starts the lazy load of the bins
+
+  // 3. Linear against quadratic, per correction.
+  const qrows = subjects.map((s) => {
+    const cells = shown.map(([c]) => {
+      const lin = fit(s, c, "linear"), q = fit(s, c, "quadratic");
+      const dAic = q.aic - lin.aic;
+      return `<td>${dAic >= 0 ? "+" : "−"}${Math.abs(dAic).toFixed(1)}</td>` +
+             `<td>${c === "pooled" ? fmtP(q.lrt_p) : fmtP(q.lrt_p_bh)}</td>` +
+             `<td>${eff(q.slope_at_1)} → ${eff(q.slope_at_50)}</td>`;
+    });
+    return `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>${cells.join("")}</tr>`;
+  });
+  quad.innerHTML = "<thead><tr><th>subject</th>" +
+    shown.map(([c, label]) => `<th>${label}: ΔAIC</th><th>curvature p${c === "pooled" ? "" : ", BH-FDR"}</th>` +
+                            `<th>local slope, use 1 → 50</th>`).join("") +
+    `</tr></thead><tbody>${qrows.join("")}</tbody>`;
+
+  const lin = (c) => subjects.map((s) => fit(s, c, "linear"));
+  const range = (fs) => {
+    const v = fs.map((f) => (doubling ? (2 ** f.b - 1) * 100 : f.b));
+    return `${Math.min(...v).toFixed(1)} to ${Math.max(...v).toFixed(1)}${doubling ? "%" : ""}`;
+  };
+  const sceneClear = lin("scene").filter((f) => f.wald_high < 0).length;
+  const notMain = measure !== "d_own" || transform !== "log" || completed;
+  $("stats-rchk-cap").innerHTML =
+    "The same data as the route model — each attempt's distance to its own route's prototype, against the nth " +
+    `use of that route, leave-subject-out medoids — fitted ${shown.length} ways, each removing more. Every line is ` +
+    "the fixed-effect slope, the trend left once the differences named are taken out. " +
+    "<strong>Nothing removed</strong> (grey) is a plain straight line through every attempt, no random effects: " +
+    "the trend the pooled row above shows by eye. Its CI treats attempts as independent and is far too " +
+    "narrow, so it gets no test. <strong>Scene &amp; level differences removed</strong> (blue): every level and " +
+    "scene gets its own intercept and slope (random effects), so easy or often-played scenes cannot make the " +
+    "trend, but all routes in a scene are treated alike: does the pooled decrease survive? " +
+    "<strong>+ route baselines removed</strong> (green): each route also gets its own intercept only, so routes " +
+    "may differ in how tight they are but all improve at the same rate. What it takes away is structure: " +
+    "some routes are simply tighter. Whatever slope survives it is change along a route. " +
+    "<strong>Scene, level &amp; route differences removed</strong> (orange) is the route model itself: each route " +
+    "gets its own intercept and slope, so it is also allowed its own rate of improvement. " +
+    `Here the decrease is ${range(lin("pooled"))} per ${doubling ? "doubling" : "log unit"} with nothing removed, ` +
+    `${range(lin("scene"))} with scene and level differences removed (CI below 0 for ${sceneClear} of ` +
+    `${subjects.length}), ` +
+    (has("route_int") ? `${range(lin("route_int"))} with route baselines removed as well, and ` : "and ") +
+    `${range(lin("route"))} with route intercepts and slopes. ` +
+    "What disappears once routes are separated is a difference " +
+    "<em>between routes</em> in the same scene, not one between scenes. " +
+    "p, BH-FDR: Benjamini-Hochberg across the five subjects, per column (statsmodels). " +
+    (notMain ? '<span class="filtered">Not the main setting (d_own, log, all attempts).</span> ' : "") +
+    "Source: <code>output_data/practice/route_checks.json</code>.";
+  $("stats-rchk-quad-cap").innerHTML =
+    "<strong>Is a straight line on log-log axes the right shape?</strong> Each model refitted with a " +
+    "log(use)² term (a fixed effect only: scenes and routes keep their own straight slope) and compared " +
+    "with the straight line by AIC and a likelihood-ratio test (1 df). ΔAIC below about −2 favours the " +
+    "curve; the local slope shows which way it bends: towards 0 means the decrease flattens with use, away " +
+    "from 0 that it steepens. The pooled test treats attempts as independent, so it says the curve is real " +
+    "far too readily.";
+}
+
+function drawRouteCheckPanel({ s, box, bins, lines }, yDomain, digits) {
+  const d = document.createElement("div");
+  d.className = "panel-title";
+  d.innerHTML = `sub-${s}`;
+  box.appendChild(d);
+  const w = box.clientWidth || 240, height = 200;
+  const pad = { l: 52, r: 8, t: 8, b: 30 };
+  const svg = svgEl("svg", { viewBox: `0 0 ${w} ${height}`, height, role: "img",
+                             "aria-label": `sub-${s}: the route data under three corrections` }, box);
+  const xMax = Math.max(...lines.map((l) => l.pts[l.pts.length - 1][0]), ...bins.map((b) => b.x)) * 1.15;
+  const [x0, x1] = [Math.log(0.8), Math.log(xMax)];
+  const [y0, y1] = [Math.log(yDomain[0]), Math.log(yDomain[1])];
+  const px = (x) => pad.l + ((w - pad.l - pad.r) * (Math.log(x) - x0)) / (x1 - x0);
+  const py = (y) => height - pad.b - ((height - pad.t - pad.b) * (Math.log(y) - y0)) / (y1 - y0 || 1);
+  drawLogAxes(svg, { px, py, pad, w, height, xMax, ylo: yDomain[0], yhi: yDomain[1],
+                    xName: "nth use of the route", yName: "distance (px)" });
+  for (const l of lines) {
+    svgEl("polyline", { points: l.pts.map(([x, y]) => `${px(x)},${py(y)}`).join(" "), fill: "none",
+                        stroke: l.color, "stroke-width": l.shape === "linear" ? 2 : 1.6,
+                        ...(l.shape === "linear" ? {} : { "stroke-dasharray": "5 3" }),
+                        "stroke-linejoin": "round", "stroke-linecap": "round" }, svg);
+  }
+  for (const b of bins) {
+    const g = svgEl("g", {}, svg);
+    svgEl("line", { x1: px(b.x), x2: px(b.x), y1: py(b.lo), y2: py(b.hi), stroke: "var(--ink)", "stroke-width": 1.2 }, g);
+    svgEl("circle", { cx: px(b.x), cy: py(b.mean), r: 3, fill: "var(--ink)", class: "dot-ring" }, g);
+    const hit = svgEl("circle", { cx: px(b.x), cy: py(b.mean), r: 8, class: "hit" }, g);
+    hit.addEventListener("mousemove", (ev) => showStatsTooltip(
+      `sub-${s} · use ≈ ${b.x.toFixed(b.x < 10 ? 1 : 0)}`, "var(--ink)",
+      [["pooled geometric mean", b.mean.toFixed(digits + 1)],
+       ["95% CI", `${b.lo.toFixed(digits + 1)} – ${b.hi.toFixed(digits + 1)}`],
+       ["attempts", b.n_obs], ["scenes", b.n_scenes]], ev.clientX, ev.clientY));
+    hit.addEventListener("mouseleave", hideStatsTooltip);
+  }
+}
+
 function renderStatsTable() {
   const { measure, form } = state.stats;
   const info = MEASURE_INFO[measure];
@@ -2895,10 +3092,11 @@ function renderStatsTable() {
   const pctDoubling = (b) => `${b < 0 ? "−" : "+"}${Math.abs((2 ** b - 1) * 100).toFixed(1)}%`;
   const head = ["subject", "medoids", "coefficient", "95% CI",
                 ...(doubling ? ["per doubling (95% CI)"] : []), "p", "p, BH-FDR (5 subjects)", "CI excludes 0",
-                `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} 1 (${info.unit})`,
-                `at ${state.stats.model === "lme4_route" ? "use" : "attempt"} ${STATS_AT} (${info.unit})`,
+                `at ${onRouteClock() ? "use" : "attempt"} 1 (${info.unit})`,
+                `at ${onRouteClock() ? "use" : "attempt"} ${STATS_AT} (${info.unit})`,
                 "attempts", "zeros dropped",
-                state.stats.model === "lme4_route" ? "routes" : measure === "d_own" ? "series" : "scenes",
+                state.stats.model === "lme4_route" ? "routes"
+                  : measure === "d_own" && state.stats.model === "scene" ? "series" : "scenes",
                 "converged"];
   const rows = [];
   for (const s of statsData.subjects) {
@@ -2933,7 +3131,7 @@ function renderStatsTable() {
     "(method fdr_bh) in the analysis, not in the browser. " +
     (doubling
     ? `Per doubling: the change in distance each time the number of ` +
-      `${state.stats.model === "lme4_route" ? "uses of a route" : "attempts at a scene"} doubles, ` +
+      `${onRouteClock() ? "uses of a route" : "attempts at a scene"} doubles, ` +
       "(2^b − 1) × 100, with the CI converted the same way. It is a proportional change, so it " +
       "holds at any point on the curve: 1→2, 10→20 and 30→60 all bring the same percentage."
     : "Per-doubling percentages are shown only for the log form under log(d); under " +
@@ -3131,9 +3329,10 @@ function applyStatsAvailability() {
   const hasLme4 = !!(statsData && statsData.lme4);
   const hasNested = !!(statsData && statsData.nested);
   const hasRoute = !!(statsData && statsData.lme4_route);
-  const avail = { lme4_nested: hasLme4, scene: true, level_scene: hasNested, lme4_route: hasRoute };
+  const avail = { lme4_nested: hasLme4, scene: true, level_scene: hasNested, lme4_route: hasRoute,
+                  route_scene: !!(statsData && statsData.route_checks) };
   if (!avail[state.stats.model]) state.stats.model = "scene";
-  const route = state.stats.model === "lme4_route";
+  const route = onRouteClock();
   const nestedModel = state.stats.model !== "scene";
   if (nestedModel && state.stats.form !== "log") state.stats.form = "log";
   // The within-route model exists for the own-medoid distance only; the other nested
@@ -3154,7 +3353,7 @@ function applyStatsAvailability() {
 }
 
 function renderStats() {
-  const { measure, form, attempts, transform } = state.stats;
+  let { measure, form, attempts, transform } = state.stats;
   $("chart-title").textContent = "Practice effect — one mixed model per subject";
   $("reset-view").hidden = true;
   $("clear-filters").hidden = true;
@@ -3188,6 +3387,7 @@ function renderStats() {
   }
 
   applyStatsAvailability();
+  ({ measure, form, attempts, transform } = state.stats);   // the model may have switched the measure
   // Two main results, one per scale: the scene scale on the primary measure (the scene-only
   // statsmodels model stands in without R), and the route scale on the own-route distance.
   const primaryModel = statsData.lme4 ? "lme4_nested" : "scene";
@@ -3207,6 +3407,7 @@ function renderStats() {
   renderStatsCurves();
   renderStatsFitData();
   renderStatsSpaghetti();
+  renderStatsRouteChecks();
   renderStatsTable();
   renderStatsBootstrap();
   renderStatsChecks();
@@ -3264,6 +3465,7 @@ function bindStats() {
       hideStatsTooltip();
       renderStatsFitData();
       renderStatsSpaghetti();
+      renderStatsRouteChecks();
     });
   }
   $("stats-spaghetti-subject").addEventListener("click", (ev) => {

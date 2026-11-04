@@ -1,0 +1,38 @@
+{
+  "assets": {
+    "mario_scenes": {
+      "datalad_id": "7f9ef287-302a-4888-aa07-1d17cba6f3fb",
+      "declared_source": "git@github.com:courtois-neuromod/mario.scenes",
+      "exists": true,
+      "git": {
+        "branch": "jsonissue",
+        "commit": "a5d08b1ad08e8f19d658dadb6796025df6c38960",
+        "dirty": true,
+        "remote": "git@github.com:courtois-neuromod/mario.scenes",
+        "toplevel": "/home/cleode5a7/Desktop/werk/neuromod/MariHA/data/mario.scenes"
+      },
+      "is_symlink": true,
+      "mode": "symlink",
+      "mtime": "2026-08-07T17:30:13+00:00",
+      "path": "source_data/mario.scenes",
+      "resolved_path": "/home/cleode5a7/Desktop/werk/neuromod/MariHA/data/mario.scenes",
+      "sha256": null,
+      "size_bytes": null
+    },
+    "scenes_mastersheet": {
+      "datalad_id": null,
+      "declared_source": null,
+      "exists": true,
+      "git": null,
+      "is_symlink": false,
+      "mode": "local",
+      "mtime": "2026-07-21T16:49:32+00:00",
+      "path": "source_data/scenes_mastersheet.csv",
+      "resolved_path": "/home/cleode5a7/Desktop/werk/neuromod/Mario_behaviour/source_data/scenes_mastersheet.csv",
+      "sha256": "67428a82359473c68c29720490d3a01bb745c60bd515a8f854df78bc7b38bd3f",
+      "size_bytes": 28693
+    }
+  },
+  "recorded_at": "2026-10-22T20:55:51+00:00",
+  "schema": "airoh/manifest/1"
+}

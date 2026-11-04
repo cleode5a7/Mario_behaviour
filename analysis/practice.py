@@ -1289,7 +1289,7 @@ def run_practice_lme4(output_dir, *, scenes=None, force=False, n_cores=None) -> 
 # Checks on the route-scale effect (analysis/practice_route_checks.R): the route plot's data
 # under three corrections, each linear on log-log axes and with a quadratic in log(use).
 ROUTE_CHECKS_SCRIPT = Path(__file__).with_name("practice_route_checks.R")
-ROUTE_CHECKS_DESIGN = "v2"   # v2: adds route_int (route random intercepts only)
+ROUTE_CHECKS_DESIGN = "v3"   # v2: adds route_int; v3: whole-polynomial change and joint test
 ROUTE_CHECK_CORRECTIONS = ("pooled", "scene", "route_int", "route")
 ROUTE_CHECK_FAMILY = ["measure", "transform", "completed_only", "correction", "shape"]
 ROUTE_CHECK_TOLERANCE = 1e-4   # route/linear must reproduce lme4_route.json's slope
@@ -1307,8 +1307,10 @@ def run_practice_route_checks(output_dir, *, scenes=None, force=False, n_cores=N
     ``route`` (plus a random slope per route too: ``lme4_route.json``'s model). Each is fitted linear in
     ``log(use)`` and with a ``log(use)^2`` term, compared by AIC and a 1-df likelihood-ratio
     test. Writes ``practice/route_checks.json``: every fit's coefficients, Wald CIs, the
-    local slope at uses 1/5/20/50, its curve, and Benjamini-Hochberg p across the five
-    subjects (``p_bh`` for the slope, ``lrt_p_bh`` for the curvature), per
+    local slope at uses 1/5/20/50, the whole polynomial's change from use 1 to the end of
+    the range (``change_end`` +/- ``change_end_se``, at ``u_end``) and a joint Wald test of
+    all its practice terms (``joint_p``), its curve, and Benjamini-Hochberg p across the five
+    subjects (``p_bh`` for the slope, ``lrt_p_bh`` for the curvature, ``joint_p_bh``), per
     ``ROUTE_CHECK_FAMILY``. Stops if the ``route`` linear fit does not reproduce
     ``lme4_route.json`` to ``ROUTE_CHECK_TOLERANCE``. Skips when already fitted on these
     scenes; a subset run (``scenes``) writes ``route_checks_smoke.json`` instead and never
@@ -1346,8 +1348,10 @@ def run_practice_route_checks(output_dir, *, scenes=None, force=False, n_cores=N
 
     fits["p_bh"] = np.nan
     fits["lrt_p_bh"] = np.nan
+    fits["joint_p_bh"] = np.nan
     for _, g in fits.groupby(ROUTE_CHECK_FAMILY):
         fits.loc[g.index, "p_bh"] = multipletests(g["p_wald"].to_numpy(), method="fdr_bh")[1]
+        fits.loc[g.index, "joint_p_bh"] = multipletests(g["joint_p"].to_numpy(), method="fdr_bh")[1]
         if g["lrt_p"].notna().all():
             fits.loc[g.index, "lrt_p_bh"] = multipletests(g["lrt_p"].to_numpy(), method="fdr_bh")[1]
 

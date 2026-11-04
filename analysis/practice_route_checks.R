@@ -11,7 +11,12 @@
 # pooled decrease survives scene and level effects; scene -> route_int asks how much of what
 # is left is routes simply differing in how tight they are (structure) rather than change
 # along a route; route_int -> route lets each route also improve at its own rate. The curvature
-# term is a fixed effect only: scenes and routes keep their own linear slope. Pooled SEs
+# term is a fixed effect only: scenes and routes keep their own linear slope. Each fit also
+# reports the behaviour of its WHOLE practice polynomial, not single terms: the change from
+# use 1 to the end of the range (the 95th-percentile use, where the curve stops),
+# b * ln(U) + b2 * ln(U)^2 with its SE from both coefficients and their covariance, and a
+# joint Wald test that every practice term is zero (2 df for the quadratic, 1 for the line,
+# where it equals the slope test). Pooled SEs
 # treat attempts as independent and are too small; they are kept for description only.
 # Maximum likelihood (REML = FALSE), so the linear and quadratic fits compare by AIC and a
 # likelihood-ratio test (1 df). Wald CIs. Called by
@@ -49,6 +54,7 @@ fit <- function(correction, quadratic, g) {
 }
 
 summarise <- function(f, correction, quadratic, key, grid) {
+  u_end <- max(grid)
   m <- f$m
   fe <- if (correction == "pooled") coef(m) else fixef(m)
   V <- as.matrix(vcov(m))
@@ -64,6 +70,15 @@ summarise <- function(f, correction, quadratic, key, grid) {
                     singular = if (correction == "pooled") FALSE else isSingular(m),
                     warnings = f$warn)
   row$p2_wald <- if (quadratic) 2 * pnorm(-abs(row$b2 / row$se2)) else NA
+  terms <- if (quadratic) c("log_use", "lu2") else "log_use"
+  Lend <- if (quadratic) c(log(u_end), log(u_end)^2) else log(u_end)
+  row$u_end <- u_end
+  row$change_end <- sum(Lend * fe[terms])           # y(u_end) - y(1), on the model's scale
+  row$change_end_se <- sqrt(drop(t(Lend) %*% V[terms, terms, drop = FALSE] %*% Lend))
+  beta <- fe[terms]
+  row$joint_df <- length(terms)
+  row$joint_chisq <- drop(t(beta) %*% solve(V[terms, terms, drop = FALSE]) %*% beta)
+  row$joint_p <- pchisq(row$joint_chisq, df = row$joint_df, lower.tail = FALSE)
   for (u in SLOPE_AT) {          # local slope d y / d log(use) at use u, and its SE
     L <- if (quadratic) c(1, 2 * log(u)) else 1
     nm <- if (quadratic) c("log_use", "lu2") else "log_use"

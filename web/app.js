@@ -2991,20 +2991,32 @@ function renderStatsRouteChecks() {
   if (fitPoints === null) renderStatsFitData();   // starts the lazy load of the bins
 
   // 3. Linear against quadratic, per correction.
-  const qrows = subjects.map((s) => {
-    const cells = shown.map(([c]) => {
-      const lin = fit(s, c, "linear"), q = fit(s, c, "quadratic");
-      const dAic = q.aic - lin.aic;
-      return `<td>${dAic >= 0 ? "+" : "−"}${Math.abs(dAic).toFixed(1)}</td>` +
-             `<td>${c === "pooled" ? fmtP(q.lrt_p) : fmtP(q.lrt_p_bh)}</td>` +
-             `<td>${eff(q.slope_at_1)} → ${eff(q.slope_at_50)}</td>`;
-    });
-    return `<tr><td class="subj"><i style="background:${subjColor(s)}"></i>sub-${s}</td>${cells.join("")}</tr>`;
-  });
-  quad.innerHTML = "<thead><tr><th>subject</th>" +
-    shown.map(([c, label]) => `<th>${label}: ΔAIC</th><th>curvature p${c === "pooled" ? "" : ", BH-FDR"}</th>` +
-                            `<th>local slope, use 1 → 50</th>`).join("") +
-    `</tr></thead><tbody>${qrows.join("")}</tbody>`;
+  // One row per subject x model. The whole polynomial, not single terms: the change from use 1 to
+  // the end of the range under each shape (both terms together, CI from their covariance), and a
+  // joint test that every practice term is zero.
+  const change = (f) => {
+    const lo = f.change_end - 1.96 * f.change_end_se, hi = f.change_end + 1.96 * f.change_end_se;
+    const fmt = (v) => (doubling ? `${v < 0 ? "−" : "+"}${Math.abs((Math.exp(v) - 1) * 100).toFixed(0)}%` : signed(v, 3));
+    return `${fmt(f.change_end)} <span class="muted">(${fmt(lo)} to ${fmt(hi)})</span>`;
+  };
+  const qrows = subjects.flatMap((s) => shown.map(([c, label, color], k) => {
+    const lin = fit(s, c, "linear"), q = fit(s, c, "quadratic");
+    const dAic = q.aic - lin.aic;
+    const naive = c === "pooled";
+    return `<tr${k === 0 ? ' class="group-start"' : ""}>` +
+      `<td class="subj">${k === 0 ? `<i style="background:${subjColor(s)}"></i>sub-${s}` : ""}</td>` +
+      `<td><i class="swatch" style="background:${color}"></i> ${label}</td>` +
+      `<td>${dAic >= 0 ? "+" : "−"}${Math.abs(dAic).toFixed(1)}</td>` +
+      `<td>${naive ? fmtP(q.lrt_p) : fmtP(q.lrt_p_bh)}</td>` +
+      `<td>${eff(q.slope_at_1)} → ${eff(q.slope_at_50)}</td>` +
+      `<td>${change(lin)}</td><td>${change(q)}</td>` +
+      `<td>${naive ? fmtP(q.joint_p) : fmtP(q.joint_p_bh)}</td><td>${q.u_end}</td></tr>`;
+  }));
+  quad.innerHTML = "<thead><tr><th>subject</th><th>model</th><th>ΔAIC, quadratic − straight</th>" +
+    "<th>curvature p (BH-FDR)</th><th>local slope, use 1 → 50</th>" +
+    `<th>total change, use 1 → end: straight (95% CI)</th><th>total change: quadratic (95% CI)</th>` +
+    "<th>any practice effect, quadratic: joint p (BH-FDR)</th><th>end of range (use)</th></tr></thead>" +
+    `<tbody>${qrows.join("")}</tbody>`;
 
   const lin = (c) => subjects.map((s) => fit(s, c, "linear"));
   const range = (fs) => {
@@ -3043,7 +3055,14 @@ function renderStatsRouteChecks() {
     "with the straight line by AIC and a likelihood-ratio test (1 df). ΔAIC below about −2 favours the " +
     "curve; the local slope shows which way it bends: towards 0 means the decrease flattens with use, away " +
     "from 0 that it steepens. The pooled test treats attempts as independent, so it says the curve is real " +
-    "far too readily.";
+    "far too readily (its p values are uncorrected and not to be trusted). " +
+    "<strong>The whole polynomial, not single terms.</strong> A quadratic's two coefficients can trade off, " +
+    "so neither one alone says how much the distance falls. <em>Total change</em> takes the whole fitted " +
+    "curve from use 1 to the end of the range (the 95th-percentile use, where the lines stop), both terms " +
+    "together, with a CI from their joint uncertainty; under log(d) it is a percentage. <em>Any practice " +
+    "effect</em> tests that every practice term is zero at once (Wald, 2 df). It asks whether the distance " +
+    "changes with use at all, not whether it falls: a curve that dips and comes back can pass it with a " +
+    "total change of 0. For the straight line the same test is the ordinary slope test.";
 }
 
 function drawRouteCheckPanel({ s, box, bins, lines }, yDomain, digits) {

@@ -745,3 +745,5 @@ button.ghost:hover { background: var(--surface-3); color: var(--ink); }
 }
 .stats-inline-seg { display: inline-flex; width: auto; margin: 2px 0 4px; }
 .stats-inline-seg button { flex: 0 0 auto; padding-left: 14px; padding-right: 14px; }
+.stats-table td .swatch { display: inline-block; vertical-align: -1px; width: 10px; height: 3px; border-radius: 2px; }
+.stats-table tr.group-start td { border-top: 1px solid var(--line); }

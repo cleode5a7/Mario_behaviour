@@ -252,7 +252,10 @@ The practice effect, measured as distance to cluster medoids. Written by
   (`+ log_use^2`, fixed only). Per fit: `intercept`, `b`, `se`, Wald CI, `p_wald`, `b2`/`se2`/
   `p2_wald`, `aic`, `loglik`, `singular`, the local slope and its SE at uses 1/5/20/50
   (`slope_at_<u>`, `slope_se_at_<u>`), the quadratic-vs-linear likelihood-ratio test
-  (`lrt_chisq`, `lrt_p`, on the quadratic row), BH-FDR across subjects (`p_bh`, `lrt_p_bh`)
+  (`lrt_chisq`, `lrt_p`, on the quadratic row), the whole polynomial's change from use 1 to
+  the end of the range (`change_end` ± `change_end_se` on the model's scale, at `u_end`, the
+  95th-percentile use) and a joint Wald test of all practice terms (`joint_chisq`, `joint_df`,
+  `joint_p`), BH-FDR across subjects (`p_bh`, `lrt_p_bh`, `joint_p_bh`)
   and the fixed-effect `curve` on the nth-use axis. A `--smoke` run writes
   `route_checks_smoke.json` beside it.
 - `figure_practice_route_checks.png` — from `figure_practice.ipynb`: per subject, the pooled

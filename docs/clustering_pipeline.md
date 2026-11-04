@@ -197,3 +197,5 @@ to interpret we take that step ammount and multiply by the coefficient to see ho
 Yes, that's the core interpretation. Because both distance and practice are on the log scale, the model says each doubling of practice multiplies the distance by the same factor:
 
 factor per doubling = 2^b        % closer per doubling = (1 − 2^b) × 100
+
+Within a scene, attempts get closer to their route prototype as routes are used more, and this holds after accounting for scene and level differences. But within a single route the improvement is small (significant in 4 of 5 subjects). Most of the decrease is therefore consistent with route selection: players increasingly use routes that were already consistent from the start, rather than refining each route with practice.

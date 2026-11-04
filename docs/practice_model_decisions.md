@@ -580,6 +580,19 @@ are but improve at the same rate. Per doubling: 01 −0.2% [−1.6, +1.1], 02 �
 alone take out nearly all of what separates the scene & level model from the route model,
 and lower AIC by 5,500-8,300; adding route slopes lowers it by a further 5.5-52 (routes do
 differ in their rate of improvement), but moves the average slope by at most 0.4 points.
+
+**The whole polynomial, not single terms (2026-10-24).** The supervisor asked whether the
+comparison only looked at the linear term, since for sub-05 the quadratic term might carry
+the decrease. ΔAIC already compared whole models, but nothing reported how much a quadratic
+fit falls. Each fit now carries its total change from use 1 to the end of the range (both
+terms, CI from their covariance) and a joint Wald test of all practice terms. Over the range
+the two shapes agree to within 0-4 points for every subject and model: with scene & level
+effects −22/−29/−42/−44/−36% straight against −21/−28/−44/−47/−32% quadratic (all joint
+BH p ≤ 0.0012); within routes −3/−9/−12/−18/−15% against −0/−9/−14/−17/−14%. Sub-05's
+quadratic differs only in the pooled model, where it puts the same −37% early (39 → 25 px
+by use 10, then flat). One trap: sub-01's quadratic route model passes the joint test
+(BH 0.049) with a total change of 0%: it dips and comes back. The joint test asks whether
+the distance changes with use at all, not whether it falls.
 So the decrease is mostly structural, and what is left is a small within-route improvement:
 clear for 02, 05 and 06, borderline for 03 (0.056 here, 0.021 in the route model), absent
 for 01. With no route slopes this model's CI may be too narrow; the route model stays the
